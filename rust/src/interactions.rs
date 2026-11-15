@@ -25,7 +25,7 @@ fn defer_privately(command: &str) -> Option<bool> {
         return None;
     }
     Some(matches!(command,
-        "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
+        "help" | "server_settings" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
         "patchnotes" | "patchnotes_channel" | "log_channel" | "shop_add" | "shop_remove" | "daily_test"
     ))
 }

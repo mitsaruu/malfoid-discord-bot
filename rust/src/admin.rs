@@ -148,7 +148,11 @@ pub async fn show_warns(
 /// Снять все варны с участника
 #[poise::command(slash_command, guild_only, default_member_permissions = "MODERATE_MEMBERS")]
 pub async fn warns_clear(ctx: Context<'_>, #[description = "С кого снять варны"] member: serenity::User) -> Result<(), Error> {
-    let deleted = ctx.data().db.clear_warns(ctx.guild_id().unwrap().get(), member.id.get())?;
+    let guild=ctx.guild_id().unwrap().get();
+    let cutoff:Option<i64>=ctx.data().db.lock().query_row("SELECT MAX(id) FROM warns WHERE guild_id=?1 AND user_id=?2",rusqlite::params![guild as i64,member.id.get() as i64],|r|r.get(0))?;
+    if cutoff.is_none(){return say(ctx,"У участника нет варнов.").await}
+    if !crate::qol::confirm(ctx,format!("Снять все текущие варны с <@{}>?",member.id)).await?{return Ok(())}
+    let deleted=ctx.data().db.lock().execute("DELETE FROM warns WHERE guild_id=?1 AND user_id=?2 AND id<=?3",rusqlite::params![guild as i64,member.id.get() as i64,cutoff])?;
     say(ctx, if deleted > 0 {
         format!("🧹 С <@{}> сняты варны: {deleted}.", member.id)
     } else {

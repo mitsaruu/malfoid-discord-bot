@@ -372,11 +372,24 @@ pub async fn pet_sell(
     let Some((pet, species)) = found else {
         return whisper(ctx, "Такого питомца у тебя нет — выбери из списка.").await;
     };
+    if matches!(species.rarity,"rare"|"epic"|"legendary"|"mythic") {
+        if !crate::qol::confirm(ctx,format!("Продать {}? Вернуть питомца после продажи нельзя.",title(species,pet.level))).await?{return Ok(())}
+    }
+    let Some(current)=data.db.own_pet(pet.id,guild,user)? else{return whisper(ctx,"Питомец уже продан или передан.").await};
+    if current!=pet{return whisper(ctx,"Питомец изменился, пока ждали подтверждение. Повтори /pet_sell.").await}
     // Возвращается часть вложенного и всё, что питомец успел накопить
     let price = pet.spent * data.pets.sell_percent / 100
         + pending(species, pet.level, pet.last_collect, db::now(), data.pets.collect_cap_hours);
-    data.db.delete_pet(pet.id)?;
-    let balance = data.db.add_money(guild, user, &display_name(ctx).await, data.economy.start_balance, price)?;
+    data.db.wallet(guild,user,&display_name(ctx).await,data.economy.start_balance)?;
+    let paid={
+        let mut connection=data.db.lock();let tx=connection.transaction()?;
+        let deleted=tx.execute("DELETE FROM pets WHERE id=?1 AND guild_id=?2 AND user_id=?3 AND level=?4 AND spent=?5 AND last_collect=?6",
+            rusqlite::params![pet.id,guild as i64,user as i64,pet.level,pet.spent,pet.last_collect])?;
+        if deleted==1{tx.execute("UPDATE economy SET balance=balance+?1 WHERE guild_id=?2 AND user_id=?3",rusqlite::params![price,guild as i64,user as i64])?;}
+        tx.commit()?;deleted==1
+    };
+    if !paid{return whisper(ctx,"Питомец уже продан, передан или изменился. Повтори команду.").await}
+    let balance=data.db.wallet(guild,user,&display_name(ctx).await,data.economy.start_balance)?.0;
     say(ctx, format!(
         "💸 <@{user}> продаёт питомца {} за **{}**. Баланс: **{}**.",
         title(species, pet.level), money_text(price), money_text(balance))).await

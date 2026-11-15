@@ -46,6 +46,31 @@ pub fn parse_link(text: &str) -> Option<(Kind, String)> {
 /// Ответ: строки «Исполнитель - Название» для поиска на YouTube и название трека/альбома/плейлиста.
 pub type Found = (Vec<String>, String);
 
+/// Дополнительные данные для сопоставления и ссылки на оригинал. Не требуют Spotify Premium.
+pub async fn metadata(web:&reqwest::Client,kind:Kind,id:&str)->std::collections::HashMap<String,Value>{
+    let result=async {
+        let html=web.get(format!("https://open.spotify.com/embed/{}/{id}",kind.path())).header("User-Agent","Mozilla/5.0").timeout(std::time::Duration::from_secs(15)).send().await?.error_for_status()?.text().await?;
+        let marker=r#"<script id="__NEXT_DATA__" type="application/json">"#;
+        let start=html.find(marker).ok_or("нет данных Spotify")?+marker.len();
+        let end=start+html[start..].find("</script>").ok_or("нет данных Spotify")?;
+        let json:Value=serde_json::from_str(&html[start..end])?;
+        let entity=&json["props"]["pageProps"]["state"]["data"]["entity"];
+        let tracks=if kind==Kind::Track{vec![entity.clone()]}else{entity["trackList"].as_array().cloned().unwrap_or_default()};
+        let mut out=std::collections::HashMap::new();
+        for track in tracks{
+            let title=track["title"].as_str().or(track["name"].as_str()).unwrap_or("");
+            let artist=track["subtitle"].as_str().map(str::to_owned).unwrap_or_else(||track["artists"].as_array().map(|a|a.iter().filter_map(|v|v["name"].as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+            let query=format!("{artist} - {title}").replace('\u{a0}'," ").trim_matches([' ','-']).to_string();
+            let milliseconds=track["duration"].as_f64().or(track["duration_ms"].as_f64()).or(track["durationMs"].as_f64());
+            let uri=track["uri"].as_str().unwrap_or("");
+            let original=uri.strip_prefix("spotify:track:").map(|id|format!("https://open.spotify.com/track/{id}")).unwrap_or_else(||format!("https://open.spotify.com/{}/{id}",kind.path()));
+            out.insert(query,serde_json::json!({"expected_duration":milliseconds.map(|n|n/1000.),"original":original}));
+        }
+        Ok::<_,crate::Error>(out)
+    }.await;
+    result.unwrap_or_default()
+}
+
 /// Через Spotify API (только треки и альбомы).
 pub async fn api_lookup(web: &reqwest::Client, client_id: &str, secret: &str, kind: Kind, id: &str) -> Result<Found, crate::Error> {
     let token: Value = web

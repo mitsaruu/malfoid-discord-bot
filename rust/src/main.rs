@@ -28,6 +28,9 @@ mod moderation;
 mod patchnotes;
 mod pets;
 mod polls;
+mod qol;
+#[cfg(feature="voice")]
+mod music_qol;
 mod reminders;
 mod reply;
 mod shop;
@@ -322,6 +325,16 @@ async fn main() {
                 ai_commands::ai_limits(),
                 ai_commands::summary(),
                 ai_commands::quiz(),
+                qol::help(),
+                qol::server_settings(),
+                #[cfg(feature="voice")]
+                music_qol::nowplaying(),
+                #[cfg(feature="voice")]
+                music_qol::queue_remove(),
+                #[cfg(feature="voice")]
+                music_qol::queue_move(),
+                #[cfg(feature="voice")]
+                music_qol::queue_clear_mine(),
                 welcome::set_welcome_channel(),
                 daily::daily_setup(),
                 daily::daily_off(),
@@ -365,7 +378,10 @@ async fn main() {
                     let (ctx, data) = (framework.serenity_context, framework.user_data);
                     // Кнопка «Играть!» под картинкой игры в слова
                     if let serenity::FullEvent::InteractionCreate { interaction: serenity::Interaction::Component(press) } = event {
+                        if qol::help_pressed(ctx,press,&framework.options.commands).await{return Ok(())}
                         // …и кнопки вариантов в опросах
+                        #[cfg(feature = "voice")]
+                        if music_qol::version_pressed(ctx,data,press).await{return Ok(())}
                         #[cfg(feature = "voice")]
                         if music::button_pressed(ctx, data, press).await {
                             return Ok(()); // кнопки плеера: пауза, дальше, повтор, перемешать
@@ -407,6 +423,8 @@ async fn main() {
                 shop::start_expiry_loop(ctx.http.clone(), data.db.clone()); // снимать роли, срок которых вышел
                 levels::start_voice_xp_loop(ctx.clone(), data.clone()); // опыт за голосовые каналы, раз в минуту
                 wordstats::start_duel_loop(ctx.http.clone(), data.clone()); // итоги дуэлей в словах
+                #[cfg(feature="voice")]
+                music_qol::start_idle_loop(ctx.clone(),data.clone());
                 start_fast_loop(ctx.http.clone(), data.clone()); // напоминания и опросы
                 daily::start_loop(ctx.http.clone(), data.clone()); // утренние и вечерние сообщения
                 chat::start_chatter_loop(ctx.clone(), data.clone()); // случайные реплики по теме чата

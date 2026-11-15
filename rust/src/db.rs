@@ -197,6 +197,13 @@ impl Database {
                  PRIMARY KEY (guild_id, user_id, role_id)
              );",
         )?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS music_preferences (guild_id INTEGER PRIMARY KEY, empty_seconds INTEGER DEFAULT 180); CREATE TABLE IF NOT EXISTS music_choices (id TEXT PRIMARY KEY,guild_id INTEGER,user_id INTEGER,expires REAL,payload TEXT);")?;
+        let columns: Vec<String> = { let mut st=connection.prepare("PRAGMA table_info(queue)")?; let rows=st.query_map([],|r|r.get(1))?; rows.collect::<rusqlite::Result<_>>()? };
+        for (name, definition) in [("details", "TEXT"),("sort_order","INTEGER")] {
+            if !columns.iter().any(|c|c==name) {connection.execute_batch(&format!("ALTER TABLE queue ADD COLUMN {name} {definition}"))?;}
+        }
+        let has_details={let mut st=connection.prepare("PRAGMA table_info(playlists)")?;let rows=st.query_map([],|r|r.get::<_,String>(1))?;rows.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|c|c=="details")};
+        if !has_details{connection.execute_batch("ALTER TABLE playlists ADD COLUMN details TEXT")?;}
         Ok(Self { connection: Mutex::new(connection) })
     }
 
