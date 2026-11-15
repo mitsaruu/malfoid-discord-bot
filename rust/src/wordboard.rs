@@ -1,5 +1,5 @@
 //! Слова в чате: картинка с полями всех, кто играет в слово дня (обновляется после каждого хода),
-//! кнопка «Играть!», итоги вчерашнего дня и команды /wort и /slovo, которые открывают мини-приложение.
+//! кнопка «Играть!» и единая команда /words, которая открывает мини-приложение.
 
 use crate::draw::{self, Anchor, Fonts};
 use crate::levels::fetch_avatar;
@@ -104,8 +104,6 @@ pub struct BoardState {
     boards: tokio::sync::Mutex<HashMap<(u64, u64, String, Lang), (Option<serenity::MessageId>, Vec<Player>)>>,
     /// участник → байты аватарки (чтобы не качать её при каждом ходе)
     pub avatars: tokio::sync::Mutex<HashMap<u64, Option<Vec<u8>>>>,
-    /// (сервер, участник) → в какую игру он последний раз позвал (/wort или /slovo)
-    pub lang_choice: std::sync::Mutex<HashMap<(u64, u64), Lang>>,
 }
 
 /// Аватарка участника (скачивается один раз за запуск бота).
@@ -119,7 +117,7 @@ pub async fn cached_avatar(data: &Data, user: u64, face: &str) -> Option<Vec<u8>
     avatar
 }
 
-fn play_button(lang: Lang) -> Vec<serenity::CreateActionRow> {
+pub(crate) fn play_button(lang: Lang) -> Vec<serenity::CreateActionRow> {
     vec![serenity::CreateActionRow::Buttons(vec![serenity::CreateButton::new(lang.button())
         .label("Играть!")
         .emoji('🧩')
@@ -127,8 +125,11 @@ fn play_button(lang: Lang) -> Vec<serenity::CreateActionRow> {
 }
 
 /// Картинка с полями игроков слова дня в канале: создаёт её или обновляет.
-/// player — кто только что открыл игру или сделал ход (первый за день вызывает и итоги вчерашнего дня).
+/// player — кто только что открыл игру или сделал ход. Итоги публикует отдельное расписание.
 pub async fn update(ctx: &serenity::Context, data: &Data, guild: u64, channel: serenity::ChannelId, player: Player, lang: Lang) {
+    if let Err(error) = crate::wordsummary::remember_channel(data, guild, channel.get(), &player, lang) {
+        println!("Не получилось сохранить канал игры: {error}");
+    }
     if !data.words.settings.get(lang).announce {
         return;
     }
@@ -149,14 +150,6 @@ async fn update_inner(
     // Замок на всё обновление: двое зашли одновременно — всё равно одно сообщение
     let mut boards = data.boards.boards.lock().await;
     let no_pings = serenity::CreateAllowedMentions::new();
-    if data.db.mark_word_summary(lang.summary_table(), guild, &day)? {
-        let yesterday = words::day_before(&day);
-        let rows = data.db.word_day_rows(lang.table(), guild, &yesterday)?;
-        let streak = words::streak(&data.db.word_played_days(lang.table(), guild)?, &yesterday);
-        if let Some(summary) = words::summary_text(lang, &rows, streak) {
-            channel.send_message(ctx, serenity::CreateMessage::new().content(summary).allowed_mentions(no_pings.clone())).await?;
-        }
-    }
     boards.retain(|key, _| key.3 != lang || key.2 == day); // вчерашние картинки больше не обновляем
     let key = (guild, channel.get(), day, lang);
     let (message, mut players) = boards.get(&key).cloned().unwrap_or((None, Vec::new()));
@@ -231,12 +224,12 @@ where
 {
     if !data.miniapp_ready {
         respond(ephemeral(format!(
-            "🧩 Мини-приложение {} ещё не настроено. Админу: инструкция в README, раздел «Wortjagd».", lang.name()))).await?;
+            "🧩 Мини-приложение {} ещё не настроено. Админу: инструкция в rust/README.md, раздел «Игра в слова».", lang.name()))).await?;
         return Ok(());
     }
     if let Some(guild) = guild {
         // страница спросит при входе, какую игру открыть
-        data.boards.lang_choice.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert((guild.get(), user.get()), lang);
+        crate::wordsummary::set_lang(data, guild.get(), user.get(), lang)?;
     }
     if let Err(error) = respond(serenity::CreateInteractionResponse::LaunchActivity).await {
         println!("Не получилось открыть мини-приложение: {}", crate::interactions::sanitize_error(&error.to_string()));
@@ -251,26 +244,46 @@ where
 
 async fn open_from_command(ctx: Context<'_>, lang: Lang) -> Result<(), Error> {
     let poise::Context::Application(app) = ctx else { return Ok(()) };
+    if let Some(guild) = ctx.guild_id() {
+        let player = Player { id: ctx.author().id.get(), name: ctx.author().name.to_string(), face: ctx.author().face() };
+        crate::wordsummary::remember_channel(ctx.data(), guild.get(), ctx.channel_id().get(), &player, lang)?;
+    }
     let http = ctx.serenity_context().http.clone();
     open_miniapp(ctx.data(), ctx.guild_id(), ctx.author().id, lang, |response| app.interaction.create_response(&http, response)).await
 }
 
-/// Wortjagd: угадай немецкое слово из 5 букв (мини-приложение)
-#[poise::command(slash_command, guild_only)]
-pub async fn wort(ctx: Context<'_>) -> Result<(), Error> {
-    open_from_command(ctx, Lang::De).await
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+pub enum WordLanguage {
+    #[name = "Русский"]
+    Russian,
+    #[name = "Немецкий"]
+    German,
 }
 
-/// 5 букв: угадай русское слово из 5 букв (мини-приложение)
+/// 5 букв: русское и немецкое слово дня в мини-приложении
 #[poise::command(slash_command, guild_only)]
-pub async fn slovo(ctx: Context<'_>) -> Result<(), Error> {
-    open_from_command(ctx, Lang::Ru).await
+pub async fn words(
+    ctx: Context<'_>,
+    #[description = "Язык слова; без выбора — последний использованный"] language: Option<WordLanguage>,
+) -> Result<(), Error> {
+    let lang = match language {
+        Some(WordLanguage::Russian) => Lang::Ru,
+        Some(WordLanguage::German) => Lang::De,
+        None => crate::wordsummary::preferred_lang(ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get()),
+    };
+    open_from_command(ctx, lang).await
 }
 
 /// Нажатие кнопки «Играть!» под картинкой (работает и под старыми картинками, после перезапуска бота).
 /// Возвращает true, если это была наша кнопка.
 pub async fn play_pressed(ctx: &serenity::Context, data: &Data, press: &serenity::ComponentInteraction) -> bool {
     let Some(lang) = Lang::ALL.into_iter().find(|lang| lang.button() == press.data.custom_id) else { return false };
+    if let Some(guild) = press.guild_id {
+        let player = Player { id: press.user.id.get(), name: press.user.name.to_string(), face: press.user.face() };
+        if let Err(error) = crate::wordsummary::remember_channel(data, guild.get(), press.channel_id.get(), &player, lang) {
+            println!("Не получилось сохранить канал игры: {error}");
+        }
+    }
     let result = open_miniapp(data, press.guild_id, press.user.id, lang, |response| press.create_response(ctx, response)).await;
     if let Err(error) = result {
         println!("Кнопка «Играть!»: {}", crate::interactions::sanitize_error(&error.to_string()));
@@ -281,6 +294,15 @@ pub async fn play_pressed(ctx: &serenity::Context, data: &Data, press: &serenity
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unified_activity_exposes_one_optional_language() {
+        let command = words();
+        assert_eq!(command.name, "words");
+        assert_eq!(command.parameters.len(), 1);
+        assert_eq!(command.parameters[0].name, "language");
+        assert!(!command.parameters[0].required);
+    }
 
     #[test]
     fn captions() {

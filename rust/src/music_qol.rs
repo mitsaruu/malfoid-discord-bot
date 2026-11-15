@@ -244,6 +244,9 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
         return crate::reply::whisper(ctx, "Сейчас ничего не играет.").await;
     };
     let mut buttons = crate::music::music_buttons();
+    buttons.push(crate::music_library::favorite_button_for(
+        &ctx.data().db, guild, &url, &title, &details,
+    )?);
     if let Some(link) = original_button(&details) {
         buttons.push(s::CreateActionRow::Buttons(vec![link]));
     }
@@ -447,7 +450,7 @@ async fn version_choice(
         .query_row(
             "SELECT user_id,expires,payload FROM music_choices WHERE id=?1 AND guild_id=?2",
             params![nonce, guild.get() as i64],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     let mut text = "Выбор уже сделан или срок истёк.".to_owned();

@@ -1,4 +1,4 @@
-//! Игры в слова из 5 букв: Wortjagd — немецкие слова (/wort), «5 букв» — русские (/slovo).
+//! Игры в слова из 5 букв: /words открывает русское или немецкое слово дня.
 //! Здесь правила, словари, проверка слов по Викисловарю и работа с базой. Мини-приложение — в miniapp.rs,
 //! картинка и сообщения в чат — в wordboard.rs.
 //!
@@ -37,7 +37,7 @@ impl Lang {
     }
 
     pub fn command(self) -> &'static str {
-        ["/wort", "/slovo"][self as usize]
+        "/words"
     }
 
     /// «немецкое слово» / «русское слово»
@@ -118,7 +118,7 @@ pub struct WordSettings {
 
 impl WordSettings {
     pub fn load(settings: &crate::config::Settings) -> Self {
-        let load = |lang: Lang, default_zone: chrono_tz::Tz| {
+        let load = |lang: Lang| {
             let section = lang.section();
             let rewards = parse_numbers(&settings.text(section, "rewards", "500, 350, 250, 150, 100, 50"));
             LangSettings {
@@ -128,11 +128,12 @@ impl WordSettings {
                     "list" => Check::List,
                     _ => Check::Wiktionary,
                 },
-                timezone: settings.text(section, "timezone", default_zone.name()).parse().unwrap_or(default_zone),
+                // Оба слова закрываются к общим итогам в московскую полночь.
+                timezone: chrono_tz::Europe::Moscow,
                 announce: settings.text(section, "announce", "on").to_lowercase() == "on",
             }
         };
-        Self { langs: [load(Lang::De, chrono_tz::Europe::Berlin), load(Lang::Ru, chrono_tz::Europe::Moscow)] }
+        Self { langs: [load(Lang::De), load(Lang::Ru)] }
     }
 
     pub fn get(&self, lang: Lang) -> &LangSettings {
@@ -392,11 +393,21 @@ pub async fn is_real_word(data: &Data, word: &str, lang: Lang) -> Option<bool> {
 }
 
 const FINISHED: &str = "Слово дня уже отгадано (или попытки кончились) — приходи за новым словом завтра.";
+pub const DAY_CHANGED: &str = "Наступил новый день — поле обновилось. Введи слово заново, попытка не потрачена.";
 
 /// Догадка участника. Возвращает (партия, текст ошибки или None).
+#[cfg(test)]
 pub async fn make_guess(data: &Data, guild: u64, user: u64, name: &str, text: &str, lang: Lang) -> rusqlite::Result<(Game, Option<String>)> {
+    make_guess_for_day(data, guild, user, name, text, lang, None).await
+}
+
+/// Дата с экрана не позволяет перенести вчерашний ввод в новое слово.
+pub async fn make_guess_for_day(data: &Data, guild: u64, user: u64, name: &str, text: &str, lang: Lang, expected_day: Option<&str>) -> rusqlite::Result<(Game, Option<String>)> {
     let word = normalize(text, lang);
     let game = daily_game(data, guild, user, lang)?;
+    if expected_day.is_some_and(|day| day != game.day) {
+        return Ok((game, Some(DAY_CHANGED.to_string())));
+    }
     if game.finished() {
         return Ok((game, Some(FINISHED.to_string())));
     }
@@ -407,8 +418,12 @@ pub async fn make_guess(data: &Data, guild: u64, user: u64, name: &str, text: &s
         let hint = if lang == Lang::De { " (ä, ö, ü — можно)" } else { "" };
         return Ok((game, Some(format!("Нужно {} ровно из {WORD_LENGTH} букв{hint}.", lang.what()))));
     }
+    let started_day = game.day.clone();
     let real = is_real_word(data, &word, lang).await;
     let mut game = daily_game(data, guild, user, lang)?; // пока проверяли слово, партия могла измениться
+    if game.day != started_day {
+        return Ok((game, Some(DAY_CHANGED.to_string())));
+    }
     let shown = word.to_uppercase();
     let problem = match real {
         None => Some("Не получилось проверить слово (Викисловарь не отвечает) — попробуй ещё раз.".to_string()),
@@ -475,6 +490,7 @@ pub fn streak(played_days: &[String], last_day: &str) -> i64 {
 
 /// Итоги вчерашнего слова дня: серия дней и кто с какой попытки отгадал. None — вчера никто не доиграл.
 /// rows — вчерашние партии (участник, ответ, догадки через запятую).
+#[cfg(test)]
 pub fn summary_text(lang: Lang, rows: &[(u64, String, String)], streak: i64) -> Option<String> {
     let mut results: Vec<(usize, u64)> = Vec::new();
     for (user, answer, guesses) in rows {
@@ -519,6 +535,34 @@ pub fn day_number(lang: Lang, day: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_screen_cannot_spend_todays_attempt() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let data = crate::Data::new(crate::db::Database::in_memory().unwrap(), &crate::config::Settings::default(), dir, true);
+        for lang in Lang::ALL {
+            let game = daily_game(&data, 7, 42, lang).unwrap();
+            let (after, error) = make_guess_for_day(&data, 7, 42, "Игрок", &game.answer, lang, Some("1900-01-01")).await.unwrap();
+            assert_eq!(error.as_deref(), Some(DAY_CHANGED));
+            assert!(after.guesses.is_empty());
+            assert!(daily_game(&data, 7, 42, lang).unwrap().guesses.is_empty());
+        }
+    }
+
+    #[test]
+    fn unified_command_and_moscow_rollover() {
+        assert_eq!(Lang::Ru.command(), "/words");
+        assert_eq!(Lang::De.command(), "/words");
+        let old = crate::config::Settings::parse("[wortspiel]\ntimezone=Europe/Berlin\n[slovo]\ntimezone=Europe/Moscow\n");
+        let settings = WordSettings::load(&old);
+        let midnight: chrono::DateTime<chrono::Utc> = "2026-11-15T21:00:00Z".parse().unwrap();
+        for lang in Lang::ALL {
+            let tz = settings.get(lang).timezone;
+            assert_eq!(tz, chrono_tz::Europe::Moscow);
+            assert_eq!(midnight.with_timezone(&tz).date_naive().to_string(), "2026-11-16");
+            assert_eq!((midnight - chrono::Duration::seconds(1)).with_timezone(&tz).date_naive().to_string(), "2026-11-15");
+        }
+    }
 
     fn marks(guess: &str, answer: &str) -> String {
         score_guess(guess, answer).iter().map(|mark| ["c", "p", "x"][*mark as usize]).collect()

@@ -1,7 +1,14 @@
 # Секреты и данные бота — их нельзя выкладывать в интернет
 start.bat
+.env
+.env.*
+!.env.example
 levels.db
 levels.db-journal
+levels.db-wal
+levels.db-shm
+backups/
+logs/
 
 # Служебные папки Python
 __pycache__/

@@ -264,12 +264,31 @@ function renderPlayers(data) {
   }
 }
 
+let refreshingPlayers = false;
 async function refreshPlayers() {
-  if (!session || document.hidden) return;
+  if (!session || document.hidden || refreshingPlayers) return;
+  refreshingPlayers = true;
   try {
-    renderPlayers(await api("api/players"));
+    const data = await api("api/players");
+    if (data.lang && data.lang !== lang) return;
+    renderPlayers(data);
+    // Открытая игра тоже переходит к новому слову после московской полуночи.
+    if (!busy && state && data.day && data.day !== state.day) {
+      busy = true;
+      try {
+        state = (await api("api/state")).state;
+        typed = "";
+        playersKey = "";
+        render(-1);
+        showGameStatus();
+      } finally {
+        busy = false;
+      }
+    }
   } catch (error) {
     // не страшно — попробуем в следующий раз
+  } finally {
+    refreshingPlayers = false;
   }
 }
 
@@ -292,10 +311,16 @@ async function press(key) {
     }
     busy = true;
     try {
-      const data = await api("api/guess", { word: typed });
+      const previousDay = state.day;
+      const data = await api("api/guess", { word: typed, day: previousDay });
       const before = state.rows.length;
       state = data.state;
       if (data.error) {
+        if (state.day !== previousDay) {
+          typed = "";
+          playersKey = "";
+          render(-1);
+        }
         setStatus(data.error, "error");
         shake();
       } else {
@@ -356,9 +381,9 @@ for (const button of document.querySelectorAll(".lang")) {
 // ---------- Запуск ----------
 async function start() {
   buildBoard();
-  setLanguage("de");
+  setLanguage("ru");
   if (!params.get("frame_id")) {
-    loadingFailed("Эта страница открывается внутри Discord: команда /wort, /slovo или кнопка запуска приложения.");
+    loadingFailed("Эта страница открывается внутри Discord: команда /words или кнопка запуска приложения.");
     return;
   }
   try {

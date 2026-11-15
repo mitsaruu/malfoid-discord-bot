@@ -10,11 +10,14 @@ use std::collections::BTreeSet;
 /// Какие команды работают только в канале для игр, если его выбрали (settings.ini → [channels] games_commands).
 pub const DEFAULT_GAMES_COMMANDS: &str = "rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, \
     dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, \
-    dice, roll, predskazanie, shar, wort, slovo, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz";
+    dice, roll, predskazanie, shar, words, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz";
 
 /// Названия через запятую → набор названий без «/» и в нижнем регистре.
 pub fn parse_commands(text: &str) -> BTreeSet<String> {
-    text.split(',').map(|name| name.trim().trim_start_matches('/').to_lowercase()).filter(|name| !name.is_empty()).collect()
+    text.split(',').map(|name| {
+        let name = name.trim().trim_start_matches('/').to_lowercase();
+        if matches!(name.as_str(), "wort" | "slovo") { "words".to_string() } else { name }
+    }).filter(|name| !name.is_empty()).collect()
 }
 
 /// Что боту можно в этом канале. None — не получилось узнать (нет данных о сервере).
@@ -36,7 +39,7 @@ pub fn allowed_here(games: &BTreeSet<String>, command: &str, games_channel: Opti
 pub async fn games_channel_check(ctx: Context<'_>) -> Result<bool, Error> {
     let Some(guild) = ctx.guild_id() else { return Ok(true) }; // в личных сообщениях можно всё
     let data = ctx.data();
-    if !data.games_commands.contains(&ctx.command().name) {
+    if !data.games_commands.contains(ctx.command().name.as_ref()) {
         return Ok(true);
     }
     let games_channel = data.db.games_channel(guild.get())?;
@@ -174,5 +177,9 @@ mod tests {
         assert!(allowed_here(&games, "rank", Some(9), 9, None));
         assert!(allowed_here(&games, "rank", Some(9), 5, Some(9))); // ветка внутри канала для игр
         assert!(parse_commands(DEFAULT_GAMES_COMMANDS).contains("wordduel"));
+        let legacy = parse_commands("wort, /slovo, wordstats");
+        assert!(legacy.contains("words"));
+        assert!(!legacy.contains("wort") && !legacy.contains("slovo"));
+        assert!(!allowed_here(&legacy, "words", Some(9), 5, None));
     }
 }

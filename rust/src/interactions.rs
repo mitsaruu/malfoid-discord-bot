@@ -21,11 +21,11 @@ pub fn error_context(ctx: Context<'_>) -> String {
 
 /// None — специальный ответ запуска Activity. Некоторые команды изначально видны только автору.
 fn defer_privately(command: &str) -> Option<bool> {
-    if matches!(command, "wort" | "slovo") {
+    if matches!(command, "words" | "wort" | "slovo") {
         return None;
     }
     Some(matches!(command,
-        "help" | "server_settings" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
+        "help" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
         "patchnotes" | "patchnotes_channel" | "log_channel" | "shop_add" | "shop_remove" | "daily_test"
     ))
 }
@@ -76,6 +76,9 @@ mod tests {
 
     #[test]
     fn activity_and_private_commands_keep_their_response_type() {
+        assert_eq!(defer_privately("words"), None);
+        assert_eq!(defer_privately("favorites"), Some(true));
+        assert_eq!(defer_privately("history"), Some(true));
         assert_eq!(defer_privately("wort"), None);
         assert_eq!(defer_privately("slovo"), None);
         assert_eq!(defer_privately("remind"), Some(true));

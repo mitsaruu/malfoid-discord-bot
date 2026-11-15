@@ -204,7 +204,11 @@ impl Database {
         }
         let has_details={let mut st=connection.prepare("PRAGMA table_info(playlists)")?;let rows=st.query_map([],|r|r.get::<_,String>(1))?;rows.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|c|c=="details")};
         if !has_details{connection.execute_batch("ALTER TABLE playlists ADD COLUMN details TEXT")?;}
-        Ok(Self { connection: Mutex::new(connection) })
+        let database = Self { connection: Mutex::new(connection) };
+        crate::wordsummary::prepare(&database)?;
+        #[cfg(feature = "voice")]
+        crate::music_library::prepare(&database)?;
+        Ok(database)
     }
 
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -566,6 +570,7 @@ impl Database {
     }
 
     /// Отмечает, что итоги вчерашнего дня на сервере уже написаны. true — отметили только что (значит, пора писать).
+    #[cfg(test)]
     pub fn mark_word_summary(&self, table: &str, guild: u64, day: &str) -> rusqlite::Result<bool> {
         let added = self.lock().execute(
             &format!("INSERT OR IGNORE INTO {table} (guild_id, day) VALUES (?1, ?2)"),

@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const TRACK_TOO_SHORT: Duration = Duration::from_secs(3); // трек «закончился» быстрее — значит, звук не загрузился
+pub(crate) const TRACK_TOO_SHORT: Duration = Duration::from_secs(3); // трек «закончился» быстрее — значит, звук не загрузился
 const MAX_PLAYLISTS: usize = 25; // сколько плейлистов может сохранить один сервер
 const MAX_PLAYLIST_SAVE: usize = 100; // сколько треков помещается в один плейлист
 const NOT_PLAYING: &str = "Сейчас ничего не играет.";
@@ -59,6 +59,8 @@ pub struct MusicState {
     guilds: Mutex<HashMap<u64, GuildMusic>>,
     /// «Замки»: не дают включить два трека одновременно, если play_next вызвали сразу из двух мест
     locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes voice destination checks/joins, independently of long track resolution.
+    voice_operations: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// Сервер → ссылки, которые недавно играли (чтобы автоплей не ходил по кругу)
     autoplay_recent: Mutex<HashMap<u64, Vec<String>>>,
 }
@@ -74,6 +76,11 @@ impl MusicState {
 
     pub(crate) fn lock_for(&self, guild: u64) -> Arc<tokio::sync::Mutex<()>> {
         locked(&self.locks).entry(guild).or_default().clone()
+    }
+
+    async fn voice_operation(&self, guild: u64) -> tokio::sync::OwnedMutexGuard<()> {
+        let operation = locked(&self.voice_operations).entry(guild).or_default().clone();
+        operation.lock_owned().await
     }
 }
 
@@ -320,12 +327,112 @@ fn user_channel(ctx: &serenity::Context, guild: serenity::GuildId, user: serenit
 }
 
 /// Заходит в голосовой канал (если бот ещё не там). Текст ошибки — если не получилось.
-async fn join(ctx: &serenity::Context, guild: serenity::GuildId, channel: serenity::ChannelId) -> Result<(), String> {
-    if bot_channel(ctx, guild).await.is_some() {
-        return Ok(());
+async fn join(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId, channel: serenity::ChannelId) -> Result<(), String> {
+    let _operation = data.music.voice_operation(guild.get()).await;
+    join_inner(ctx, guild, channel).await
+}
+
+/// Returns whether a join is needed; an existing connection may never be moved
+/// to another caller's channel as a side effect of replay or /play.
+fn voice_destination(current: Option<u64>, requested: u64) -> Result<bool, String> {
+    match current {
+        None => Ok(true),
+        Some(current) if current == requested => Ok(false),
+        Some(_) => Err("Зайди в голосовой канал бота.".into()),
     }
+}
+
+/// Caller holds MusicState::voice_operation; never take the play_next lock here.
+async fn join_inner(ctx: &serenity::Context, guild: serenity::GuildId, channel: serenity::ChannelId) -> Result<(), String> {
+    if !voice_destination(bot_channel(ctx, guild).await.map(|id| id.0.get()), channel.get())? { return Ok(()); }
     let manager = songbird::get(ctx).await.ok_or("голосовой модуль не запущен")?;
     manager.join(guild, channel).await.map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// Replay a selected saved song through the normal queue/resolver/play_next flow.
+/// Callers must defer their interaction before awaiting this helper.
+pub async fn enqueue_saved(
+    ctx: &serenity::Context,
+    data: &Shared,
+    guild: serenity::GuildId,
+    user: serenity::UserId,
+    channel: serenity::ChannelId,
+    track: &crate::music_library::SavedTrack,
+) -> Result<(), Error> {
+    enqueue_saved_many(ctx, data, guild, user, channel, std::slice::from_ref(track)).await?;
+    Ok(())
+}
+
+/// Join/check voice once and start the normal queue once for a bounded collection.
+/// Returns the number queued; at most MAX_BULK_FAVORITES (200) are accepted per call.
+pub async fn enqueue_saved_many(
+    ctx: &serenity::Context,
+    data: &Shared,
+    guild: serenity::GuildId,
+    user: serenity::UserId,
+    channel: serenity::ChannelId,
+    tracks: &[crate::music_library::SavedTrack],
+) -> Result<usize, Error> {
+    if tracks.is_empty() { return Ok(0); }
+    let operation = data.music.voice_operation(guild.get()).await;
+    let voice = user_channel(ctx, guild, user).ok_or("Сначала зайди в голосовой канал.")?;
+    join_inner(ctx, guild, voice).await.map_err(|error| format!("Не получилось зайти в голосовой канал: {error}"))?;
+    // Joining is asynchronous: reject users who left/moved before queue insertion.
+    let current_voice = user_channel(ctx, guild, user).ok_or("Ты вышел из голосового канала — трек не добавлен.")?;
+    if current_voice != voice || bot_channel(ctx, guild).await.is_none_or(|bot| bot.0.get() != current_voice.get()) {
+        return Err("Зайди в голосовой канал бота — трек не добавлен.".into());
+    }
+    let mut count = 0;
+    for track in tracks.iter().take(crate::music_library::MAX_BULK_FAVORITES) {
+        crate::music_library::enqueue_track(data, guild.get(), user.get(), track)?;
+        count += 1;
+    }
+    drop(operation);
+    play_next(ctx, data, guild, channel).await;
+    Ok(count)
+}
+
+/// A single confirmation guard is shared by progress, End and Error callbacks.
+/// Its identity belongs to the playing instance, not the queue request/repeat URL.
+#[derive(Clone)]
+struct LibraryPlayback {
+    data: Shared,
+    guild: u64,
+    snapshot_id: i64,
+    instance: String,
+    confirmed: Arc<Mutex<bool>>,
+}
+
+impl LibraryPlayback {
+    fn observe(&self, event: &EventContext<'_>) -> bool {
+        let EventContext::Track(tracks) = event else { return false };
+        let Some((state, _)) = tracks.first() else { return false };
+        let mut confirmed = locked(&self.confirmed);
+        if *confirmed { return true; }
+        // Songbird play_time advances with decoded frames, unlike time since spawn.
+        match crate::music_library::record_confirmed(&self.data.db, self.guild, self.snapshot_id,
+            &self.instance, state.play_time, chrono::Utc::now().timestamp()) {
+            Ok(true) => {
+                *confirmed = true;
+                // Preserve the existing monthly chart, but only count confirmed audio.
+                let title = self.data.db.lock().query_row(
+                    "SELECT title FROM music_library_tracks WHERE id=?1", [self.snapshot_id], |r| r.get::<_, String>(0)).ok();
+                if let Some(title) = title {
+                    let _ = self.data.db.record_play(self.guild, &chrono::Local::now().format("%Y-%m").to_string(), &title);
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(error) => { println!("История музыки: {error}"); false }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl songbird::EventHandler for LibraryPlayback {
+    async fn act(&self, event: &EventContext<'_>) -> Option<Event> {
+        if self.observe(event) { Some(Event::Cancel) } else { None }
+    }
 }
 
 /// Обработчик «трек закончился» (или сломался).
@@ -337,6 +444,7 @@ struct TrackEnd {
     title: String,
     log: Arc<Mutex<String>>,                    // что написал yt-dlp
     done: Arc<std::sync::atomic::AtomicBool>,   // End и Error могут прийти оба — обрабатываем один раз
+    library: Option<LibraryPlayback>,
 }
 
 #[async_trait::async_trait]
@@ -344,6 +452,9 @@ impl songbird::EventHandler for TrackEnd {
     async fn act(&self, event: &EventContext<'_>) -> Option<Event> {
         if self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return None;
+        }
+        if let Some(library) = &self.library {
+            library.observe(event); // catches a manual skip after 3s but before the next periodic tick
         }
         let (played, error) = match event {
             EventContext::Track(tracks) => tracks.first().map_or((Duration::ZERO, None), |(state, _)| {
@@ -459,6 +570,17 @@ pub async fn play_next(ctx: &serenity::Context, data: &Shared, guild: serenity::
     let volume = data.music.with(guild.get(), |state| state.volume.unwrap_or(1.0));
     let handle = call.lock().await.play_input(input);
     let _ = handle.set_volume(volume);
+    let snapshot = match crate::music_library::snapshot(&data.db, guild.get(), &url, &title, &details) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => { println!("Снимок трека: {error}"); None }
+    };
+    let library = snapshot.as_ref().map(|snapshot| LibraryPlayback {
+        data: data.clone(), guild: guild.get(), snapshot_id: snapshot.id,
+        instance: handle.uuid().to_string(), confirmed: Arc::new(Mutex::new(false)),
+    });
+    if let Some(library) = &library {
+        let _ = handle.add_event(Event::Periodic(Duration::from_secs(1), None), library.clone());
+    }
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let end = || TrackEnd {
         ctx: ctx.clone(),
@@ -468,6 +590,7 @@ pub async fn play_next(ctx: &serenity::Context, data: &Shared, guild: serenity::
         title: title.clone(),
         log: log.clone(),
         done: done.clone(),
+        library: library.clone(),
     };
     let _ = handle.add_event(Event::Track(TrackEvent::End), end());
     let _ = handle.add_event(Event::Track(TrackEvent::Error), end());
@@ -481,10 +604,9 @@ pub async fn play_next(ctx: &serenity::Context, data: &Shared, guild: serenity::
     drop(_guard);
     let message = serenity::CreateMessage::new()
         .embed(crate::music_qol::card(&title,&url,&details,data.db.queue_count(guild.get()).unwrap_or(0)))
-        .components({let mut rows=music_buttons();if let Some(link)=crate::music_qol::original_button(&details){rows.push(serenity::CreateActionRow::Buttons(vec![link]));}rows})
+        .components({let mut rows=music_buttons();if let Some(snapshot)=&snapshot{rows.push(crate::music_library::favorite_button(guild.get(),snapshot.id));}if let Some(link)=crate::music_qol::original_button(&details){rows.push(serenity::CreateActionRow::Buttons(vec![link]));}rows})
         .allowed_mentions(serenity::CreateAllowedMentions::new());
     let _ = channel.send_message(ctx, message).await;
-    let _ = data.db.record_play(guild.get(), &chrono::Local::now().format("%Y-%m").to_string(), &title); // для топа месяца
 }
 
 /// Очередь кончилась: если автоплей включён и бота кто-то слушает — добавляет в очередь похожий трек.
@@ -533,7 +655,7 @@ pub async fn play(
     };
     ctx.defer().await?; // поиск дольше 3 секунд, которые даёт Discord
     let was_playing = current_mode(data, guild.get()).await.is_some();
-    if let Err(error) = join(ctx.serenity_context(), guild, voice).await {
+    if let Err(error) = join(ctx.serenity_context(), data, guild, voice).await {
         ctx.say(format!("⚠️ Не получилось зайти в голосовой канал: `{error}`")).await?;
         return Ok(());
     }
@@ -652,20 +774,15 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
     if mode.is_some() {
         return whisper(ctx, "Музыка и так играет 🙂").await;
     }
-    if bot_channel(ctx.serenity_context(), guild).await.is_none() {
-        // бот не в канале — заходим к тому, кто вызвал команду
-        let Some(voice) = user_channel(ctx.serenity_context(), guild, ctx.author().id) else {
-            return whisper(ctx, "Сначала зайди в голосовой канал.").await;
-        };
-        ctx.defer().await?;
-        if let Err(error) = join(ctx.serenity_context(), guild, voice).await {
-            ctx.say(format!("⚠️ Не получилось зайти в голосовой канал: `{error}`")).await?;
-            return Ok(());
-        }
-        ctx.say(format!("▶️ Продолжаю сохранённую очередь: {}.", tracks_text(waiting))).await?;
-    } else {
-        ctx.say("▶️ Продолжаю очередь.").await?;
+    let Some(voice) = user_channel(ctx.serenity_context(), guild, ctx.author().id) else {
+        return whisper(ctx, "Сначала зайди в голосовой канал.").await;
+    };
+    ctx.defer().await?;
+    if let Err(error) = join(ctx.serenity_context(), data, guild, voice).await {
+        ctx.say(format!("⚠️ Не получилось зайти в голосовой канал: `{error}`")).await?;
+        return Ok(());
     }
+    ctx.say(format!("▶️ Продолжаю сохранённую очередь: {}.", tracks_text(waiting))).await?;
     play_next(ctx.serenity_context(), data, guild, ctx.channel_id()).await;
     Ok(())
 }
@@ -818,7 +935,7 @@ pub async fn playlist_play(
         return whisper(ctx, "Сначала зайди в голосовой канал.").await;
     };
     ctx.defer().await?;
-    if let Err(error) = join(ctx.serenity_context(), guild, voice).await {
+    if let Err(error) = join(ctx.serenity_context(), data, guild, voice).await {
         ctx.say(format!("⚠️ Не получилось зайти в голосовой канал: `{error}`")).await?;
         return Ok(());
     }
@@ -999,6 +1116,40 @@ pub async fn button_pressed(ctx: &serenity::Context, data: &Shared, press: &sere
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_voice_operations_recheck_destination_before_queueing() {
+        let music = MusicState::default();
+        let destination = Mutex::new(None);
+        let queued = Mutex::new(Vec::new());
+        let attempt = |requested| {
+            let (music, destination, queued) = (&music, &destination, &queued);
+            async move {
+                let _operation = music.voice_operation(1).await;
+                let needs_join = voice_destination(*locked(&destination), requested)?;
+                // Model the await in Songbird join: a second entry point must not
+                // inspect the disconnected state until this operation enqueues.
+                tokio::task::yield_now().await;
+                if needs_join { *locked(&destination) = Some(requested); }
+                locked(&queued).push(requested);
+                Ok::<_, String>(())
+            }
+        };
+        let (first, second) = tokio::join!(attempt(10), attempt(20));
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(locked(&queued).as_slice(), &[(*locked(&destination)).unwrap()]);
+        // Guilds and play_next have independent locks.
+        let _operation = music.voice_operation(1).await;
+        let _other_guild = tokio::time::timeout(Duration::from_secs(1), music.voice_operation(2)).await.unwrap();
+        assert!(music.lock_for(1).try_lock().is_ok());
+    }
+
+    #[test]
+    fn joining_accepts_same_channel_and_refuses_another_channel() {
+        assert!(voice_destination(None, 10).unwrap());
+        assert!(!voice_destination(Some(10), 10).unwrap());
+        assert!(voice_destination(Some(20), 10).is_err());
+    }
 
     /// Проверка без Discord: yt-dlp качает настоящий трек, а бот распознаёт формат звука.
     /// Нужны интернет и yt-dlp, поэтому тест запускается только вручную: cargo test -- --ignored

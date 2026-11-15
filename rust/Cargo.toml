@@ -9,7 +9,7 @@ description = "Discord-бот на Rust (переписывается с bot.py 
 poise = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
 # Та же база levels.db, что и у bot.py. bundled — SQLite собирается вместе с ботом, ставить его отдельно не нужно
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 rand = "0.9"
 chrono = "0.4"
 chrono-tz = "0.10"

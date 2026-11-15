@@ -46,6 +46,8 @@ fn section(name: &str) -> usize {
             | "queue_remove"
             | "queue_move"
             | "queue_clear_mine"
+            | "favorites"
+            | "history"
     ) {
         0
     } else if name.starts_with("pet")
@@ -95,7 +97,7 @@ fn help_embed(commands: &[poise::Command<Shared, Error>], page: usize) -> s::Cre
     let example = [
         "`/play название` · `/queue_move from:3 to:1`",
         "`/daily` · `/pets` · `/shop`",
-        "`/slovo` · `/wordstats`",
+        "`/words` · `/wordstats`",
         "`/ask question:объясни закон Ома`",
         "`/remind after:2ч text:проверить сервер` · `/server_settings`",
     ][page];
@@ -195,7 +197,7 @@ pub async fn server_settings(
         .query_row(
             "SELECT channel_id FROM patchnotes_channel WHERE guild_id=?1",
             [guild.get() as i64],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0).map(|id| id as u64),
         )
         .ok();
     let settings = crate::config::Settings::load(&data.dir.join("config/settings.ini"));

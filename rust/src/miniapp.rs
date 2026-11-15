@@ -134,6 +134,17 @@ fn text_field(body: &Value, key: &str) -> String {
     }
 }
 
+// channel_id приходит со страницы: не позволяем записать канал другого сервера
+// как постоянный адрес для игровых картинок и ежедневных итогов.
+async fn session_channel(app: &Miniapp, body: &Value, guild: u64) -> Option<u64> {
+    let id = text_field(body, "channel_id").parse::<u64>().ok().filter(|id| *id != 0)?;
+    let channel = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        serenity::ChannelId::new(id).to_channel(&app.ctx),
+    ).await.ok()?.ok()?.guild()?;
+    (channel.guild_id.get() == guild).then_some(id)
+}
+
 /// Вход: страница получила от Discord одноразовый код — меняем его на токен и узнаём, кто это.
 async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
     let (code, guild_id) = (text_field(&body, "code"), text_field(&body, "guild_id"));
@@ -177,10 +188,11 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         return Err(json_error("Ты не участник этого сервера.", StatusCode::FORBIDDEN));
     };
     let now = db::now();
-    let lang = locked(&app.data.boards.lang_choice).get(&(guild, user)).copied().unwrap_or(Lang::De); // какую игру звал
+    let lang = crate::wordsummary::preferred_lang(&app.data, guild, user);
+    let channel = session_channel(&app, &body, guild).await;
     let session = Session {
         guild, user, name: name.clone(), face, time: now, lang,
-        channel: text_field(&body, "channel_id").parse().ok().filter(|id| *id != 0),
+        channel,
     };
     let pass = Alphanumeric.sample_string(&mut rand::rng(), 32);
     {
@@ -205,7 +217,9 @@ async fn state(State(app): State<App>, headers: HeaderMap) -> Reply {
 async fn guess(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
     let (_, session) = app.session(&headers)?;
     let word = text_field(&body, "word");
-    let (game, problem) = words::make_guess(&app.data, session.guild, session.user, &session.name, &word, session.lang)
+    let expected_day = text_field(&body, "day");
+    let expected_day = (!expected_day.is_empty()).then_some(expected_day.as_str());
+    let (game, problem) = words::make_guess_for_day(&app.data, session.guild, session.user, &session.name, &word, session.lang, expected_day)
         .await
         .map_err(failed)?;
     if problem.is_none() {
@@ -232,7 +246,7 @@ async fn new_game(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
         if let Some(stored) = locked(&app.sessions).get_mut(&pass) {
             stored.lang = lang;
         }
-        locked(&app.data.boards.lang_choice).insert((session.guild, session.user), lang);
+        crate::wordsummary::set_lang(&app.data, session.guild, session.user, lang).map_err(failed)?;
     }
     let game = words::daily_game(&app.data, session.guild, session.user, session.lang).map_err(failed)?;
     if switched.is_some() && !game.finished() {
@@ -261,7 +275,7 @@ async fn players(State(app): State<App>, headers: HeaderMap) -> Reply {
     }
     players.sort_by_key(|(other, _)| *other); // сам игрок — первым
     let players: Vec<Value> = players.into_iter().take(12).map(|(_, player)| player).collect();
-    Ok(Json(json!({ "players": players, "guild": session.guild.to_string() })).into_response())
+    Ok(Json(json!({ "players": players, "guild": session.guild.to_string(), "day": day, "lang": lang.key() })).into_response())
 }
 
 /// Аватарка участника из Discord (картинки с чужих сайтов внутри Discord-приложения не грузятся,

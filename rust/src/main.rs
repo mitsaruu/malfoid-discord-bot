@@ -10,6 +10,7 @@
 //!   YTDLP           — как запускать yt-dlp (по умолчанию «yt-dlp»; на сервере — «venv/bin/python -m yt_dlp»).
 
 mod admin;
+mod backups;
 mod ai;
 mod ai_commands;
 mod blackjack;
@@ -43,7 +44,10 @@ mod weather;
 mod welcome;
 mod wordboard;
 mod wordstats;
+mod wordsummary;
 mod words;
+#[cfg(feature = "voice")]
+mod music_library;
 
 use poise::serenity_prelude as serenity;
 #[cfg(feature = "voice")]
@@ -248,6 +252,108 @@ fn start_fast_loop(http: std::sync::Arc<serenity::Http>, data: Shared) {
     });
 }
 
+fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
+    vec![
+        economy::balance(),
+        economy::work(),
+        economy::daily(),
+        economy::give_money(),
+        economy::coinflip(),
+        economy::slots(),
+        blackjack::blackjack(),
+        pets::open_case(),
+        pets::cases(),
+        pets::show_pets(),
+        pets::pets_collect(),
+        pets::pet_feed(),
+        pets::pet_sell(),
+        pets::pet_battle(),
+        pets::pet_trade(),
+        shop::shop(),
+        shop::shop_buy(),
+        shop::shop_add(),
+        shop::shop_remove(),
+        levels::rank(),
+        levels::leaderboard(),
+        levels::money_leaderboard(),
+        wordboard::words(),
+        wordstats::wordstats(),
+        wordstats::wordtop(),
+        wordstats::wordduel(),
+        fun::dice(),
+        fun::roll(),
+        fun::predskazanie(),
+        fun::shar(),
+        fun::dick_growth(),
+        fun::dick_size(),
+        fun::dick_leaderboard(),
+        reminders::remind(),
+        reminders::reminders(),
+        polls::poll(),
+        patchnotes::show(),
+        patchnotes::set_channel(),
+        admin::set_games_channel(),
+        admin::set_log_channel(),
+        admin::show_warns(),
+        admin::warns_clear(),
+        weather::weather(),
+        weather::weather_cities(),
+        ai_commands::ask(),
+        ai_commands::forget(),
+        ai_commands::ai_limits(),
+        ai_commands::summary(),
+        ai_commands::quiz(),
+        qol::help(),
+        qol::server_settings(),
+        #[cfg(feature="voice")]
+        music_qol::nowplaying(),
+        #[cfg(feature="voice")]
+        music_qol::queue_remove(),
+        #[cfg(feature="voice")]
+        music_qol::queue_move(),
+        #[cfg(feature="voice")]
+        music_qol::queue_clear_mine(),
+        #[cfg(feature="voice")]
+        music_library::favorites(),
+        #[cfg(feature="voice")]
+        music_library::history(),
+        welcome::set_welcome_channel(),
+        daily::daily_setup(),
+        daily::daily_off(),
+        daily::daily_test(),
+        #[cfg(feature = "voice")]
+        music::play(),
+        #[cfg(feature = "voice")]
+        music::skip(),
+        #[cfg(feature = "voice")]
+        music::pause(),
+        #[cfg(feature = "voice")]
+        music::resume(),
+        #[cfg(feature = "voice")]
+        music::show_queue(),
+        #[cfg(feature = "voice")]
+        music::remove_all(),
+        #[cfg(feature = "voice")]
+        music::setvolume(),
+        #[cfg(feature = "voice")]
+        music::leave(),
+        #[cfg(feature = "voice")]
+        music::autoplay(),
+        #[cfg(feature = "voice")]
+        music::playlist_save(),
+        #[cfg(feature = "voice")]
+        music::playlist_play(),
+        #[cfg(feature = "voice")]
+        music::show_playlists(),
+        #[cfg(feature = "voice")]
+        music::playlist_delete(),
+        #[cfg(feature = "voice")]
+        music::lyrics(),
+        #[cfg(feature = "voice")]
+        music::top_chart_month(),
+    ]
+}
+
 #[tokio::main]
 async fn main() {
     let Ok(token) = std::env::var("DISCORD_TOKEN") else {
@@ -267,6 +373,7 @@ async fn main() {
     let client_secret = std::env::var("DISCORD_CLIENT_SECRET").ok().filter(|secret| !secret.is_empty());
     let miniapp_host = settings.text("miniapp", "host", "127.0.0.1");
     let miniapp_port = settings.int("miniapp", "port", 8080).clamp(0, 65535) as u16;
+    let backup_settings = backups::BackupSettings::load(&settings);
     let data: Shared = std::sync::Arc::new(Data::new(database, &settings, dir.clone(), client_secret.is_some() && miniapp_port > 0));
     let test_guild = std::env::var("TEST_GUILD_ID").ok().and_then(|id| id.parse::<u64>().ok());
     let register_global = std::env::var("REGISTER_GLOBAL").is_ok_and(|value| value == "1");
@@ -274,102 +381,7 @@ async fn main() {
     let token_for_setup = token.clone();
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![
-                economy::balance(),
-                economy::work(),
-                economy::daily(),
-                economy::give_money(),
-                economy::coinflip(),
-                economy::slots(),
-                blackjack::blackjack(),
-                pets::open_case(),
-                pets::cases(),
-                pets::show_pets(),
-                pets::pets_collect(),
-                pets::pet_feed(),
-                pets::pet_sell(),
-                pets::pet_battle(),
-                pets::pet_trade(),
-                shop::shop(),
-                shop::shop_buy(),
-                shop::shop_add(),
-                shop::shop_remove(),
-                levels::rank(),
-                levels::leaderboard(),
-                levels::money_leaderboard(),
-                wordboard::wort(),
-                wordboard::slovo(),
-                wordstats::wordstats(),
-                wordstats::wordtop(),
-                wordstats::wordduel(),
-                fun::dice(),
-                fun::roll(),
-                fun::predskazanie(),
-                fun::shar(),
-                fun::dick_growth(),
-                fun::dick_size(),
-                fun::dick_leaderboard(),
-                reminders::remind(),
-                reminders::reminders(),
-                polls::poll(),
-                patchnotes::show(),
-                patchnotes::set_channel(),
-                admin::set_games_channel(),
-                admin::set_log_channel(),
-                admin::show_warns(),
-                admin::warns_clear(),
-                weather::weather(),
-                weather::weather_cities(),
-                ai_commands::ask(),
-                ai_commands::forget(),
-                ai_commands::ai_limits(),
-                ai_commands::summary(),
-                ai_commands::quiz(),
-                qol::help(),
-                qol::server_settings(),
-                #[cfg(feature="voice")]
-                music_qol::nowplaying(),
-                #[cfg(feature="voice")]
-                music_qol::queue_remove(),
-                #[cfg(feature="voice")]
-                music_qol::queue_move(),
-                #[cfg(feature="voice")]
-                music_qol::queue_clear_mine(),
-                welcome::set_welcome_channel(),
-                daily::daily_setup(),
-                daily::daily_off(),
-                daily::daily_test(),
-                #[cfg(feature = "voice")]
-                music::play(),
-                #[cfg(feature = "voice")]
-                music::skip(),
-                #[cfg(feature = "voice")]
-                music::pause(),
-                #[cfg(feature = "voice")]
-                music::resume(),
-                #[cfg(feature = "voice")]
-                music::show_queue(),
-                #[cfg(feature = "voice")]
-                music::remove_all(),
-                #[cfg(feature = "voice")]
-                music::setvolume(),
-                #[cfg(feature = "voice")]
-                music::leave(),
-                #[cfg(feature = "voice")]
-                music::autoplay(),
-                #[cfg(feature = "voice")]
-                music::playlist_save(),
-                #[cfg(feature = "voice")]
-                music::playlist_play(),
-                #[cfg(feature = "voice")]
-                music::show_playlists(),
-                #[cfg(feature = "voice")]
-                music::playlist_delete(),
-                #[cfg(feature = "voice")]
-                music::lyrics(),
-                #[cfg(feature = "voice")]
-                music::top_chart_month(),
-            ],
+            commands: bot_commands(),
             on_error: |error| Box::pin(on_error(error)),
             // Перед каждой командой: игры и рейтинги — только в канале для игр, если его выбрали
             command_check: Some(|ctx| Box::pin(interactions::before_command(ctx))),
@@ -382,6 +394,8 @@ async fn main() {
                         // …и кнопки вариантов в опросах
                         #[cfg(feature = "voice")]
                         if music_qol::version_pressed(ctx,data,press).await{return Ok(())}
+                        #[cfg(feature = "voice")]
+                        if music_library::pressed(ctx,data,press).await{return Ok(())}
                         #[cfg(feature = "voice")]
                         if music::button_pressed(ctx, data, press).await {
                             return Ok(()); // кнопки плеера: пауза, дальше, повтор, перемешать
@@ -423,6 +437,8 @@ async fn main() {
                 shop::start_expiry_loop(ctx.http.clone(), data.db.clone()); // снимать роли, срок которых вышел
                 levels::start_voice_xp_loop(ctx.clone(), data.clone()); // опыт за голосовые каналы, раз в минуту
                 wordstats::start_duel_loop(ctx.http.clone(), data.clone()); // итоги дуэлей в словах
+                wordsummary::start_loop(ctx.clone(), data.clone()); // итоги дня ровно в московскую полночь
+                backups::start_loop(data.clone(), backup_settings);
                 #[cfg(feature="voice")]
                 music_qol::start_idle_loop(ctx.clone(),data.clone());
                 start_fast_loop(ctx.http.clone(), data.clone()); // напоминания и опросы
@@ -433,7 +449,7 @@ async fn main() {
                 }
                 match client_secret {
                     Some(secret) if miniapp_port > 0 => miniapp::start(ctx.clone(), data.clone(), secret, miniapp_host, miniapp_port),
-                    _ => println!("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET (или port = 0). /wort и /slovo не будут работать."),
+                    _ => println!("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET (или port = 0). /words не будет работать."),
                 }
                 println!("yt-dlp запускается так: {}", data.ytdlp);
                 println!("Бот запущен как {}", ready.user.name);
@@ -467,6 +483,31 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_commands_have_one_word_game_and_new_music_library() {
+        let commands = super::bot_commands();
+        let payload = serde_json::to_value(poise::builtins::create_application_commands(&commands)).unwrap();
+        let list = payload.as_array().unwrap();
+        let names: std::collections::BTreeSet<_> = list.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), list.len());
+        assert!(names.contains("words"));
+        assert!(!names.contains("slovo") && !names.contains("wort"));
+        let words = list.iter().find(|c| c["name"] == "words").unwrap();
+        assert_eq!(words["options"].as_array().unwrap().len(), 1);
+        assert_eq!(words["options"][0]["name"], "language");
+        assert_eq!(words["options"][0]["choices"].as_array().unwrap().len(), 2);
+        #[cfg(feature = "voice")]
+        {
+            assert_eq!(names.len(), 76);
+            assert!(names.contains("favorites") && names.contains("history"));
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            assert_eq!(names.len(), 55);
+            assert!(!names.contains("favorites") && !names.contains("history"));
+        }
+    }
+
     /// Список команд для Discord собирается в JSON, который принимает массовое обновление (PUT).
     #[test]
     fn command_payload() {
