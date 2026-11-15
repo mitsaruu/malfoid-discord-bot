@@ -349,14 +349,15 @@ pub async fn quiz(
             press.create_response(ctx, note("❌ Неверно.")).await?;
             continue;
         }
+        press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await?;
         let name = guild_name(&press);
         let balance = data.db.add_money(guild, press.user.id.get(), &name, data.economy.start_balance, reward)?;
-        let won = serenity::CreateInteractionResponseMessage::new()
+        let won = serenity::EditInteractionResponse::new()
             .content(result(format!(
                 "🏆 Первым правильно ответил <@{}>: **+{}** (баланс {}).", press.user.id, money_text(reward), money_text(balance))))
             .components(quiz_buttons(&options, Some(correct)))
             .allowed_mentions(serenity::CreateAllowedMentions::new());
-        press.create_response(ctx, serenity::CreateInteractionResponse::UpdateMessage(won)).await?;
+        press.edit_response(ctx, won).await?;
         return Ok(());
     }
 }

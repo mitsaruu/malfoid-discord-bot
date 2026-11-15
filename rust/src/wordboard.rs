@@ -239,7 +239,10 @@ where
         data.boards.lang_choice.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert((guild.get(), user.get()), lang);
     }
     if let Err(error) = respond(serenity::CreateInteractionResponse::LaunchActivity).await {
-        println!("Не получилось открыть мини-приложение: {error}");
+        println!("Не получилось открыть мини-приложение: {}", crate::interactions::sanitize_error(&error.to_string()));
+        if matches!(error_code(&error), Some(10062 | 40060)) {
+            return Ok(()); // interaction уже истёк или подтверждён — второй callback тоже не сработает
+        }
         // Discord мог уже перестать ждать ответа на эту команду — тогда подсказка останется только в консоли
         let _ = respond(ephemeral(launch_problem(error_code(&error)))).await;
     }
@@ -270,7 +273,7 @@ pub async fn play_pressed(ctx: &serenity::Context, data: &Data, press: &serenity
     let Some(lang) = Lang::ALL.into_iter().find(|lang| lang.button() == press.data.custom_id) else { return false };
     let result = open_miniapp(data, press.guild_id, press.user.id, lang, |response| press.create_response(ctx, response)).await;
     if let Err(error) = result {
-        println!("Кнопка «Играть!»: {error}");
+        println!("Кнопка «Играть!»: {}", crate::interactions::sanitize_error(&error.to_string()));
     }
     true
 }

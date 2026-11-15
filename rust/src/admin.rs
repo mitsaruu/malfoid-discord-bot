@@ -36,8 +36,19 @@ pub fn allowed_here(games: &BTreeSet<String>, command: &str, games_channel: Opti
 pub async fn games_channel_check(ctx: Context<'_>) -> Result<bool, Error> {
     let Some(guild) = ctx.guild_id() else { return Ok(true) }; // в личных сообщениях можно всё
     let data = ctx.data();
+    if !data.games_commands.contains(&ctx.command().name) {
+        return Ok(true);
+    }
     let games_channel = data.db.games_channel(guild.get())?;
-    let parent = ctx.guild_channel().await.and_then(|channel| channel.parent_id).map(|id| id.get());
+    if games_channel.is_none() || games_channel == Some(ctx.channel_id().get()) {
+        return Ok(true);
+    }
+    // Discord уже присылает родительский канал ветки во взаимодействии. Не делаем HTTP-запрос
+    // до первого ответа: на медленной сети он съедал отведённые Discord три секунды.
+    let parent = match ctx {
+        poise::Context::Application(app) => app.interaction.channel.as_ref().and_then(|channel| channel.parent_id),
+        poise::Context::Prefix(_) => ctx.guild().and_then(|guild| guild.channels.get(&ctx.channel_id()).and_then(|channel| channel.parent_id)),
+    }.map(|id| id.get());
     if allowed_here(&data.games_commands, &ctx.command().name, games_channel, ctx.channel_id().get(), parent) {
         return Ok(true);
     }
@@ -96,6 +107,7 @@ pub async fn set_log_channel(
 
 /// Присылает ошибку в канал логов сервера (если он выбран). Без пингов.
 pub async fn report_error(http: &serenity::Http, data: &Data, guild: Option<serenity::GuildId>, place: &str, details: &str) {
+    let details = crate::interactions::sanitize_error(details);
     let Some(guild) = guild else { return };
     let Ok(Some(channel)) = data.db.log_channel(guild.get()) else { return };
     let tail: String = details.chars().rev().take(3800).collect::<Vec<_>>().into_iter().rev().collect(); // конец — самое важное

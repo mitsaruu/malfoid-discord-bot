@@ -85,6 +85,7 @@ pub async fn challenge(
             continue;
         }
         if press.data.custom_id == "challenge:accept" {
+            press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await?;
             return Ok(Some(press));
         }
         let declined = serenity::CreateInteractionResponseMessage::new()
@@ -98,10 +99,10 @@ pub async fn challenge(
 
 /// Ответ на принятое предложение: заменяет текст сообщения и убирает кнопки.
 pub async fn finish_challenge(ctx: Context<'_>, press: &serenity::ComponentInteraction, text: String) -> Result<(), Error> {
-    let update = serenity::CreateInteractionResponseMessage::new()
+    let update = serenity::EditInteractionResponse::new()
         .content(text)
         .components(Vec::new())
         .allowed_mentions(serenity::CreateAllowedMentions::new());
-    press.create_response(ctx, serenity::CreateInteractionResponse::UpdateMessage(update)).await?;
+    press.edit_response(ctx, update).await?;
     Ok(())
 }

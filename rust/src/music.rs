@@ -935,9 +935,14 @@ pub async fn top_chart_month(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn button_pressed(ctx: &serenity::Context, data: &Shared, press: &serenity::ComponentInteraction) -> bool {
     let Some(action) = press.data.custom_id.strip_prefix("music:") else { return false };
     let Some(guild) = press.guild_id else { return true };
+    // Подтверждаем нажатие до ожидания состояния голосового плеера.
+    if let Err(error) = press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await {
+        println!("Кнопка музыки {action}: {}", crate::interactions::sanitize_error(&error.to_string()));
+        return true;
+    }
     let answer = |text: String, private: bool| {
-        let message = serenity::CreateInteractionResponseMessage::new().content(text).ephemeral(private).allowed_mentions(serenity::CreateAllowedMentions::new());
-        press.create_response(ctx, serenity::CreateInteractionResponse::Message(message))
+        let message = serenity::CreateInteractionResponseFollowup::new().content(text).ephemeral(private).allowed_mentions(serenity::CreateAllowedMentions::new());
+        press.create_followup(ctx, message)
     };
     // Нажимать может тот, кто сидит с ботом в одном голосовом канале
     let same_voice = match (bot_channel(ctx, guild).await, user_channel(ctx, guild, press.user.id)) {

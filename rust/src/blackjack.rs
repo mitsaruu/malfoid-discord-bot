@@ -375,6 +375,7 @@ pub async fn blackjack(
             press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await?;
             continue;
         }
+        press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await?;
         let balance = wallet(data)?;
         let refused = match press.data.custom_id.as_str() {
             "bj:hit" => {
@@ -400,18 +401,18 @@ pub async fn blackjack(
             _ => Some("Не понял кнопку 🙂"),
         };
         if let Some(text) = refused {
-            let note = serenity::CreateInteractionResponseMessage::new().content(text).ephemeral(true);
-            press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await?;
+            let note = serenity::CreateInteractionResponseFollowup::new().content(text).ephemeral(true);
+            press.create_followup(ctx, note).await?;
             continue;
         }
         let update = if game.outcome.is_some() {
-            serenity::CreateInteractionResponseMessage::new().embed(settle(&game, cards_left)?).components(Vec::new())
+            serenity::EditInteractionResponse::new().embed(settle(&game, cards_left)?).components(Vec::new())
         } else {
-            serenity::CreateInteractionResponseMessage::new()
+            serenity::EditInteractionResponse::new()
                 .embed(embed(&game, &name, &avatar, cards_left, None))
                 .components(buttons(&game, wallet(data)?))
         };
-        press.create_response(ctx, serenity::CreateInteractionResponse::UpdateMessage(update)).await?;
+        press.edit_response(ctx, update).await?;
         if game.outcome.is_some() {
             return Ok(());
         }

@@ -184,6 +184,7 @@ pub fn google_reset_time() -> i64 {
 pub enum AiError {
     Quota,         // Google: лимит запросов исчерпан (429)
     Overloaded,    // Google перегружен или временная ошибка сервера (5xx)
+    Network(String), // тайм-аут, обрыв соединения, DNS/TLS — можно повторить запрос
     Other(String), // всё остальное (например, неверный ключ)
 }
 
@@ -192,6 +193,7 @@ impl std::fmt::Display for AiError {
         match self {
             AiError::Quota => write!(formatter, "лимит запросов к Gemini исчерпан (429)"),
             AiError::Overloaded => write!(formatter, "Gemini перегружен (5xx)"),
+            AiError::Network(details) => write!(formatter, "Сетевая ошибка Gemini: {details}"),
             AiError::Other(details) => write!(formatter, "{details}"),
         }
     }
@@ -204,6 +206,7 @@ pub fn error_text(error: &AiError) -> &'static str {
     match error {
         AiError::Quota => "😵 Лимит бесплатных запросов к ИИ на сейчас исчерпан. Попробуй позже (подробнее — /ai_limits).",
         AiError::Overloaded => "😵 ИИ у Google сейчас перегружен, попробуй через пару минут.",
+        AiError::Network(_) => "😵 Не удалось дождаться ответа ИИ: проблема соединения с Google. Попробуй позже.",
         AiError::Other(_) => "😵 ИИ сейчас недоступен, попробуй чуть позже.",
     }
 }
@@ -278,17 +281,20 @@ async fn call_gemini(data: &Data, model: &str, system: &str, turns: &[Turn]) -> 
         .header("x-goog-api-key", key)
         .header("Content-Type", "application/json")
         .body(body)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
-        .map_err(|error| AiError::Other(error.to_string()))?;
+        .map_err(transport_error)?;
     let status = response.status();
-    let text = response.text().await.map_err(|error| AiError::Other(error.to_string()))?;
+    let text = response.text().await.map_err(transport_error)?;
     if status.as_u16() == 429 || text.contains("RESOURCE_EXHAUSTED") && !status.is_success() {
         return Err(AiError::Quota);
     }
     if status.is_server_error() {
         return Err(AiError::Overloaded);
+    }
+    if status.as_u16() == 408 {
+        return Err(AiError::Network("Google не дождался запроса (408)".into()));
     }
     if !status.is_success() {
         let short: String = text.chars().take(500).collect();
@@ -298,40 +304,82 @@ async fn call_gemini(data: &Data, model: &str, system: &str, turns: &[Turn]) -> 
     Ok(parse_answer(&json))
 }
 
+fn transport_error(error: reqwest::Error) -> AiError {
+    let retryable = error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() || error.is_decode();
+    let error = error.without_url();
+    let mut details = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        details.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    if retryable { AiError::Network(details) } else { AiError::Other(details) }
+}
+
 /// Запрос к Gemini с повторами и запасной моделью.
 /// 1) Основная модель: если Google ответил «перегружен» — ждём и пробуем ещё (до retries раз).
 /// 2) Не помогло (или кончился лимит основной модели) — тот же вопрос запасной модели.
 pub async fn generate(data: &Data, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
-    let settings = &data.ai.settings;
-    let mut last_error = AiError::Other("нет моделей".into());
-    for model in std::iter::once(&settings.model).chain(settings.fallback_model.iter()) {
-        for attempt in 0..=settings.retries {
-            match call_gemini(data, model, system, turns).await {
-                Ok(answer) => {
-                    // Google ответил — засчитываем запрос (для /ai_limits)
-                    let _ = data.db.count_ai_request(&google_day());
-                    locked(&data.ai.recent_requests).push(db::now());
-                    if *model != settings.model {
-                        println!("ИИ: основная модель {} не ответила ({last_error}), ответила запасная {model}", settings.model);
+    // Ограничиваем суммарное ожидание всех моделей: один запрос не занимает все 15 минут
+    // жизни Discord interaction. Отмена прекращает текущий запрос и дальнейшие повторы.
+    generate_with(data, std::time::Duration::from_secs(2), std::time::Duration::from_secs(180), |model| async move {
+        call_gemini(data, &model, system, turns).await
+    }).await
+}
+
+async fn generate_with<F, Fut>(data: &Data, base_delay: std::time::Duration, budget: std::time::Duration, mut call: F) -> Result<Answer, AiError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Answer, AiError>>,
+{
+    tokio::time::timeout(budget, async {
+        let settings = &data.ai.settings;
+        let mut last_error = AiError::Other("нет моделей".into());
+        let model_budget = budget / if settings.fallback_model.is_some() { 2 } else { 1 };
+        for model in std::iter::once(&settings.model).chain(settings.fallback_model.iter()) {
+            // Медленная основная модель не должна съесть всё время, отведённое запасной.
+            let deadline = tokio::time::Instant::now() + model_budget;
+            let retries = settings.retries.clamp(0, 5);
+            for attempt in 0..=retries {
+                let result = match tokio::time::timeout_at(deadline, call(model.clone())).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        last_error = AiError::Network(format!("модель {model} не ответила вовремя"));
+                        println!("ИИ: {last_error}; пробую запасную модель, если она задана");
+                        break;
                     }
-                    return Ok(answer);
-                }
-                Err(AiError::Quota) => {
-                    *locked(&data.ai.last_quota_error) = db::now(); // покажем в /ai_limits
-                    last_error = AiError::Quota;
-                    break; // лимит у этой модели — повторять бесполезно, сразу к запасной
-                }
-                Err(AiError::Overloaded) => {
-                    last_error = AiError::Overloaded;
-                    if attempt < settings.retries {
-                        tokio::time::sleep(std::time::Duration::from_secs(2 * (attempt as u64 + 1))).await; // 2, потом 4 секунды
+                };
+                match result {
+                    Ok(answer) => {
+                        // Google ответил — засчитываем запрос (для /ai_limits)
+                        let _ = data.db.count_ai_request(&google_day());
+                        locked(&data.ai.recent_requests).push(db::now());
+                        if *model != settings.model {
+                            println!("ИИ: основная модель {} не ответила ({last_error}), ответила запасная {model}", settings.model);
+                        }
+                        return Ok(answer);
                     }
+                    Err(AiError::Quota) => {
+                        *locked(&data.ai.last_quota_error) = db::now(); // покажем в /ai_limits
+                        last_error = AiError::Quota;
+                        println!("ИИ: {model} — лимит запросов; пробую запасную модель, если она задана");
+                        break; // лимит у этой модели — повторять бесполезно, сразу к запасной
+                    }
+                    Err(error @ (AiError::Overloaded | AiError::Network(_))) => {
+                        println!("ИИ: модель={model}, попытка={}/{}: {error}", attempt + 1, retries + 1);
+                        last_error = error;
+                        if attempt < retries {
+                            let jitter = if base_delay.is_zero() { 0 } else { rand::random::<u64>() % 500 };
+                            let delay = base_delay * (1 << attempt as u32) + std::time::Duration::from_millis(jitter);
+                            tokio::time::sleep(delay.min(deadline.saturating_duration_since(tokio::time::Instant::now()))).await;
+                        }
+                    }
+                    Err(other) => return Err(other), // другая ошибка — повтор не поможет
                 }
-                Err(other) => return Err(other), // другая ошибка — повтор не поможет
             }
         }
-    }
-    Err(last_error)
+        Err(last_error)
+    }).await.unwrap_or_else(|_| Err(AiError::Network("превышено общее время ожидания ответа".into())))
 }
 
 /// Убирает из prompt.txt строки-пояснения (начинаются с #).
@@ -593,6 +641,79 @@ pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retry_test_data() -> Data {
+        let settings = crate::config::Settings::parse("[ai]\nmodel = primary\nfallback_model = fallback\nretries = 1\n");
+        Data::new(crate::db::Database::in_memory().unwrap(), &settings, std::path::PathBuf::new(), false)
+    }
+
+    #[tokio::test]
+    async fn retries_network_and_server_failures_then_uses_fallback() {
+        let data = retry_test_data();
+        let mut calls = Vec::new();
+        let answer = generate_with(&data, std::time::Duration::ZERO, std::time::Duration::from_secs(2), |model| {
+            calls.push(model.clone());
+            std::future::ready(match calls.len() {
+                1 => Err(AiError::Overloaded),
+                2 => Err(AiError::Network("connection reset".into())),
+                _ => Ok(Answer { text: "ответ запасной".into(), cut: false }),
+            })
+        }).await.unwrap();
+        assert_eq!(calls, ["primary", "primary", "fallback"]);
+        assert_eq!(answer.text, "ответ запасной");
+        assert_eq!(data.db.ai_requests(&google_day()).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_request_is_not_retried_but_quota_uses_fallback() {
+        let data = retry_test_data();
+        let mut calls = Vec::new();
+        let error = generate_with(&data, std::time::Duration::ZERO, std::time::Duration::from_secs(2), |model| {
+            calls.push(model);
+            std::future::ready(Err(AiError::Other("400 invalid request".into())))
+        }).await.unwrap_err();
+        assert!(matches!(error, AiError::Other(_)));
+        assert_eq!(calls, ["primary"]);
+
+        calls.clear();
+        let error = generate_with(&data, std::time::Duration::ZERO, std::time::Duration::from_secs(2), |model| {
+            calls.push(model);
+            std::future::ready(Err(AiError::Quota))
+        }).await.unwrap_err();
+        assert_eq!(calls, ["primary", "fallback"]);
+        assert_eq!(error, AiError::Quota);
+    }
+
+    #[tokio::test]
+    async fn total_deadline_stops_a_stalled_request() {
+        let data = retry_test_data();
+        let mut calls = 0;
+        let error = generate_with(&data, std::time::Duration::ZERO, std::time::Duration::from_millis(20), |_| {
+            calls += 1;
+            std::future::pending::<Result<Answer, AiError>>()
+        }).await.unwrap_err();
+        assert!((1..=2).contains(&calls));
+        assert!(matches!(error, AiError::Network(_)));
+        assert!(error_text(&error).contains("соединения"));
+    }
+
+    #[tokio::test]
+    async fn slow_primary_leaves_time_for_fallback() {
+        let data = retry_test_data();
+        let mut calls = Vec::new();
+        let answer = generate_with(&data, std::time::Duration::ZERO, std::time::Duration::from_millis(100), |model| {
+            calls.push(model.clone());
+            async move {
+                if model == "primary" {
+                    std::future::pending::<Result<Answer, AiError>>().await
+                } else {
+                    Ok(Answer { text: "ответ запасной".into(), cut: false })
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(calls, ["primary", "fallback"]);
+        assert_eq!(answer.text, "ответ запасной");
+    }
 
     fn settings(text: &str) -> AiSettings {
         AiSettings::load(&crate::config::Settings::parse(text))

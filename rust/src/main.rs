@@ -21,6 +21,7 @@ mod db;
 mod draw;
 mod economy;
 mod fun;
+mod interactions;
 mod levels;
 mod miniapp;
 mod moderation;
@@ -167,26 +168,34 @@ fn bot_dir() -> PathBuf {
 async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
     match error {
         poise::FrameworkError::Command { error, ctx, .. } => {
-            println!("Ошибка в команде /{}: {error:?}", ctx.command().name);
+            let details = interactions::sanitize_error(&format!("{}: {error:?}", interactions::error_context(ctx)));
+            println!("Ошибка в команде: {details}");
             let place = format!("команда /{}", ctx.command().name);
-            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &format!("{error:?}")).await;
-            let reply = poise::CreateReply::default().content("😵 Что-то пошло не так. Ошибка записана в консоль.").ephemeral(true);
-            let _ = ctx.send(reply).await;
+            if !interactions::is_expired(&error) {
+                let reply = poise::CreateReply::default().content("😵 Что-то пошло не так. Ошибка записана в консоль.").ephemeral(true);
+                let _ = ctx.send(reply).await;
+            }
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
         }
         poise::FrameworkError::ArgumentParse { error, input, ctx, .. } => {
             // Например, Discord прислал параметры в другом виде (команды зарегистрированы другой версией бота)
-            let details = format!("{error} (ввод: {input:?})");
+            let details = interactions::sanitize_error(&format!("{}: {error} (ввод: {input:?})", interactions::error_context(ctx)));
             println!("Не разобрала параметры /{}: {details}", ctx.command().name);
             let place = format!("параметры команды /{}", ctx.command().name);
-            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
             let text = "😵 Не поняла параметры команды. Если команды только что обновились — перезапусти Discord (Ctrl+R).";
             let _ = ctx.send(poise::CreateReply::default().content(text).ephemeral(true)).await;
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
         }
         poise::FrameworkError::CommandCheckFailed { error: Some(error), ctx, .. } => {
-            println!("Ошибка в проверке перед /{}: {error:?}", ctx.command().name);
+            let details = interactions::sanitize_error(&format!("{}: {error:?}", interactions::error_context(ctx)));
+            println!("Ошибка перед командой: {details}");
+            if !interactions::is_expired(&error) {
+                let _ = ctx.send(poise::CreateReply::default().content("😵 Не получилось выполнить проверку команды.").ephemeral(true)).await;
+            }
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), "проверка команды", &details).await;
         }
         other => {
-            println!("Ошибка: {other}");
+            println!("Ошибка: {}", interactions::sanitize_error(&other.to_string()));
             if let Err(error) = poise::builtins::on_error(other).await {
                 println!("Ошибка при обработке ошибки: {error}");
             }
@@ -350,7 +359,7 @@ async fn main() {
             ],
             on_error: |error| Box::pin(on_error(error)),
             // Перед каждой командой: игры и рейтинги — только в канале для игр, если его выбрали
-            command_check: Some(|ctx| Box::pin(admin::games_channel_check(ctx))),
+            command_check: Some(|ctx| Box::pin(interactions::before_command(ctx))),
             event_handler: |framework, event| {
                 Box::pin(async move {
                     let (ctx, data) = (framework.serenity_context, framework.user_data);

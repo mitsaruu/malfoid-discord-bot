@@ -96,24 +96,25 @@ pub async fn vote_pressed(ctx: &serenity::Context, data: &Data, press: &serenity
         return false;
     };
     if let Err(error) = vote(ctx, data, press, option).await {
-        println!("Опрос: {error}");
+        println!("Опрос: {}", crate::interactions::sanitize_error(&error.to_string()));
     }
     true
 }
 
 async fn vote(ctx: &serenity::Context, data: &Data, press: &serenity::ComponentInteraction, option: i64) -> Result<(), Error> {
+    press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await?;
     let message = press.message.id.get();
     let open = data.db.poll(message)?.filter(|poll| poll.2 > db::now());
     let Some((question, options, ends, author)) = open else {
-        let note = serenity::CreateInteractionResponseMessage::new().content("Этот опрос уже закончился.").ephemeral(true);
-        press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await?;
+        let note = serenity::CreateInteractionResponseFollowup::new().content("Этот опрос уже закончился.").ephemeral(true);
+        press.create_followup(ctx, note).await?;
         return Ok(());
     };
     let options: Vec<String> = serde_json::from_str(&options)?;
     data.db.set_poll_vote(message, press.user.id.get(), option)?;
-    let update = serenity::CreateInteractionResponseMessage::new()
+    let update = serenity::EditInteractionResponse::new()
         .embed(embed(&question, &options, &counts(data, message, options.len())?, ends, author, false));
-    press.create_response(ctx, serenity::CreateInteractionResponse::UpdateMessage(update)).await?;
+    press.edit_response(ctx, update).await?;
     Ok(())
 }
 
