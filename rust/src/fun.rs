@@ -82,7 +82,7 @@ pub async fn predskazanie(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Магический шар: задай вопрос — ответит да или нет
+/// Магический шар: уверенные, сомневающиеся и шуточные ответы
 #[poise::command(slash_command)]
 pub async fn shar(
     ctx: Context<'_>,
@@ -215,7 +215,8 @@ mod tests {
     #[test]
     fn prediction_lists() {
         let (day, ball) = (predictions("day"), predictions("ball"));
-        assert_eq!((day.len(), ball.len()), (36, 11)); // столько же, сколько в bot.py
+        assert_eq!((day.len(), ball.len()), (36, 64));
+        assert_eq!(ball.iter().collect::<std::collections::HashSet<_>>().len(), ball.len());
         assert!(day.iter().any(|line| line.contains("{name}")));
         assert_eq!(ball[0], "Бесспорно ✅");
         assert!(predictions("нет такого").is_empty());

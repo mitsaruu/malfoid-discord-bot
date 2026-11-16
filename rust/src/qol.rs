@@ -95,11 +95,11 @@ fn help_embed(commands: &[poise::Command<Shared, Error>], page: usize) -> s::Cre
         .collect();
     lines.sort();
     let example = [
-        "`/play название` · `/queue_move from:3 to:1`",
+        "`/play название` · `/queue` — страницы и кнопки управления",
         "`/daily` · `/pets` · `/shop`",
         "`/words` · `/wordstats`",
         "`/ask question:объясни закон Ома`",
-        "`/remind after:2ч text:проверить сервер` · `/server_settings`",
+        "`/music_channel channel:#музыка` · `/status` · `/server_settings`",
     ][page];
     s::CreateEmbed::new()
         .title(format!("Справка · {}", SECTIONS[page]))
@@ -201,10 +201,10 @@ pub async fn server_settings(
         )
         .ok();
     let settings = crate::config::Settings::load(&data.dir.join("config/settings.ini"));
-    let mut text=format!("Игры: {}\nЛоги: {}\nПатчноуты: {}\nПриветствия: {}\nУтро/вечер: {}\n\nИИ: {}\nМини-приложение: {}\nServer Members Intent: {}\nАнти-спам: {}",
-        channel(data.db.games_channel(guild.get())?),channel(data.db.log_channel(guild.get())?),channel(patch),channel(data.db.welcome_channel(guild.get())?),
+    let mut text=format!("Игры: {}\nМузыка: {}\nЛоги: {}\nПатчноуты: {}\nУтро/вечер: {}\n\nИИ: {}\nМини-приложение: {}\nАнти-спам: {}",
+        channel(data.db.games_channel(guild.get())?),channel(crate::music_channels::channel(&data.db,guild.get())?),channel(data.db.log_channel(guild.get())?),channel(patch),
         daily.map_or("выключены".into(),|r|format!("<#{}>, {} / {} ({})",r.channel,r.morning,r.evening,r.timezone)),
-        data.ai.ready(),data.miniapp_ready,data.members_intent,settings.text("antispam","enabled","on"));
+        data.ai.ready(),data.miniapp_ready,settings.text("antispam","enabled","on"));
     #[cfg(feature = "voice")]
     {
         text.push_str(&format!(

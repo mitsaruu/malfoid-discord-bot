@@ -8,7 +8,7 @@ use poise::serenity_prelude as serenity;
 use std::collections::BTreeSet;
 
 /// Какие команды работают только в канале для игр, если его выбрали (settings.ini → [channels] games_commands).
-pub const DEFAULT_GAMES_COMMANDS: &str = "rank, leaderboard, top_chart_month, money_leaderboard, dick_growth, dick_size, \
+pub const DEFAULT_GAMES_COMMANDS: &str = "rank, leaderboard, money_leaderboard, dick_growth, dick_size, \
     dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, \
     dice, roll, predskazanie, shar, words, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz";
 
@@ -17,7 +17,7 @@ pub fn parse_commands(text: &str) -> BTreeSet<String> {
     text.split(',').map(|name| {
         let name = name.trim().trim_start_matches('/').to_lowercase();
         if matches!(name.as_str(), "wort" | "slovo") { "words".to_string() } else { name }
-    }).filter(|name| !name.is_empty()).collect()
+    }).filter(|name| !name.is_empty() && !crate::music_channels::is_music_command(name)).collect()
 }
 
 /// Что боту можно в этом канале. None — не получилось узнать (нет данных о сервере).
@@ -112,6 +112,7 @@ pub async fn set_log_channel(
 pub async fn report_error(http: &serenity::Http, data: &Data, guild: Option<serenity::GuildId>, place: &str, details: &str) {
     let details = crate::interactions::sanitize_error(details);
     let Some(guild) = guild else { return };
+    crate::diagnostics::record_error(data, guild.get(), place, &details);
     let Ok(Some(channel)) = data.db.log_channel(guild.get()) else { return };
     let tail: String = details.chars().rev().take(3800).collect::<Vec<_>>().into_iter().rev().collect(); // конец — самое важное
     let embed = serenity::CreateEmbed::new().color(0xEF4444).title(format!("⚠️ Ошибка: {place}")).description(format!("```\n{tail}\n```"));

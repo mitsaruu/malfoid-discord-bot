@@ -12,6 +12,13 @@ pub struct Item {
     pub title: String,
     pub details: Value,
 }
+
+fn choice_rows(buttons: Vec<s::CreateButton>) -> Vec<s::CreateActionRow> {
+    buttons
+        .chunks(5)
+        .map(|row| s::CreateActionRow::Buttons(row.to_vec()))
+        .collect()
+}
 pub fn items(data: &Data, guild: u64) -> Result<Vec<Item>, Error> {
     let conn = data.db.lock();
     let mut st=conn.prepare("SELECT id,url,title,details FROM queue WHERE guild_id=?1 ORDER BY COALESCE(sort_order,id),id")?;
@@ -131,6 +138,7 @@ pub async fn queue_remove(
         .await;
     }
     remove_snapshot(ctx.data(), guild, std::slice::from_ref(item))?;
+    crate::music_runtime::queue_changed(ctx.data(), guild);
     crate::reply::say(ctx, format!("🗑️ Удалён трек: {}", item.title)).await
 }
 /// Переместить трек в очереди
@@ -148,11 +156,22 @@ pub async fn queue_move(
         return crate::reply::whisper(ctx, "Зайди в голосовой канал бота.").await;
     }
     let guild = ctx.guild_id().unwrap().get();
+    let moderator = ctx.author_member().await.is_some_and(|m| {
+        crate::moderation::permissions(ctx.serenity_context(), ctx.guild_id().unwrap(), &m)
+            .manage_guild()
+    });
     let mut rows = items(ctx.data(), guild)?;
     if from as usize > rows.len() || to as usize > rows.len() {
         return crate::reply::whisper(ctx, "Проверь номера в /queue.").await;
     }
     let row = rows.remove(from as usize - 1);
+    if row.details["requester"].as_u64() != Some(ctx.author().id.get()) && !moderator {
+        return crate::reply::whisper(
+            ctx,
+            "Переместить чужую заявку может участник с правом «Управлять сервером».",
+        )
+        .await;
+    }
     rows.insert(to as usize - 1, row);
     {
         let mut conn = ctx.data().db.lock();
@@ -165,6 +184,7 @@ pub async fn queue_move(
         }
         tx.commit()?;
     }
+    crate::music_runtime::queue_changed(ctx.data(), guild);
     crate::reply::say(ctx, format!("↕️ Трек перемещён: {from} → {to}.")).await
 }
 /// Удалить из очереди только свои заявки
@@ -179,6 +199,7 @@ pub async fn queue_clear_mine(ctx: Context<'_>) -> Result<(), Error> {
         .filter(|i| i.details["requester"].as_u64() == Some(ctx.author().id.get()))
         .collect();
     let n = remove_snapshot(ctx.data(), guild, &rows)?;
+    crate::music_runtime::queue_changed(ctx.data(), guild);
     crate::reply::say(ctx, format!("🗑️ Удалено твоих заявок: {n}.")).await
 }
 pub fn duration(seconds: Option<f64>) -> String {
@@ -245,7 +266,11 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
     };
     let mut buttons = crate::music::music_buttons();
     buttons.push(crate::music_library::favorite_button_for(
-        &ctx.data().db, guild, &url, &title, &details,
+        &ctx.data().db,
+        guild,
+        &url,
+        &title,
+        &details,
     )?);
     if let Some(link) = original_button(&details) {
         buttons.push(s::CreateActionRow::Buttons(vec![link]));
@@ -267,6 +292,14 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
 
 /// Получает названия, длительность и обложки без скачивания аудио.
 pub async fn candidates(data: &Data, query: &str, count: usize) -> Result<Vec<Value>, Error> {
+    crate::music_runtime::cached_candidates(data, query, count).await
+}
+
+pub async fn uncached_candidates(
+    data: &Data,
+    query: &str,
+    count: usize,
+) -> Result<Vec<Value>, Error> {
     let target = if query.starts_with("http") {
         query.to_owned()
     } else {
@@ -382,15 +415,13 @@ pub async fn offer(
     data.db
         .lock()
         .execute("DELETE FROM music_choices WHERE expires<?1", [db::now()])?;
-    data.db.lock().execute(
-        "INSERT INTO music_choices(id,guild_id,user_id,expires,payload) VALUES(?1,?2,?3,?4,?5)",
-        params![
-            nonce,
-            guild as i64,
-            user as i64,
-            db::now() + 600.,
-            payload.to_string()
-        ],
+    crate::music_runtime::handoff_choice(
+        &data.db,
+        guild,
+        &nonce,
+        user,
+        &payload,
+        db::now() + 600.,
     )?;
     let text = choice
         .list
@@ -410,7 +441,11 @@ pub async fn offer(
     let buttons = (0..choice.list.len().min(5))
         .map(|i| s::CreateButton::new(format!("version:{nonce}:{i}")).label((i + 1).to_string()))
         .collect();
-    channel.send_message(ctx,s::CreateMessage::new().content(format!("<@{user}>, выбери версию **{}** (10 минут). Остальная очередь продолжает играть.\n{text}",choice.title)).components(vec![s::CreateActionRow::Buttons(buttons)]).allowed_mentions(s::CreateAllowedMentions::new())).await?;
+    let sent = channel.send_message(ctx,s::CreateMessage::new().content(format!("<@{user}>, выбери версию **{}** (10 минут). Остальная очередь продолжает играть.\n{text}",choice.title)).components(choice_rows(buttons)).allowed_mentions(s::CreateAllowedMentions::new())).await;
+    if let Err(error) = sent {
+        crate::music_runtime::return_choice(&data.db, &nonce)?;
+        return Err(error.into());
+    }
     Ok(())
 }
 pub async fn version_pressed(
@@ -498,6 +533,7 @@ async fn version_choice(
                     deleted > 0
                 };
                 if inserted {
+                    crate::music_runtime::queue_changed(data, guild.get());
                     press
                         .edit_response(
                             ctx,
@@ -579,8 +615,26 @@ pub async fn choose(
     expected: Option<f64>,
     list: Vec<Value>,
 ) -> Result<Option<Value>, Error> {
+    choose_inner(ctx, query, expected, list, false).await
+}
+
+pub async fn choose_explicit(
+    ctx: Context<'_>,
+    query: &str,
+    list: Vec<Value>,
+) -> Result<Option<Value>, Error> {
+    choose_inner(ctx, query, None, list, true).await
+}
+
+async fn choose_inner(
+    ctx: Context<'_>,
+    query: &str,
+    expected: Option<f64>,
+    list: Vec<Value>,
+    explicit: bool,
+) -> Result<Option<Value>, Error> {
     let list = ranked(query, expected, list);
-    if confident(query, expected, &list) {
+    if !explicit && confident(query, expected, &list) {
         return Ok(list.into_iter().next());
     }
     if list.is_empty() {
@@ -605,7 +659,7 @@ pub async fn choose(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let buttons = (0..list.len().min(5))
+    let buttons: Vec<_> = (0..list.len().min(5))
         .map(|i| s::CreateButton::new(format!("match:{i}")).label((i + 1).to_string()))
         .chain(std::iter::once(
             s::CreateButton::new("match:cancel").label("Отмена"),
@@ -614,10 +668,8 @@ pub async fn choose(
     let reply = ctx
         .send(
             poise::CreateReply::default()
-                .content(format!(
-                    "Не уверен в совпадении **{query}**. Выбери версию (60 секунд):\n{body}"
-                ))
-                .components(vec![s::CreateActionRow::Buttons(buttons)])
+                .content(format!("Выбери трек для **{query}** (60 секунд):\n{body}"))
+                .components(choice_rows(buttons))
                 .allowed_mentions(s::CreateAllowedMentions::new()),
         )
         .await?;
@@ -640,6 +692,9 @@ pub async fn choose(
                     ),
                 )
                 .await?;
+            continue;
+        }
+        if !crate::music_channels::button_check(ctx.serenity_context(), ctx.data(), &press).await? {
             continue;
         }
         press
@@ -707,6 +762,7 @@ pub fn start_idle_loop(ctx: s::Context, data: Shared) {
                 if entry.1.elapsed() < Duration::from_secs(limit as u64) {
                     continue;
                 }
+                let _voice_operation = data.music.voice_operation(guild.get()).await;
                 let lock = data.music.lock_for(guild.get());
                 let _guard = lock.lock().await;
                 // Повторная проверка под замком: человек мог зайти, пока плеер искал трек.
@@ -730,7 +786,7 @@ pub fn start_idle_loop(ctx: s::Context, data: Shared) {
                     empty.remove(&guild.get());
                     continue;
                 }
-                if let Err(e) = crate::music::disconnect_saved(&ctx, &data, guild).await {
+                if let Err(e) = crate::music::disconnect_saved_locked(&ctx, &data, guild).await {
                     println!("Автовыход: {e}");
                 }
                 empty.remove(&guild.get());
@@ -742,6 +798,18 @@ pub fn start_idle_loop(ctx: s::Context, data: Shared) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn five_choices_and_cancel_fit_discord_rows() {
+        let rows = super::choice_rows(
+            (0..6)
+                .map(|i| super::s::CreateButton::new(format!("choice:{i}")).label(i.to_string()))
+                .collect(),
+        );
+        let value = serde_json::to_value(rows).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        assert_eq!(value[0]["components"].as_array().unwrap().len(), 5);
+        assert_eq!(value[1]["components"].as_array().unwrap().len(), 1);
+    }
     use super::*;
     #[test]
     fn versions() {

@@ -206,6 +206,11 @@ impl Database {
         if !has_details{connection.execute_batch("ALTER TABLE playlists ADD COLUMN details TEXT")?;}
         let database = Self { connection: Mutex::new(connection) };
         crate::wordsummary::prepare(&database)?;
+        crate::music_channels::prepare(&database)?;
+        #[cfg(feature = "voice")]
+        crate::music_queue::prepare(&database)?;
+        #[cfg(feature = "voice")]
+        crate::music_runtime::prepare(&database)?;
         #[cfg(feature = "voice")]
         crate::music_library::prepare(&database)?;
         Ok(database)
@@ -1042,28 +1047,6 @@ impl Database {
             )
             .optional()?;
         Ok(time.flatten())
-    }
-
-    // ---------- Приветствие новичков ----------
-
-    pub fn welcome_channel(&self, guild: u64) -> rusqlite::Result<Option<u64>> {
-        let channel = self
-            .lock()
-            .query_row("SELECT channel_id FROM welcome_channel WHERE guild_id = ?1", params![guild as i64], |row| row.get::<_, Option<i64>>(0))
-            .optional()?;
-        Ok(channel.flatten().map(|id| id as u64))
-    }
-
-    pub fn set_welcome_channel(&self, guild: u64, channel: Option<u64>) -> rusqlite::Result<()> {
-        let connection = self.lock();
-        match channel {
-            Some(channel) => connection.execute(
-                "INSERT OR REPLACE INTO welcome_channel (guild_id, channel_id) VALUES (?1, ?2)",
-                params![guild as i64, channel as i64],
-            )?,
-            None => connection.execute("DELETE FROM welcome_channel WHERE guild_id = ?1", params![guild as i64])?,
-        };
-        Ok(())
     }
 
     // ---------- Утренние и вечерние сообщения ----------

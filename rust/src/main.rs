@@ -41,7 +41,12 @@ mod music;
 mod spotify;
 mod text;
 mod weather;
-mod welcome;
+mod diagnostics;
+mod music_channels;
+#[cfg(feature = "voice")]
+mod music_queue;
+#[cfg(feature = "voice")]
+mod music_runtime;
 mod wordboard;
 mod wordstats;
 mod wordsummary;
@@ -56,6 +61,10 @@ use std::path::PathBuf;
 
 /// Общие данные бота — доступны из каждой команды через ctx.data().
 pub struct Data {
+    pub started_at: std::time::Instant,
+    pub diagnostics: diagnostics::DiagnosticsState,
+    #[cfg(feature = "voice")]
+    pub music_runtime: music_runtime::RuntimeState,
     pub db: std::sync::Arc<db::Database>,
     pub economy: economy::EconomySettings,
     pub pets: pets::PetSettings,
@@ -68,8 +77,6 @@ pub struct Data {
     pub chat: chat::ChatState,
     /// Варн номер N → тайм-аут (settings.ini → [moderation] warn_punishments)
     pub warn_punishments: Vec<(i64, i64)>,
-    /// Приходит ли событие «зашёл новый участник» (settings.ini → [welcome] members_intent)
-    pub members_intent: bool,
     /// Каналы, где викторина идёт прямо сейчас
     pub quiz_running: std::sync::Mutex<std::collections::HashSet<u64>>,
     /// Сервер → последние вопросы викторины (чтобы ИИ не повторялся)
@@ -102,6 +109,10 @@ impl Data {
     pub fn new(database: db::Database, settings: &config::Settings, dir: PathBuf, miniapp_ready: bool) -> Self {
         let ytdlp = std::env::var("YTDLP").ok().filter(|value| !value.trim().is_empty()).map_or_else(|| default_ytdlp(&dir), |value| fix_ytdlp(&value));
         Self {
+            started_at: std::time::Instant::now(),
+            diagnostics: Default::default(),
+            #[cfg(feature = "voice")]
+            music_runtime: Default::default(),
             db: std::sync::Arc::new(database),
             economy: economy::EconomySettings::load(settings),
             pets: pets::PetSettings::load(settings),
@@ -111,7 +122,6 @@ impl Data {
             quiz: ai_commands::QuizSettings::load(settings),
             chat: chat::ChatState::new(settings),
             warn_punishments: moderation::parse_warn_punishments(&settings.text("moderation", "warn_punishments", "3: 60, 5: 1440, 7: 10080")),
-            members_intent: welcome::members_intent(settings),
             quiz_running: Default::default(),
             quiz_recent: Default::default(),
             games_commands: admin::parse_commands(&settings.text("channels", "games_commands", admin::DEFAULT_GAMES_COMMANDS)),
@@ -317,7 +327,8 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         music_library::favorites(),
         #[cfg(feature="voice")]
         music_library::history(),
-        welcome::set_welcome_channel(),
+        music_channels::set_music_channel(),
+        diagnostics::status(),
         daily::daily_setup(),
         daily::daily_off(),
         daily::daily_test(),
@@ -369,6 +380,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    #[cfg(feature = "voice")]
+    if let Err(error) = music_runtime::recover(&database) {
+        println!("Не получилось восстановить сохранённую очередь: {error}");
+        std::process::exit(1);
+    }
     // Мини-приложение: секрет приложения из Developer Portal → OAuth2 и адрес веб-сервера из settings.ini
     let client_secret = std::env::var("DISCORD_CLIENT_SECRET").ok().filter(|secret| !secret.is_empty());
     let miniapp_host = settings.text("miniapp", "host", "127.0.0.1");
@@ -391,7 +407,13 @@ async fn main() {
                     // Кнопка «Играть!» под картинкой игры в слова
                     if let serenity::FullEvent::InteractionCreate { interaction: serenity::Interaction::Component(press) } = event {
                         if qol::help_pressed(ctx,press,&framework.options.commands).await{return Ok(())}
+                        if ["music:", "library:", "queue:", "version:"].iter().any(|prefix| press.data.custom_id.starts_with(prefix))
+                            && !music_channels::button_check(ctx, data, press).await? {
+                            return Ok(());
+                        }
                         // …и кнопки вариантов в опросах
+                        #[cfg(feature = "voice")]
+                        if music_queue::pressed(ctx,data,press).await{return Ok(())}
                         #[cfg(feature = "voice")]
                         if music_qol::version_pressed(ctx,data,press).await{return Ok(())}
                         #[cfg(feature = "voice")]
@@ -407,10 +429,6 @@ async fn main() {
                     // Сообщения: анти-спам, ответы ИИ, автоответы и опыт
                     if let serenity::FullEvent::Message { new_message } = event {
                         chat::on_message(ctx, data, new_message).await;
-                    }
-                    // Новый участник на сервере — приветствие
-                    if let serenity::FullEvent::GuildMemberAddition { new_member } = event {
-                        welcome::on_member_join(ctx, data, new_member).await;
                     }
                     Ok(())
                 })
@@ -460,13 +478,10 @@ async fn main() {
 
     // Какие события бот получает от Discord: серверы, голосовые каналы (для музыки) и сообщения.
     // MESSAGE_CONTENT — текст сообщений (для ИИ, автоответов и анти-спама): включается в Developer Portal → Bot.
-    let mut intents = serenity::GatewayIntents::GUILDS
+    let intents = serenity::GatewayIntents::GUILDS
         | serenity::GatewayIntents::GUILD_VOICE_STATES
         | serenity::GatewayIntents::GUILD_MESSAGES
         | serenity::GatewayIntents::MESSAGE_CONTENT;
-    if welcome::members_intent(&settings) {
-        intents |= serenity::GatewayIntents::GUILD_MEMBERS; // «зашёл новый участник» — для приветствий
-    }
     let builder = serenity::ClientBuilder::new(token, intents).framework(framework);
     #[cfg(feature = "voice")]
     let builder = builder.register_songbird();
@@ -492,18 +507,20 @@ mod tests {
         assert_eq!(names.len(), list.len());
         assert!(names.contains("words"));
         assert!(!names.contains("slovo") && !names.contains("wort"));
+        assert!(!names.contains("welcome_channel"));
+        assert!(names.contains("music_channel") && names.contains("status"));
         let words = list.iter().find(|c| c["name"] == "words").unwrap();
         assert_eq!(words["options"].as_array().unwrap().len(), 1);
         assert_eq!(words["options"][0]["name"], "language");
         assert_eq!(words["options"][0]["choices"].as_array().unwrap().len(), 2);
         #[cfg(feature = "voice")]
         {
-            assert_eq!(names.len(), 76);
+            assert_eq!(names.len(), 77);
             assert!(names.contains("favorites") && names.contains("history"));
         }
         #[cfg(not(feature = "voice"))]
         {
-            assert_eq!(names.len(), 55);
+            assert_eq!(names.len(), 56);
             assert!(!names.contains("favorites") && !names.contains("history"));
         }
     }

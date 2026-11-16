@@ -25,7 +25,7 @@ fn defer_privately(command: &str) -> Option<bool> {
         return None;
     }
     Some(matches!(command,
-        "help" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
+        "help" | "status" | "music_channel" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
         "patchnotes" | "patchnotes_channel" | "log_channel" | "shop_add" | "shop_remove" | "daily_test"
     ))
 }
@@ -37,7 +37,11 @@ pub async fn before_command(ctx: Context<'_>) -> Result<bool, Error> {
             return Ok(true);
         }
     }
-    if !crate::admin::games_channel_check(ctx).await? {
+    if !crate::music_channels::command_check(ctx).await? {
+        return Ok(false);
+    }
+    if !matches!(ctx.command().name.as_ref(), "status" | "music_channel")
+        && !crate::music_channels::is_music_command(&ctx.command().name) && !crate::admin::games_channel_check(ctx).await? {
         return Ok(false);
     }
     if let Some(private) = defer_privately(&ctx.command().name) {
