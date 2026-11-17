@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 /// Какие команды работают только в канале для игр, если его выбрали (settings.ini → [channels] games_commands).
 pub const DEFAULT_GAMES_COMMANDS: &str = "rank, leaderboard, money_leaderboard, dick_growth, dick_size, \
-    dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, case, pets, pets_collect, pet_feed, pet_sell, \
+    dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, rocket, roulette, case, pets, pets_collect, pet_feed, pet_sell, \
     dice, roll, predskazanie, shar, words, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz";
 
 /// Названия через запятую → набор названий без «/» и в нижнем регистре.

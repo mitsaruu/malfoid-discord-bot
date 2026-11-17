@@ -218,6 +218,7 @@ impl Database {
         let database = Self { connection: Mutex::new(connection) };
         crate::wordsummary::prepare(&database)?;
         crate::music_channels::prepare(&database)?;
+        crate::wagers::prepare(&database)?;
         #[cfg(feature = "voice")]
         crate::music_queue::prepare(&database)?;
         #[cfg(feature = "voice")]

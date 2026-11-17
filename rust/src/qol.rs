@@ -61,6 +61,8 @@ fn section(name: &str) -> usize {
                 | "coinflip"
                 | "slots"
                 | "blackjack"
+                | "rocket"
+                | "roulette"
                 | "case"
                 | "cases"
                 | "money_leaderboard"
@@ -96,7 +98,7 @@ fn help_embed(commands: &[poise::Command<Shared, Error>], page: usize) -> s::Cre
     lines.sort();
     let example = [
         "`/play название` · `/queue` — страницы и кнопки управления",
-        "`/daily` · `/pets` · `/shop`",
+        "`/daily` · `/pets` · `/shop` · `/rocket bet:100` · `/roulette bet:100 space:red`",
         "`/words` · `/wordstats`",
         "`/ask question:объясни закон Ома model:Hydrogen thinking:high` · `/ai_limits`",
         "`/music_channel channel:#музыка` · `/status` · `/server_settings`",

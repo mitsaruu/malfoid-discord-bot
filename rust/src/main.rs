@@ -34,12 +34,15 @@ mod qol;
 mod music_qol;
 mod reminders;
 mod reply;
+mod rocket;
+mod roulette;
 mod shop;
 #[cfg(feature = "voice")]
 mod music;
 #[cfg(feature = "voice")]
 mod spotify;
 mod text;
+mod wagers;
 mod weather;
 mod diagnostics;
 mod music_channels;
@@ -67,6 +70,8 @@ pub struct Data {
     pub music_runtime: music_runtime::RuntimeState,
     pub db: std::sync::Arc<db::Database>,
     pub economy: economy::EconomySettings,
+    pub rocket: rocket::State,
+    pub roulette: roulette::State,
     pub pets: pets::PetSettings,
     pub levels: levels::LevelSettings,
     pub growth: fun::GrowthSettings,
@@ -115,6 +120,8 @@ impl Data {
             music_runtime: Default::default(),
             db: std::sync::Arc::new(database),
             economy: economy::EconomySettings::load(settings),
+            rocket: Default::default(),
+            roulette: Default::default(),
             pets: pets::PetSettings::load(settings),
             levels: levels::LevelSettings::load(settings),
             growth: fun::GrowthSettings::load(settings),
@@ -271,6 +278,8 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         economy::coinflip(),
         economy::slots(),
         blackjack::blackjack(),
+        rocket::rocket(),
+        roulette::roulette(),
         pets::open_case(),
         pets::cases(),
         pets::show_pets(),
@@ -380,6 +389,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    match wagers::refund(&database, None) {
+        Ok(0) => {},
+        Ok(count) => println!("Возвращены ставки прерванных игр: {count}"),
+        Err(error) => {
+            eprintln!("Не получилось вернуть ставки прерванных игр: {error}");
+            std::process::exit(1);
+        }
+    }
     #[cfg(feature = "voice")]
     if let Err(error) = music_runtime::recover(&database) {
         println!("Не получилось восстановить сохранённую очередь: {error}");
@@ -406,6 +423,8 @@ async fn main() {
                     let (ctx, data) = (framework.serenity_context, framework.user_data);
                     // Кнопка «Играть!» под картинкой игры в слова
                     if let serenity::FullEvent::InteractionCreate { interaction: serenity::Interaction::Component(press) } = event {
+                        if rocket::pressed(ctx, data, press).await { return Ok(()); }
+                        if roulette::pressed(ctx, press).await? { return Ok(()); }
                         if qol::help_pressed(ctx,press,&framework.options.commands).await{return Ok(())}
                         if ["music:", "library:", "queue:", "version:"].iter().any(|prefix| press.data.custom_id.starts_with(prefix))
                             && !music_channels::button_check(ctx, data, press).await? {
@@ -509,18 +528,24 @@ mod tests {
         assert!(!names.contains("slovo") && !names.contains("wort"));
         assert!(!names.contains("welcome_channel"));
         assert!(names.contains("music_channel") && names.contains("status"));
+        let rocket = list.iter().find(|c| c["name"] == "rocket").unwrap();
+        assert_eq!(rocket["options"][0]["name"], "bet");
+        assert_eq!(rocket["options"][0]["required"], true);
+        let roulette = list.iter().find(|c| c["name"] == "roulette").unwrap();
+        assert_eq!(roulette["options"][1]["name"], "space");
+        assert_eq!(roulette["options"][1]["autocomplete"], true);
         let words = list.iter().find(|c| c["name"] == "words").unwrap();
         assert_eq!(words["options"].as_array().unwrap().len(), 1);
         assert_eq!(words["options"][0]["name"], "language");
         assert_eq!(words["options"][0]["choices"].as_array().unwrap().len(), 2);
         #[cfg(feature = "voice")]
         {
-            assert_eq!(names.len(), 77);
+            assert_eq!(names.len(), 79);
             assert!(names.contains("favorites") && names.contains("history"));
         }
         #[cfg(not(feature = "voice"))]
         {
-            assert_eq!(names.len(), 56);
+            assert_eq!(names.len(), 58);
             assert!(!names.contains("favorites") && !names.contains("history"));
         }
     }
