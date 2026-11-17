@@ -163,6 +163,14 @@ impl Database {
                  channel_id INTEGER, role TEXT, text TEXT, created REAL
              );
              CREATE TABLE IF NOT EXISTS ai_stats (day TEXT PRIMARY KEY, requests INTEGER);
+             CREATE TABLE IF NOT EXISTS ai_model_usage (
+                 user_id INTEGER NOT NULL,
+                 day TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 used INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0),
+                 reserved INTEGER NOT NULL DEFAULT 0 CHECK (reserved >= 0),
+                 PRIMARY KEY (user_id, day, model)
+             );
              CREATE TABLE IF NOT EXISTS rude_strikes (
                  guild_id INTEGER, user_id INTEGER, count INTEGER, last_time REAL,
                  PRIMARY KEY (guild_id, user_id)
@@ -204,6 +212,9 @@ impl Database {
         }
         let has_details={let mut st=connection.prepare("PRAGMA table_info(playlists)")?;let rows=st.query_map([],|r|r.get::<_,String>(1))?;rows.collect::<rusqlite::Result<Vec<_>>>()?.iter().any(|c|c=="details")};
         if !has_details{connection.execute_batch("ALTER TABLE playlists ADD COLUMN details TEXT")?;}
+        // Single-bot startup: unfinished requests died with the previous process.
+        // Successful usage survives; callers must not reopen during active requests.
+        connection.execute("UPDATE ai_model_usage SET reserved = 0 WHERE reserved != 0", [])?;
         let database = Self { connection: Mutex::new(connection) };
         crate::wordsummary::prepare(&database)?;
         crate::music_channels::prepare(&database)?;
@@ -999,6 +1010,43 @@ impl Database {
         Ok(())
     }
 
+    /// Reserve one model answer globally across guilds. The caller supplies the
+    /// Moscow calendar day and owns an RAII guard that finishes this reservation.
+    /// A single conditional write also enforces the limit across SQLite connections.
+    pub fn reserve_ai_model(&self, user: u64, day: &str, model: &str, limit: i64) -> rusqlite::Result<bool> {
+        if limit <= 0 {
+            return Ok(false);
+        }
+        Ok(self.lock().execute(
+            "INSERT INTO ai_model_usage (user_id, day, model, used, reserved)
+             VALUES (?1, ?2, ?3, 0, 1)
+             ON CONFLICT (user_id, day, model) DO UPDATE SET reserved = reserved + 1
+             WHERE used + reserved < ?4",
+            params![user as i64, day, model, limit],
+        )? > 0)
+    }
+
+    /// Release a pending reservation, charging only a successful answer. Finish
+    /// against the originally reserved day, even if the request crosses midnight.
+    /// With no pending reservation this is a no-op, preventing counter underflow.
+    pub fn finish_ai_model(&self, user: u64, day: &str, model: &str, success: bool) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE ai_model_usage SET reserved = reserved - 1, used = used + ?4
+             WHERE user_id = ?1 AND day = ?2 AND model = ?3 AND reserved > 0",
+            params![user as i64, day, model, i64::from(success)],
+        )?;
+        Ok(())
+    }
+
+    /// Successful answers only; pending reservations do not count as usage.
+    pub fn ai_model_usage(&self, user: u64, day: &str, model: &str) -> rusqlite::Result<i64> {
+        Ok(self.lock().query_row(
+            "SELECT used FROM ai_model_usage WHERE user_id = ?1 AND day = ?2 AND model = ?3",
+            params![user as i64, day, model],
+            |row| row.get(0),
+        ).optional()?.unwrap_or(0))
+    }
+
     /// Сколько запросов к Google бот отправил за день day.
     pub fn ai_requests(&self, day: &str) -> rusqlite::Result<i64> {
         let requests = self
@@ -1114,6 +1162,136 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QuotaTestFile(std::path::PathBuf);
+
+    impl QuotaTestFile {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "musicbot-quota-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory.join("quota.db"))
+        }
+    }
+
+    impl Drop for QuotaTestFile {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(self.0.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn ai_model_quota_counts_successes_and_blocks_pending_oversubscription() {
+        let db = Database::in_memory().unwrap();
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 0);
+        for _ in 0..4 {
+            assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+        }
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 0);
+        assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+        for expected in 1..=4 {
+            db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+            assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), expected);
+            assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+        }
+    }
+
+    #[test]
+    fn ai_model_quota_refunds_failures_without_underflow_or_unreserved_successes() {
+        let db = Database::in_memory().unwrap();
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 0);
+        assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 1).unwrap());
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", false).unwrap();
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", false).unwrap();
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 0);
+        assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 1).unwrap());
+        assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 1).unwrap());
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 1);
+    }
+
+    #[test]
+    fn ai_model_quota_isolates_user_day_and_model() {
+        let db = Database::in_memory().unwrap();
+        assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 1).unwrap());
+        db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+        for (user, day, model) in [
+            (2, "2026-11-17", "hydrogen"),
+            (1, "2026-11-18", "hydrogen"),
+            (1, "2026-11-17", "other"),
+        ] {
+            assert_eq!(db.ai_model_usage(user, day, model).unwrap(), 0);
+            assert!(db.reserve_ai_model(user, day, model, 1).unwrap());
+            db.finish_ai_model(user, day, model, false).unwrap();
+        }
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 1);
+        assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 1).unwrap());
+    }
+
+    #[test]
+    fn ai_model_quota_rejects_nonpositive_limits() {
+        let db = Database::in_memory().unwrap();
+        for limit in [0, -1, i64::MIN] {
+            assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", limit).unwrap());
+        }
+        assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 1).unwrap());
+        assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 0).unwrap());
+    }
+
+    #[test]
+    fn ai_model_quota_reopen_keeps_successes_and_releases_stale_reservations() {
+        let file = QuotaTestFile::new();
+        {
+            let db = Database::open(&file.0).unwrap();
+            assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+            db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+            for _ in 0..3 {
+                assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+            }
+            assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+        }
+        let db = Database::open(&file.0).unwrap();
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 1);
+        for _ in 0..3 {
+            assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+        }
+        assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+    }
+
+    #[test]
+    fn ai_model_quota_is_atomic_across_separate_connections() {
+        let file = QuotaTestFile::new();
+        // Open all connections before reserving: open is single-bot startup recovery.
+        let databases: Vec<_> = (0..12).map(|_| Database::open(&file.0).unwrap()).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(databases.len()));
+        let workers: Vec<_> = databases.into_iter().map(|db| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let reserved = db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4);
+                // Keep reservations outstanding until every connection has tried.
+                barrier.wait();
+                let reserved = reserved.unwrap();
+                if reserved {
+                    db.finish_ai_model(1, "2026-11-17", "hydrogen", true).unwrap();
+                }
+                reserved
+            })
+        }).collect();
+        let accepted = workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>();
+        assert_eq!(accepted, 4);
+        let db = Database::open(&file.0).unwrap();
+        assert_eq!(db.ai_model_usage(1, "2026-11-17", "hydrogen").unwrap(), 4);
+        assert!(!db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
+    }
 
     #[test]
     fn wallet_and_money() {

@@ -24,6 +24,8 @@ pub async fn ask(
     ctx: Context<'_>,
     #[description = "Твой вопрос"] question: String,
     #[description = "Картинка к вопросу (необязательно): PNG, JPEG, WEBP"] image: Option<serenity::Attachment>,
+    #[description = "Модель: Авто, Flash-Lite или Hydrogen (4 ответа в сутки)"] model: Option<ai::ModelChoice>,
+    #[description = "Уровень рассуждения; без выбора используется настройка бота"] thinking: Option<ai::ThinkingLevel>,
 ) -> Result<(), Error> {
     let data = ctx.data();
     if !data.ai.ready() {
@@ -35,17 +37,8 @@ pub async fn ask(
                 "Это не подходит: нужна картинка PNG, JPEG или WEBP не больше {} МБ.", ai::MAX_IMAGE_MB)).await;
         }
     }
-    if ai::is_rude(data, &question) {
-        // Вопрос с матом — молчим. Discord требует ответа на команду, поэтому отвечаем невидимо и сразу удаляем.
-        ctx.defer_ephemeral().await?;
-        vanish(ctx).await;
-        ai::punish_rudeness(ctx.serenity_context(), data, ctx.guild_id(), ctx.author(), ctx.channel_id()).await;
-        return Ok(());
-    }
-    if let Some(refusal) = data.ai.limit_check(ctx.author().id.get()) {
-        return whisper(ctx, refusal).await;
-    }
     ctx.defer().await?; // ИИ отвечает несколько секунд — показываем «бот думает…»
+    let delivery = ai::DeliveryReceipt::default();
     let mut images = Vec::new();
     if let Some(image) = &image {
         match image.download().await {
@@ -57,6 +50,7 @@ pub async fn ask(
     // На сервере модератор может попросить через /ask выдать варн или тайм-аут
     let member = ctx.author_member().await.map(|member| member.into_owned());
     let mut extras = ai::Extras::default();
+    extras.options = ai::RequestOptions { model: model.unwrap_or_default(), thinking, user: Some(ctx.author().id.get()), delivery: Some(&delivery) };
     if let (Some(guild), Some(member)) = (ctx.guild_id(), &member) {
         let note = crate::moderation::context_note(ctx.serenity_context(), guild, member, &question, &[]).await;
         extras.moderation = Some((crate::moderation::Requester { ctx: ctx.serenity_context(), guild, member }, note));
@@ -86,6 +80,7 @@ pub async fn ask(
         }
         ctx.send(reply).await?;
     }
+    delivery.delivered();
     Ok(())
 }
 
@@ -111,6 +106,7 @@ pub async fn ai_limits(ctx: Context<'_>) -> Result<(), Error> {
     let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap();
     let personal_reset = tomorrow.and_local_timezone(chrono::Local).earliest().map_or(0, |time| time.timestamp());
     let wait = settings.cooldown as f64 - (db::now() - last);
+    let hydrogen_used = data.db.ai_model_usage(ctx.author().id.get(), &ai::moscow_day(), ai::HYDROGEN_MODEL)?;
     // Общий лимит ключа Google
     let used = data.db.ai_requests(&ai::google_day())?;
     let google_reset = ai::google_reset_time();
@@ -121,6 +117,8 @@ pub async fn ai_limits(ctx: Context<'_>) -> Result<(), Error> {
         "**Твой личный лимит** (ограничение бота):".to_string(),
         format!("• Осталось вопросов сегодня: **{left}** из {}", settings.daily_limit),
         format!("• Обновится: <t:{personal_reset}:t> (<t:{personal_reset}:R>)"),
+        format!("• Hydrogen: **{}** из {} ответов осталось; сброс в 00:00 МСК (<t:{}:R>)",
+                (ai::HYDROGEN_DAILY_LIMIT - hydrogen_used).max(0), ai::HYDROGEN_DAILY_LIMIT, ai::moscow_reset_time()),
     ];
     if wait > 0.0 {
         lines.push(format!("• Следующий вопрос можно задать через {} сек", wait as i64 + 1));
@@ -201,7 +199,8 @@ pub async fn summary(
     lines.reverse(); // история шла от новых к старым
     let task = summary_task(hours, &lines.join("\n"));
     let system = "Ты аккуратно и нейтрально пересказываешь переписку. Отвечай по-русски.";
-    let answer = match ai::generate(data, system, &[Turn::user(task)]).await {
+    let delivery = ai::DeliveryReceipt::default();
+    let answer = match ai::generate_selected(data, system, &[Turn::user(task)], ai::RequestOptions { user: Some(ctx.author().id.get()), delivery: Some(&delivery), ..Default::default() }).await {
         Ok(answer) => answer,
         Err(error) => {
             ctx.say(ai::error_text(&error)).await?;
@@ -213,6 +212,7 @@ pub async fn summary(
     for part in ai::split_message(&format!("📝 **О чём говорили за {hours} ч** ({} сообщений):\n{text}", lines.len()), 1900) {
         ctx.send(poise::CreateReply::default().content(part).allowed_mentions(serenity::CreateAllowedMentions::new())).await?;
     }
+    delivery.delivered();
     Ok(())
 }
 
@@ -300,7 +300,8 @@ pub async fn quiz(
     let used: Vec<String> = data.quiz_recent.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&guild).cloned().unwrap_or_default();
     let task = quiz_task(topic.as_deref(), &used[used.len().saturating_sub(15)..]);
     let system = "Ты ведущий викторины. Отвечай по-русски и строго в формате JSON.";
-    let answer = match ai::generate(data, system, &[Turn::user(task)]).await {
+    let delivery = ai::DeliveryReceipt::default();
+    let answer = match ai::generate_selected(data, system, &[Turn::user(task)], ai::RequestOptions { user: Some(ctx.author().id.get()), delivery: Some(&delivery), ..Default::default() }).await {
         Ok(answer) => answer,
         Err(error) => {
             ctx.say(ai::error_text(&error)).await?;
@@ -326,6 +327,7 @@ pub async fn quiz(
             .components(quiz_buttons(&options, None)))
         .await?;
     let message_id = reply.message().await?.id;
+    delivery.delivered();
     let result = |ending: String| format!("🧠 **Викторина:** {question}\n✅ Правильный ответ: **{}**\n{ending}", options[correct]);
     let (deadline, mut tried) = (tokio::time::Instant::now() + Duration::from_secs(seconds), HashSet::new());
     loop {
@@ -370,6 +372,17 @@ fn guild_name(press: &serenity::ComponentInteraction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_registers_optional_model_and_thinking_choices() {
+        let command = ask();
+        for (name, expected) in [("model", vec!["Авто", "Flash-Lite", "Hydrogen"]), ("thinking", vec!["low", "medium", "high"])] {
+            let parameter = command.parameters.iter().find(|parameter| parameter.name == name).unwrap();
+            assert!(!parameter.required);
+            assert_eq!(parameter.choices.iter().map(|choice| choice.name.as_ref()).collect::<Vec<_>>(), expected);
+            assert!(parameter.create_as_slash_command_option().is_some());
+        }
+    }
 
     #[test]
     fn quiz_parsing() {

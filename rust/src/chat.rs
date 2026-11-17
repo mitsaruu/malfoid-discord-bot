@@ -405,16 +405,6 @@ async fn chat_context(ctx: &serenity::Context, guild: serenity::GuildId, message
 
 /// Отвечает с помощью ИИ на сообщение, в котором обратились к боту.
 async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId, message: &serenity::Message) {
-    if ai::is_rude(data, &message.content) {
-        // к боту обратились с матом — молчим (и не тратим запрос к Google)
-        println!("Бот промолчал на мат: пользователь={} канал={}", message.author.id, message.channel_id);
-        ai::punish_rudeness(ctx, data, Some(guild), &message.author, message.channel_id).await;
-        return;
-    }
-    if let Some(refusal) = data.ai.limit_check(message.author.id.get()) {
-        let _ = message.channel_id.send_message(ctx, no_pings(&refusal).reference_message(message)).await;
-        return;
-    }
     let bot = ctx.cache.current_user().id;
     let question = message.content.replace(&format!("<@{bot}>"), "").replace(&format!("<@!{bot}>"), "").trim().to_string();
     // Картинки: из самого сообщения и из сообщения, на которое ответили (например, «@бот что тут?» на чужое фото)
@@ -449,7 +439,12 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
         }
     }
     let author = guild.member(ctx, message.author.id).await.ok();
-    let mut extras = ai::Extras { chat, moderation: None };
+    let delivery = ai::DeliveryReceipt::default();
+    let mut extras = ai::Extras {
+        chat,
+        moderation: None,
+        options: ai::RequestOptions { user: Some(message.author.id.get()), delivery: Some(&delivery), ..Default::default() },
+    };
     if let Some(author) = &author {
         let note = moderation::context_note(ctx, guild, author, &question, &targets).await;
         extras.moderation = Some((Requester { ctx, guild, member: author }, note));
@@ -464,7 +459,7 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
     };
     typing.stop();
     let Some(answer) = answer else {
-        // ИИ сама решила, что обращение грубое, — не отвечаем
+        // Отдельный классификатор в ai::ask выявил прямое серьёзное оскорбление бота.
         ai::punish_rudeness(ctx, data, Some(guild), &message.author, message.channel_id).await;
         return;
     };
@@ -472,9 +467,10 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
     for (index, part) in ai::split_message(&answer, 1900).into_iter().enumerate() {
         let reply = if index == 0 { no_pings(&part).reference_message(message) } else { no_pings(&part) };
         if message.channel_id.send_message(ctx, reply).await.is_err() {
-            break;
+            return;
         }
     }
+    delivery.delivered();
 }
 
 /// Сообщение от другого бота: опыт и автоответы ботам не положены, а на прямое обращение — ответ ИИ.

@@ -98,7 +98,7 @@ fn help_embed(commands: &[poise::Command<Shared, Error>], page: usize) -> s::Cre
         "`/play название` · `/queue` — страницы и кнопки управления",
         "`/daily` · `/pets` · `/shop`",
         "`/words` · `/wordstats`",
-        "`/ask question:объясни закон Ома`",
+        "`/ask question:объясни закон Ома model:Hydrogen thinking:high` · `/ai_limits`",
         "`/music_channel channel:#музыка` · `/status` · `/server_settings`",
     ][page];
     s::CreateEmbed::new()

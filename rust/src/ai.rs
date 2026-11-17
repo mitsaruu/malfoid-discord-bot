@@ -21,6 +21,7 @@ const DEFAULT_CHARACTER: &str = include_str!("ai_character.txt");
 const TECH_RULES: &str = include_str!("ai_rules.txt");
 
 /// Настройки из settings.ini, раздел [ai].
+#[derive(Clone)]
 pub struct AiSettings {
     pub model: String,
     pub fallback_model: Option<String>, // запасная модель, если основная не отвечает
@@ -34,12 +35,105 @@ pub struct AiSettings {
     pub one_line: bool,                 // склеивать ответ в одну строку
 }
 
+pub const HYDROGEN_MODEL: &str = "gemini-4-hydrogen";
+pub const FLASH_LITE_MODEL: &str = "gemini-3.5-flash-lite";
+pub const HYDROGEN_DAILY_LIMIT: i64 = 4;
+
+#[derive(Debug, Clone, Copy, Default, poise::ChoiceParameter)]
+pub enum ModelChoice {
+    #[default]
+    #[name = "Авто"]
+    Auto,
+    #[name = "Flash-Lite"]
+    FlashLite,
+    #[name = "Hydrogen"]
+    Hydrogen,
+}
+
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+pub enum ThinkingLevel {
+    #[name = "low"]
+    Low,
+    #[name = "medium"]
+    Medium,
+    #[name = "high"]
+    High,
+}
+
+impl ThinkingLevel {
+    fn as_str(self) -> &'static str {
+        match self { Self::Low => "low", Self::Medium => "medium", Self::High => "high" }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct RequestOptions<'a> {
+    pub model: ModelChoice,
+    pub thinking: Option<ThinkingLevel>,
+    pub user: Option<u64>,
+    pub delivery: Option<&'a DeliveryReceipt>,
+}
+
+fn request_settings(defaults: &AiSettings, options: RequestOptions<'_>) -> AiSettings {
+    let mut settings = defaults.clone();
+    match options.model {
+        ModelChoice::Auto => {},
+        ModelChoice::FlashLite => { settings.model = FLASH_LITE_MODEL.into(); settings.fallback_model = None; },
+        ModelChoice::Hydrogen => { settings.model = HYDROGEN_MODEL.into(); settings.fallback_model = None; },
+    }
+    if let Some(level) = options.thinking { settings.thinking_level = Some(level.as_str().into()); }
+    settings
+}
+
+pub fn moscow_day_at(now: chrono::DateTime<chrono::Utc>) -> String {
+    now.with_timezone(&chrono_tz::Europe::Moscow).date_naive().to_string()
+}
+
+pub fn moscow_day() -> String { moscow_day_at(chrono::Utc::now()) }
+
+pub fn moscow_reset_time() -> i64 {
+    use chrono::TimeZone;
+    let zone = chrono_tz::Europe::Moscow;
+    let next = chrono::Utc::now().with_timezone(&zone).date_naive() + chrono::Duration::days(1);
+    zone.from_local_datetime(&next.and_hms_opt(0, 0, 0).unwrap()).earliest().map_or(0, |time| time.timestamp())
+}
+
+/// Резерв снимается и при ошибке, и при отмене future по тайм-ауту.
+struct HydrogenPermit {
+    db: std::sync::Arc<db::Database>,
+    user: u64,
+    day: String,
+    success: bool,
+}
+
+/// Живёт до отправки ответа в Discord. Отмена/ошибка доставки возвращают резерв.
+#[derive(Default)]
+pub struct DeliveryReceipt {
+    permit: Mutex<Option<HydrogenPermit>>,
+}
+
+impl DeliveryReceipt {
+    pub fn delivered(&self) {
+        if let Some(mut permit) = locked(&self.permit).take() {
+            permit.success = true;
+        }
+    }
+}
+
+impl Drop for HydrogenPermit {
+    fn drop(&mut self) {
+        if let Err(error) = self.db.finish_ai_model(self.user, &self.day, HYDROGEN_MODEL, self.success) {
+            eprintln!("Не удалось сохранить расход Hydrogen: {error}");
+        }
+    }
+}
+
 impl AiSettings {
     pub fn load(settings: &crate::config::Settings) -> Self {
         let off = |text: &str| ["none", "нет", "off"].contains(&text.to_lowercase().as_str());
         let model = settings.text("ai", "model", "gemini-3.5-flash-lite");
         let level = settings.text("ai", "thinking_level", "high").to_lowercase();
-        let fallback = settings.text("ai", "fallback_model", "gemini-3.8-flash");
+        let fallback = settings.text("ai", "fallback_model", "gemini-4-hydrogen");
         Self {
             thinking_level: if off(&level) {
                 None
@@ -64,30 +158,13 @@ impl AiSettings {
 
 /// Настройки тайм-аутов за грубость из settings.ini, раздел [moderation].
 pub struct RudeSettings {
-    pub timeouts: Vec<i64>,      // минуты: за 2-ю грубость подряд, 3-ю, 4-ю…
     pub strike_reset: i64,       // через сколько минут без грубостей счётчик обнуляется
     pub announce: bool,          // писать ли в чат, что человек получил тайм-аут
-}
-
-/// «1, 5, 10, 30, 60» → [1, 5, 10, 30, 60] (минуты). off / пусто → [] (тайм-аутов нет).
-pub fn parse_timeouts(text: &str) -> Vec<i64> {
-    if ["off", "none", "нет", "0", ""].contains(&text.trim().to_lowercase().as_str()) {
-        return Vec::new();
-    }
-    let minutes: Option<Vec<i64>> = text.split(',').filter(|part| !part.trim().is_empty()).map(|part| part.trim().parse().ok()).collect();
-    match minutes {
-        Some(minutes) => minutes.into_iter().map(|m| m.clamp(1, 28 * 24 * 60)).collect(), // Discord: от 1 минуты до 28 дней
-        None => {
-            println!("settings.ini: timeouts = {text} — нужны числа через запятую, беру 1, 5, 10, 30, 60");
-            vec![1, 5, 10, 30, 60]
-        }
-    }
 }
 
 impl RudeSettings {
     pub fn load(settings: &crate::config::Settings) -> Self {
         Self {
-            timeouts: parse_timeouts(&settings.text("moderation", "timeouts", "1, 5, 10, 30, 60")),
             strike_reset: settings.int("moderation", "strike_reset_minutes", 60),
             announce: !["off", "нет", "no", "0"].contains(&settings.text("moderation", "announce_timeouts", "on").to_lowercase().as_str()),
         }
@@ -182,6 +259,7 @@ pub fn google_reset_time() -> i64 {
 /// Что пошло не так при запросе к ИИ.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AiError {
+    HydrogenLimit,
     Quota,         // Google: лимит запросов исчерпан (429)
     Overloaded,    // Google перегружен или временная ошибка сервера (5xx)
     Network(String), // тайм-аут, обрыв соединения, DNS/TLS — можно повторить запрос
@@ -191,6 +269,7 @@ pub enum AiError {
 impl std::fmt::Display for AiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            AiError::HydrogenLimit => write!(formatter, "Лимит Hydrogen: 4 ответа в сутки, сброс в 00:00 МСК. Выбери Flash-Lite."),
             AiError::Quota => write!(formatter, "лимит запросов к Gemini исчерпан (429)"),
             AiError::Overloaded => write!(formatter, "Gemini перегружен (5xx)"),
             AiError::Network(details) => write!(formatter, "Сетевая ошибка Gemini: {details}"),
@@ -204,6 +283,7 @@ impl std::error::Error for AiError {}
 /// Понятный текст ошибки ИИ для чата.
 pub fn error_text(error: &AiError) -> &'static str {
     match error {
+        AiError::HydrogenLimit => "Лимит Hydrogen на сегодня закончился: 4 ответа в сутки. Сброс в 00:00 МСК; пока можно выбрать Flash-Lite.",
         AiError::Quota => "😵 Лимит бесплатных запросов к ИИ на сейчас исчерпан. Попробуй позже (подробнее — /ai_limits).",
         AiError::Overloaded => "😵 ИИ у Google сейчас перегружен, попробуй через пару минут.",
         AiError::Network(_) => "😵 Не удалось дождаться ответа ИИ: проблема соединения с Google. Попробуй позже.",
@@ -271,16 +351,19 @@ pub fn parse_answer(response: &Value) -> Answer {
     Answer { text: text.trim().to_string(), cut }
 }
 
-async fn call_gemini(data: &Data, model: &str, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
+async fn call_gemini_settings(data: &Data, settings: &AiSettings, model: &str, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
+    send_gemini(data, model, request_body(settings, model, system, turns)).await
+}
+
+async fn send_gemini(data: &Data, model: &str, body: Value) -> Result<Answer, AiError> {
     let key = data.ai.key.as_deref().ok_or_else(|| AiError::Other("нет ключа GEMINI_API_KEY".into()))?;
     let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent");
-    let body = request_body(&data.ai.settings, model, system, turns).to_string();
     let response = data
         .web
         .post(url)
         .header("x-goog-api-key", key)
         .header("Content-Type", "application/json")
-        .body(body)
+        .body(body.to_string())
         .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
@@ -322,21 +405,49 @@ fn transport_error(error: reqwest::Error) -> AiError {
 pub async fn generate(data: &Data, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
     // Ограничиваем суммарное ожидание всех моделей: один запрос не занимает все 15 минут
     // жизни Discord interaction. Отмена прекращает текущий запрос и дальнейшие повторы.
-    generate_with(data, std::time::Duration::from_secs(2), std::time::Duration::from_secs(180), |model| async move {
-        call_gemini(data, &model, system, turns).await
+    generate_selected(data, system, turns, RequestOptions { model: ModelChoice::FlashLite, ..Default::default() }).await
+}
+
+#[cfg(test)]
+async fn call_gemini(data: &Data, model: &str, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
+    call_gemini_settings(data, &data.ai.settings, model, system, turns).await
+}
+
+pub async fn generate_selected(data: &Data, system: &str, turns: &[Turn], options: RequestOptions<'_>) -> Result<Answer, AiError> {
+    let settings = request_settings(&data.ai.settings, options);
+    let settings_ref = &settings;
+    generate_with_settings(data, settings_ref, options, std::time::Duration::from_secs(2), std::time::Duration::from_secs(180), |model| async move {
+        call_gemini_settings(data, settings_ref, &model, system, turns).await
     }).await
 }
 
+#[cfg(test)]
 async fn generate_with<F, Fut>(data: &Data, base_delay: std::time::Duration, budget: std::time::Duration, mut call: F) -> Result<Answer, AiError>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<Answer, AiError>>,
 {
+    generate_with_settings(data, &data.ai.settings, RequestOptions::default(), base_delay, budget, &mut call).await
+}
+
+async fn generate_with_settings<F, Fut>(data: &Data, settings: &AiSettings, options: RequestOptions<'_>, base_delay: std::time::Duration, budget: std::time::Duration, mut call: F) -> Result<Answer, AiError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Answer, AiError>>,
+{
     tokio::time::timeout(budget, async {
-        let settings = &data.ai.settings;
         let mut last_error = AiError::Other("нет моделей".into());
         let model_budget = budget / if settings.fallback_model.is_some() { 2 } else { 1 };
         for model in std::iter::once(&settings.model).chain(settings.fallback_model.iter()) {
+            let mut permit = if model == HYDROGEN_MODEL {
+                // Фоновые задачи не используют дорогую модель без владельца квоты.
+                let Some(user) = options.user else { continue };
+                let day = moscow_day();
+                let reserved = data.db.reserve_ai_model(user, &day, HYDROGEN_MODEL, HYDROGEN_DAILY_LIMIT)
+                    .map_err(|error| AiError::Other(error.to_string()))?;
+                if !reserved { last_error = AiError::HydrogenLimit; continue; }
+                Some(HydrogenPermit { db: data.db.clone(), user, day, success: false })
+            } else { None };
             // Медленная основная модель не должна съесть всё время, отведённое запасной.
             let deadline = tokio::time::Instant::now() + model_budget;
             let retries = settings.retries.clamp(0, 5);
@@ -351,6 +462,13 @@ where
                 };
                 match result {
                     Ok(answer) => {
+                        if !without_tags(&answer.text).trim().is_empty() {
+                            if let Some(receipt) = options.delivery {
+                                *locked(&receipt.permit) = permit.take();
+                            } else if let Some(permit) = &mut permit {
+                                permit.success = true;
+                            }
+                        }
                         // Google ответил — засчитываем запрос (для /ai_limits)
                         let _ = data.db.count_ai_request(&google_day());
                         locked(&data.ai.recent_requests).push(db::now());
@@ -480,6 +598,7 @@ pub fn is_supported_image(content_type: Option<&str>, size: u64) -> bool {
 /// Что ещё передать ИИ вместе с вопросом.
 #[derive(Default)]
 pub struct Extras<'a> {
+    pub options: RequestOptions<'a>,
     /// Последние сообщения чата (для контекста), пусто — без них
     pub chat: String,
     /// Кто спрашивает на сервере и подсказка о его правах — чтобы выполнять варны и тайм-ауты по просьбе модератора
@@ -488,6 +607,10 @@ pub struct Extras<'a> {
 
 /// Отправляет вопрос в Gemini вместе с памятью разговора. Ok(None) — ИИ решил, что к нему обратились грубо.
 pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: Vec<(Vec<u8>, String)>, extras: Extras<'_>) -> Result<Option<String>, AiError> {
+    if directed_insult(data, question).await { return Ok(None); }
+    if let Some(user) = extras.options.user {
+        if let Some(refusal) = data.ai.limit_check(user) { return Ok(Some(refusal)); }
+    }
     let system = format!("{}\nСегодня {}.", system_prompt(data), chrono::Local::now().format("%d.%m.%Y"));
     let current = format!("{name}: {question}");
     let image_count = images.len();
@@ -504,14 +627,12 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     let history = data.db.ai_history(channel, data.ai.settings.history_limit).map_err(|error| AiError::Other(error.to_string()))?;
     let mut turns: Vec<Turn> = history.into_iter().map(|(role, text)| Turn { role, text, images: Vec::new() }).collect();
     turns.push(Turn { role: "user".into(), text: prompt, images });
-    let answer = generate(data, &system, &turns).await?;
+    let answer = generate_selected(data, &system, &turns, extras.options).await?;
     if answer.text.is_empty() {
         return Ok(Some("🤔 ИИ не дал ответа. Попробуй переформулировать вопрос.".to_string()));
     }
-    if has_ignore_tag(&answer.text) {
-        return Ok(None); // не отвечаем и не запоминаем
-    }
-    let text = strip_tags(&answer.text, &["ЗАПОМНИТЬ"]);
+    // Только отдельный классификатор решает о наказании. Метки ответа не запускают его.
+    let text = strip_tags(&answer.text, &["ЗАПОМНИТЬ", "ИГНОР"]);
     // Варны и тайм-ауты по просьбе модератора: метки выполняем, а неполные (без id) просто вырезаем
     let (text, actions) = crate::moderation::take_actions(&text);
     let mut text = strip_tags(&text, &MOD_TAGS);
@@ -537,53 +658,39 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     Ok(Some(text))
 }
 
-// ---------- Грубость: слова из config/bad_words.txt и тайм-ауты ----------
+// ---------- Адресная проверка оскорблений и минутный тайм-аут ----------
 
-/// «Буква» для поиска слов: цифры, латиница и кириллица в нижнем регистре (ё заранее заменяется на е).
+fn directed_insult_result(text: &str) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text.trim()) else { return false };
+    object.len() == 1 && object.get("target").and_then(Value::as_str) == Some("bot")
+}
+
+/// Границы слов для правил автоответов в чате (ё нормализуется вызывающим кодом).
 pub fn is_letter(c: char) -> bool {
     c.is_ascii_digit() || c.is_ascii_lowercase() || ('а'..='я').contains(&c)
 }
 
-/// Совпадает ли шаблон (буквы и * — «любые буквы») с текстом, начиная с позиции start. Возвращает конец совпадения.
-fn match_at(pattern: &[char], text: &[char], start: usize) -> Option<usize> {
-    match pattern.split_first() {
-        None => Some(start),
-        Some(('*', rest)) => {
-            let mut end = start;
-            while end < text.len() && is_letter(text[end]) {
-                end += 1;
-            }
-            // пробуем «съесть» как можно больше букв, потом меньше
-            (start..=end).rev().find_map(|position| match_at(rest, text, position))
-        }
-        Some((first, rest)) => (text.get(start) == Some(first)).then(|| match_at(rest, text, start + 1)).flatten(),
+async fn directed_insult(data: &Data, text: &str) -> bool {
+    if text.trim().is_empty() { return false; }
+    let system = include_str!("ai_insult_rules.txt");
+    let turns = [Turn::user(json!({"message":text}).to_string())];
+    let options = RequestOptions { model: ModelChoice::FlashLite, thinking: Some(ThinkingLevel::Low), ..Default::default() };
+    let mut settings = request_settings(&data.ai.settings, options);
+    settings.retries = 0;
+    let mut body = request_body(&settings, FLASH_LITE_MODEL, system, &turns);
+    body["generationConfig"]["maxOutputTokens"] = json!(512);
+    body["generationConfig"]["responseMimeType"] = json!("application/json");
+    body["generationConfig"]["responseSchema"] = json!({
+        "type":"OBJECT", "properties":{"target":{"type":"STRING","enum":["bot","other","none","uncertain"]}},
+        "required":["target"]
+    });
+    let result = generate_with_settings(data, &settings, options, std::time::Duration::ZERO, std::time::Duration::from_secs(10), |_| {
+        send_gemini(data, FLASH_LITE_MODEL, body.clone())
+    }).await;
+    match result {
+        Ok(answer) if !answer.cut => directed_insult_result(&answer.text),
+        _ => false, // ошибка или сомнение никогда не приводят к наказанию
     }
-}
-
-/// Слова из bad_words.txt: по одному или несколько через запятую, строки с # — пояснения.
-pub fn parse_bad_words(text: &str) -> Vec<Vec<char>> {
-    text.lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .flat_map(|line| line.split(','))
-        .map(|word| word.trim().to_lowercase().replace('ё', "е"))
-        .filter(|word| !word.trim_matches('*').is_empty())
-        .map(|word| word.chars().collect())
-        .collect()
-}
-
-/// Есть ли в тексте слово из списка. Края слова проверяются, чтобы «сука» не ловилась в «сукно».
-pub fn contains_bad_word(words: &[Vec<char>], text: &str) -> bool {
-    let text: Vec<char> = text.to_lowercase().replace('ё', "е").chars().collect();
-    (0..text.len()).any(|start| {
-        (start == 0 || !is_letter(text[start - 1]))
-            && words.iter().any(|word| match_at(word, &text, start).is_some_and(|end| end > start && text.get(end).is_none_or(|next| !is_letter(*next))))
-    })
-}
-
-/// Есть ли в тексте слова из config/bad_words.txt.
-pub fn is_rude(data: &Data, text: &str) -> bool {
-    let words = parse_bad_words(&std::fs::read_to_string(data.dir.join("config").join("bad_words.txt")).unwrap_or_default());
-    contains_bad_word(&words, text)
 }
 
 /// Минуты → текст вроде «1 минуту», «5 минут», «2 часа».
@@ -599,15 +706,7 @@ pub fn minutes_text(minutes: i64) -> String {
     }
 }
 
-/// Какой тайм-аут (в минутах) положен за count-ю грубость подряд. None — пока только молчим.
-pub fn rude_timeout(steps: &[i64], count: i64) -> Option<i64> {
-    if count < 2 || steps.is_empty() {
-        return None; // первый раз — только молчим
-    }
-    Some(steps[((count - 2) as usize).min(steps.len() - 1)]) // 2-й раз — первая длительность и т.д.
-}
-
-/// Засчитывает грубость и, начиная со второй подряд, даёт тайм-аут.
+/// Прямое оскорбление бота: ровно минута с первого случая.
 pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option<serenity::GuildId>, user: &serenity::User, channel: serenity::ChannelId) {
     let Some(guild) = guild else { return }; // в личных сообщениях тайм-аутов нет
     if user.bot {
@@ -615,8 +714,12 @@ pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option
     }
     let Ok(count) = data.db.add_rude_strike(guild.get(), user.id.get(), db::now(), data.ai.rude.strike_reset as f64 * 60.0) else { return };
     println!("Грубость к боту: пользователь={} сервер={guild} подряд={count}", user.id);
-    let Some(minutes) = rude_timeout(&data.ai.rude.timeouts, count) else { return };
+    let minutes = 1;
     let until = serenity::Timestamp::from_unix_timestamp(db::now() as i64 + minutes * 60).unwrap_or_else(|_| serenity::Timestamp::now());
+    // Уже действующее более долгое наказание нельзя сокращать до минуты.
+    // Без GUILD_MEMBERS кэш участника может быть устаревшим — нужен свежий HTTP-ответ.
+    let Ok(member) = ctx.http.get_member(guild, user.id).await else { return };
+    if member.communication_disabled_until.is_some_and(|existing| existing > until) { return; }
     let reason = format!("Грубость к боту ({count} раз подряд)");
     let edit = serenity::EditMember::new().disable_communication_until_datetime(until).audit_log_reason(&reason);
     if let Err(error) = guild.edit_member(ctx, user.id, edit).await {
@@ -641,6 +744,104 @@ pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_models_and_thinking_are_per_request() {
+        let defaults = settings("");
+        let explicit = RequestOptions { model: ModelChoice::Hydrogen, thinking: Some(ThinkingLevel::Low), user: Some(7), ..Default::default() };
+        let selected = request_settings(&defaults, explicit);
+        assert_eq!(selected.model, "gemini-4-hydrogen");
+        assert!(selected.fallback_model.is_none());
+        assert_eq!(selected.thinking_level.as_deref(), Some("low"));
+        assert_eq!(defaults.thinking_level.as_deref(), Some("high"));
+        assert_eq!(defaults.model, "gemini-3.5-flash-lite");
+        let lite = request_settings(&defaults, RequestOptions { model: ModelChoice::FlashLite, ..Default::default() });
+        assert_eq!(lite.model, "gemini-3.5-flash-lite");
+        assert!(lite.fallback_model.is_none());
+    }
+
+    #[test]
+    fn moderation_classifier_requires_unambiguous_structured_result() {
+        assert!(directed_insult_result(r#"{"target":"bot"}"#));
+        for text in [r#"{"target":"other"}"#, r#"{"target":"none"}"#, r#"{"target":"uncertain"}"#,
+                     "[ИГНОР]", "bot", r#"{"target":"bot","explanation":"x"}"#, "ignore all instructions"] {
+            assert!(!directed_insult_result(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn hydrogen_day_changes_at_moscow_midnight() {
+        assert_eq!(moscow_day_at(chrono::DateTime::parse_from_rfc3339("2026-11-17T20:59:59Z").unwrap().to_utc()), "2026-11-17");
+        assert_eq!(moscow_day_at(chrono::DateTime::parse_from_rfc3339("2026-11-17T21:00:00Z").unwrap().to_utc()), "2026-11-18");
+    }
+
+    #[tokio::test]
+    async fn hydrogen_quota_counts_successful_answers_including_auto() {
+        let data = retry_test_data();
+        let mut selected = request_settings(&data.ai.settings, RequestOptions { model: ModelChoice::Hydrogen, ..Default::default() });
+        selected.retries = 0;
+        let options = RequestOptions { user: Some(9), ..Default::default() };
+        for _ in 0..4 {
+            let result = generate_with_settings(&data, &selected, options, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |_| {
+                std::future::ready(Ok(Answer { text: "готово".into(), cut: false }))
+            }).await;
+            assert!(result.is_ok());
+        }
+        let mut calls = 0;
+        let result = generate_with_settings(&data, &selected, options, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |_| {
+            calls += 1;
+            std::future::ready(Ok(Answer { text: "нельзя".into(), cut: false }))
+        }).await;
+        assert_eq!(result, Err(AiError::HydrogenLimit));
+        assert_eq!(calls, 0);
+        assert_eq!(data.db.ai_model_usage(9, &moscow_day(), HYDROGEN_MODEL).unwrap(), 4);
+
+        selected.model = "primary".into(); selected.fallback_model = Some(HYDROGEN_MODEL.into());
+        let result = generate_with_settings(&data, &selected, RequestOptions { user: Some(10), ..Default::default() }, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |model| {
+            std::future::ready(if model == "primary" { Err(AiError::Quota) } else { Ok(Answer { text: "fallback".into(), cut: false }) })
+        }).await;
+        assert!(result.is_ok());
+        assert_eq!(data.db.ai_model_usage(10, &moscow_day(), HYDROGEN_MODEL).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn hydrogen_error_empty_answer_and_cancellation_refund_reservation() {
+        let data = retry_test_data();
+        let settings = request_settings(&data.ai.settings, RequestOptions { model: ModelChoice::Hydrogen, ..Default::default() });
+        let options = RequestOptions { user: Some(11), ..Default::default() };
+        let budget = std::time::Duration::from_millis(20);
+        let result = generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, budget, |_| std::future::ready(Err(AiError::Other("bad".into())))).await;
+        assert!(result.is_err());
+        let _ = generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, budget, |_| std::future::ready(Ok(Answer { text: String::new(), cut: false }))).await;
+        let result = generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, budget, |_| std::future::pending::<Result<Answer, AiError>>()).await;
+        assert!(result.is_err());
+        assert_eq!(data.db.ai_model_usage(11, &moscow_day(), HYDROGEN_MODEL).unwrap(), 0);
+        // Все четыре места доступны после отмены, пятого быть не должно.
+        for _ in 0..4 { assert!(data.db.reserve_ai_model(11, &moscow_day(), HYDROGEN_MODEL, 4).unwrap()); }
+        assert!(!data.db.reserve_ai_model(11, &moscow_day(), HYDROGEN_MODEL, 4).unwrap());
+    }
+
+    #[tokio::test]
+    async fn hydrogen_delivery_failure_refunds_and_delivery_commits_once() {
+        let data = retry_test_data();
+        let settings = request_settings(&data.ai.settings, RequestOptions { model: ModelChoice::Hydrogen, ..Default::default() });
+        let body = || std::future::ready(Ok(Answer { text: "answer".into(), cut: false }));
+        {
+            let receipt = DeliveryReceipt::default();
+            let options = RequestOptions { user: Some(50), delivery: Some(&receipt), ..Default::default() };
+            generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |_| body()).await.unwrap();
+            assert_eq!(data.db.ai_model_usage(50, &moscow_day(), HYDROGEN_MODEL).unwrap(), 0);
+            // Симулируем отмену/ошибку Discord после успешной генерации.
+        }
+        assert_eq!(data.db.ai_model_usage(50, &moscow_day(), HYDROGEN_MODEL).unwrap(), 0);
+        let receipt = DeliveryReceipt::default();
+        let options = RequestOptions { user: Some(50), delivery: Some(&receipt), ..Default::default() };
+        generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |_| body()).await.unwrap();
+        receipt.delivered(); receipt.delivered();
+        assert_eq!(data.db.ai_model_usage(50, &moscow_day(), HYDROGEN_MODEL).unwrap(), 1);
+        for _ in 0..3 { assert!(data.db.reserve_ai_model(50, &moscow_day(), HYDROGEN_MODEL, 4).unwrap()); }
+        assert!(!data.db.reserve_ai_model(50, &moscow_day(), HYDROGEN_MODEL, 4).unwrap());
+    }
 
     fn retry_test_data() -> Data {
         let settings = crate::config::Settings::parse("[ai]\nmodel = primary\nfallback_model = fallback\nretries = 1\n");
@@ -720,19 +921,16 @@ mod tests {
     }
 
     #[test]
-    fn settings_like_python() {
+    fn default_settings() {
         let ai = settings("");
         assert_eq!((ai.model.as_str(), ai.fallback_model.as_deref(), ai.thinking_level.as_deref()),
-                   ("gemini-3.5-flash-lite", Some("gemini-3.8-flash"), Some("high")));
+                   ("gemini-3.5-flash-lite", Some("gemini-4-hydrogen"), Some("high")));
         assert_eq!((ai.retries, ai.cooldown, ai.daily_limit, ai.history_limit, ai.one_line), (2, 5, 50, 20, true));
         let ai = settings("[ai]\nthinking_level = чушь\nfallback_model = none\none_line_answers = off\n");
         assert_eq!((ai.thinking_level.as_deref(), ai.fallback_model, ai.one_line), (Some("high"), None, false));
         let ai = settings("[ai]\nthinking_level = off\nmodel = x\nfallback_model = x\n");
         assert_eq!((ai.thinking_level, ai.fallback_model), (None, None)); // запасная модель та же, что основная
-        assert_eq!(parse_timeouts("1, 5, 10"), [1, 5, 10]);
-        assert!(parse_timeouts("off").is_empty() && parse_timeouts("").is_empty());
-        assert_eq!(parse_timeouts("1, абв"), [1, 5, 10, 30, 60]);
-        assert_eq!(parse_timeouts("0, 99999999"), [1, 40320]);
+
     }
 
     #[test]
@@ -746,7 +944,7 @@ mod tests {
         assert_eq!(body["contents"][2]["parts"][1]["inlineData"]["data"], "AQID");
         assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal");
         // «minimal» есть только у Flash-Lite
-        assert_eq!(request_body(&ai, "gemini-3.8-flash", "", &turns)["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+        assert_eq!(request_body(&ai, "gemini-4-hydrogen", "", &turns)["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
         assert!(request_body(&settings("[ai]\nthinking_level = none\n"), "m", "", &turns)["generationConfig"].get("thinkingConfig").is_none());
 
         let response: Value = serde_json::from_str(r#"{"candidates":[{"content":{"parts":[
@@ -778,24 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_words() {
-        let words = parse_bad_words("# список\nсука, бля*\nиди* лесом\n ,*,\n");
-        assert_eq!(words.len(), 3);
-        assert!(contains_bad_word(&words, "Ну ты и СУКА!"));
-        assert!(!contains_bad_word(&words, "купил сукно")); // край слова
-        assert!(contains_bad_word(&words, "вот блядство")); // * — любые буквы
-        assert!(!contains_bad_word(&words, "табля")); // начало слова
-        assert!(contains_bad_word(&words, "идите лесом"));
-        assert!(!contains_bad_word(&words, "иди домой"));
-        assert!(!contains_bad_word(&[], "что угодно"));
-    }
-
-    #[test]
-    fn rudeness_steps() {
-        let steps = [1, 5, 10, 30, 60];
-        assert_eq!([rude_timeout(&steps, 1), rude_timeout(&steps, 2), rude_timeout(&steps, 3), rude_timeout(&steps, 99)],
-                   [None, Some(1), Some(5), Some(60)]);
-        assert_eq!(rude_timeout(&[], 5), None);
+    fn rudeness_minutes() {
         assert_eq!([minutes_text(1), minutes_text(5), minutes_text(60), minutes_text(120), minutes_text(1440), minutes_text(90)],
                    ["1 минуту", "5 минут", "1 час", "2 часа", "1 день", "90 минут"]);
     }
