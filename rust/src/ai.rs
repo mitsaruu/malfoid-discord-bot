@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 const MAX_TOKENS: i64 = 8192; // предел длины ответа; с запасом — «обдумывание» модели тоже входит в предел
+const HYDROGEN_MAX_TOKENS: i64 = 32768; // длинные ответы + рассуждение high
 pub const MAX_IMAGES: usize = 3; // сколько картинок из одного сообщения отправлять ИИ
 pub const MAX_IMAGE_MB: u64 = 5; // картинки тяжелее не отправляем (весь запрос к Gemini — не больше 20 МБ)
 const IMAGE_TYPES: [&str; 5] = ["image/png", "image/jpeg", "image/webp", "image/heic", "image/heif"];
@@ -324,7 +325,7 @@ pub fn request_body(settings: &AiSettings, model: &str, system: &str, turns: &[T
             json!({ "role": turn.role, "parts": parts })
         })
         .collect();
-    let mut config = json!({ "maxOutputTokens": MAX_TOKENS });
+    let mut config = json!({ "maxOutputTokens": if model == HYDROGEN_MODEL { HYDROGEN_MAX_TOKENS } else { MAX_TOKENS } });
     // «minimal» есть только у Flash-Lite — для других моделей берём ближайший уровень
     let level = settings.thinking_level.as_deref().map(|level| if level == "minimal" && !model.contains("lite") { "low" } else { level });
     if let Some(level) = level {
@@ -364,7 +365,7 @@ async fn send_gemini(data: &Data, model: &str, body: Value) -> Result<Answer, Ai
         .header("x-goog-api-key", key)
         .header("Content-Type", "application/json")
         .body(body.to_string())
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(http_timeout(model))
         .send()
         .await
         .map_err(transport_error)?;
@@ -416,9 +417,19 @@ async fn call_gemini(data: &Data, model: &str, system: &str, turns: &[Turn]) -> 
 pub async fn generate_selected(data: &Data, system: &str, turns: &[Turn], options: RequestOptions<'_>) -> Result<Answer, AiError> {
     let settings = request_settings(&data.ai.settings, options);
     let settings_ref = &settings;
-    generate_with_settings(data, settings_ref, options, std::time::Duration::from_secs(2), std::time::Duration::from_secs(180), |model| async move {
+    generate_with_settings(data, settings_ref, options, std::time::Duration::from_secs(2), generation_budget(settings_ref), |model| async move {
         call_gemini_settings(data, settings_ref, &model, system, turns).await
     }).await
+}
+
+fn http_timeout(model: &str) -> std::time::Duration {
+    std::time::Duration::from_secs(if model == HYDROGEN_MODEL { 300 } else { 60 })
+}
+
+fn generation_budget(settings: &AiSettings) -> std::time::Duration {
+    let hydrogen = settings.model == HYDROGEN_MODEL || settings.fallback_model.as_deref() == Some(HYDROGEN_MODEL);
+    // С запасом до 15-минутного срока Discord: остаётся время на контекст и доставку частей.
+    std::time::Duration::from_secs(if hydrogen { 660 } else { 180 })
 }
 
 #[cfg(test)]
@@ -563,6 +574,17 @@ pub fn to_one_line(text: &str) -> String {
     result
 }
 
+fn wants_structured_answer(question: &str) -> bool {
+    let question = question.to_lowercase();
+    ["latex", "латех", "конспект", "подробн", "таблиц", "пошаг", "шпаргал", "по пункт", "раздел", "абзац",
+     "table", "step by step", "step-by-step", "detailed", "outline", "paragraph", "section", "cheat sheet", "study notes"]
+        .iter().any(|word| question.contains(word))
+}
+
+fn format_answer_text(text: &str, question: &str, one_line: bool) -> String {
+    if one_line && !wants_structured_answer(question) { to_one_line(text) } else { text.to_string() }
+}
+
 /// Режет длинный текст на части (в одном сообщении Discord не больше 2000 символов).
 pub fn split_message(text: &str, limit: usize) -> Vec<String> {
     let mut parts = Vec::new();
@@ -611,7 +633,12 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     if let Some(user) = extras.options.user {
         if let Some(refusal) = data.ai.limit_check(user) { return Ok(Some(refusal)); }
     }
-    let system = format!("{}\nСегодня {}.", system_prompt(data), chrono::Local::now().format("%d.%m.%Y"));
+    let mut system = format!("{}\nСегодня {}.", system_prompt(data), chrono::Local::now().format("%d.%m.%Y"));
+    if wants_structured_answer(question) {
+        system.push_str("\nВ текущем вопросе явно запрошен структурированный или подробный материал. \
+            Выполни требования к полноте и оформлению: сохраняй разделы и абзацы; если запрошены таблицы или LaTeX, используй их. \
+            Обычные предпочтения краткого ответа и записи формул обычным текстом здесь не применяются.");
+    }
     let current = format!("{name}: {question}");
     let image_count = images.len();
     let mut prompt = current.clone();
@@ -640,9 +667,7 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
         Some((requester, _)) => crate::moderation::run_actions(data, requester, actions).await,
         None => Vec::new(),
     };
-    if data.ai.settings.one_line {
-        text = to_one_line(&text); // в памяти тоже — чтобы ИИ не копировал абзацы
-    }
+    text = format_answer_text(&text, question, data.ai.settings.one_line);
     if !punishments.is_empty() {
         text = format!("{text}\n{}", punishments.join("\n")).trim().to_string();
     }
@@ -744,6 +769,30 @@ pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hydrogen_long_answers_have_time_and_output_headroom() {
+        let defaults = settings("");
+        let turns = [Turn::user("Составь подробный конспект")];
+        assert_eq!(request_body(&defaults, HYDROGEN_MODEL, "", &turns)["generationConfig"]["maxOutputTokens"], 32768);
+        assert_eq!(request_body(&defaults, FLASH_LITE_MODEL, "", &turns)["generationConfig"]["maxOutputTokens"], 8192);
+        assert_eq!(http_timeout(HYDROGEN_MODEL), std::time::Duration::from_secs(300));
+        assert_eq!(http_timeout(FLASH_LITE_MODEL), std::time::Duration::from_secs(60));
+        assert_eq!(generation_budget(&request_settings(&defaults, RequestOptions { model: ModelChoice::Hydrogen, ..Default::default() })), std::time::Duration::from_secs(660));
+        assert_eq!(generation_budget(&request_settings(&defaults, RequestOptions { model: ModelChoice::FlashLite, ..Default::default() })), std::time::Duration::from_secs(180));
+        assert_eq!(generation_budget(&defaults), std::time::Duration::from_secs(660)); // auto leaves time for Hydrogen
+    }
+
+    #[test]
+    fn explicit_structured_requests_preserve_latex_tables_and_paragraphs() {
+        let text = "Раздел 1\n\n$$\\sum a_n$$\n\n| Признак | Условие |\n| --- | --- |";
+        for question in ["Составь подробный конспект", "Все формулы запиши в LaTeX", "Покажи сравнительную таблицу", "Объясни пошагово",
+                         "Write a comparison table", "Explain step by step", "Разбей ответ на разделы"] {
+            assert_eq!(format_answer_text(text, question, true), text);
+        }
+        assert_eq!(format_answer_text("Привет\nКак дела", "привет", true), "Привет Как дела");
+        assert_eq!(format_answer_text(text, "привет", false), text);
+    }
 
     #[test]
     fn selected_models_and_thinking_are_per_request() {

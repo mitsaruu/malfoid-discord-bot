@@ -14,7 +14,7 @@ pub struct PetSettings {
     pub max_level: i64,
     pub collect_cap_hours: i64,
     pub sell_percent: i64,
-    pub case_prices: [i64; 3], // дешёвый, средний, дорогой
+    pub case_prices: [i64; 4], // дешёвый, средний, дорогой, секретный
 }
 
 impl PetSettings {
@@ -28,6 +28,7 @@ impl PetSettings {
                 settings.int("pets", "cheap_case_price", 500).max(1),
                 settings.int("pets", "medium_case_price", 2000).max(1),
                 settings.int("pets", "expensive_case_price", 7500).max(1),
+                settings.int("pets", "secret_case_price", 25000).max(1),
             ],
         }
     }
@@ -41,17 +42,19 @@ pub enum Case {
     Medium,
     #[name = "💎 Дорогой"]
     Expensive,
+    #[name = "🔮 Секретный"]
+    Secret,
 }
 
 impl Case {
-    const ALL: [Case; 3] = [Case::Cheap, Case::Medium, Case::Expensive];
+    const ALL: [Case; 4] = [Case::Cheap, Case::Medium, Case::Expensive, Case::Secret];
 
     fn emoji(self) -> &'static str {
-        ["📦", "🎁", "💎"][self as usize]
+        ["📦", "🎁", "💎", "🔮"][self as usize]
     }
 
     fn title(self) -> &'static str {
-        ["Дешёвый", "Средний", "Дорогой"][self as usize]
+        ["Дешёвый", "Средний", "Дорогой", "Секретный"][self as usize]
     }
 }
 
@@ -60,15 +63,16 @@ pub struct Rarity {
     pub key: &'static str,
     pub name: &'static str,
     pub color: u32,
-    pub chances: [f64; 3], // дешёвый, средний, дорогой
+    pub chances: [f64; 4], // дешёвый, средний, дорогой, секретный
 }
 
-pub const RARITIES: [Rarity; 5] = [
-    Rarity { key: "common", name: "Обычный", color: 0x9CA3AF, chances: [75.0, 40.0, 0.0] },
-    Rarity { key: "rare", name: "Редкий", color: 0x3B82F6, chances: [20.0, 38.0, 40.0] },
-    Rarity { key: "epic", name: "Эпический", color: 0xA855F7, chances: [4.5, 17.0, 40.0] },
-    Rarity { key: "legendary", name: "Легендарный", color: 0xF59E0B, chances: [0.49, 4.8, 18.5] },
-    Rarity { key: "mythic", name: "Мифический", color: 0xEF4444, chances: [0.01, 0.2, 1.5] },
+pub const RARITIES: [Rarity; 6] = [
+    Rarity { key: "common", name: "Обычный", color: 0x9CA3AF, chances: [75.0, 40.0, 0.0, 0.0] },
+    Rarity { key: "rare", name: "Редкий", color: 0x3B82F6, chances: [20.0, 38.0, 40.0, 0.0] },
+    Rarity { key: "epic", name: "Эпический", color: 0xA855F7, chances: [4.5, 17.0, 40.0, 60.0] },
+    Rarity { key: "legendary", name: "Легендарный", color: 0xF59E0B, chances: [0.49, 4.8, 18.5, 34.95] },
+    Rarity { key: "mythic", name: "Мифический", color: 0xEF4444, chances: [0.01, 0.2, 1.5, 5.0] },
+    Rarity { key: "secret", name: "Секретный", color: 0x22D3EE, chances: [0.0, 0.0, 0.0, 0.05] },
 ];
 
 /// Вид питомца: ключ (он хранится в базе), эмодзи, название, редкость, монет в час на 1 уровне.
@@ -84,7 +88,7 @@ const fn species(key: &'static str, emoji: &'static str, name: &'static str, rar
     Species { key, emoji, name, rarity, income }
 }
 
-pub const SPECIES: [Species; 14] = [
+pub const SPECIES: [Species; 17] = [
     species("valera", "🐱", "котик", "common", 10),
     species("gena", "🐹", "хомяк", "common", 12),
     species("tolik", "🐦", "голубь", "common", 8),
@@ -98,7 +102,10 @@ pub const SPECIES: [Species; 14] = [
     species("vasily", "🐉", "дракон", "legendary", 150),
     species("lyudmila", "🦄", "единорог", "legendary", 140),
     species("lion", "🦁", "лев", "legendary", 160),
+    species("danya_dog", "🐕", "Даня собака", "legendary", 170),
     species("sergey", "🐶", "собака Сергей", "mythic", 500),
+    species("foidka_romana", "🧚", "Фоидка романа", "mythic", 550),
+    species("stellochka", "🌟", "Стеллочка", "secret", 1500),
 ];
 
 const STAGES: [(i64, &str); 4] = [(1, "малыш"), (5, "подросток"), (10, "взрослый"), (15, "легенда района")];
@@ -109,6 +116,10 @@ pub fn find_species(key: &str) -> Option<&'static Species> {
 
 fn rarity_of(species: &Species) -> &'static Rarity {
     RARITIES.iter().find(|rarity| rarity.key == species.rarity).unwrap()
+}
+
+fn needs_sale_confirmation(species: &Species) -> bool {
+    species.rarity != "common"
 }
 
 pub fn stage(level: i64) -> &'static str {
@@ -177,7 +188,7 @@ async fn pet_autocomplete(ctx: Context<'_>, partial: &str) -> serenity::CreateAu
     response.set_choices(choices)
 }
 
-/// Открыть кейс с питомцем: дешёвый, средний или дорогой
+/// Открыть кейс с питомцем: дешёвый, средний, дорогой или секретный
 #[poise::command(slash_command, guild_only, rename = "case")]
 pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс открыть"] kind: Case) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
@@ -204,7 +215,7 @@ pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс о
         .await?;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await; // немного интриги
     let rarity = rarity_of(species);
-    let ending = if rarity.key == "mythic" { "!!! Самый редкий в игре!" } else { "!" };
+    let ending = if rarity.key == "secret" { "!!! Самый редкий в игре!" } else { "!" };
     let embed = serenity::CreateEmbed::new()
         .color(rarity.color)
         .title(format!("{} {}", species.emoji, species.name))
@@ -216,10 +227,7 @@ pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс о
     Ok(())
 }
 
-/// Какие питомцы бывают в кейсах и с каким шансом
-#[poise::command(slash_command)]
-pub async fn cases(ctx: Context<'_>) -> Result<(), Error> {
-    let prices = ctx.data().pets.case_prices;
+fn case_catalogue(prices: [i64; 4]) -> String {
     let mut blocks = vec![Case::ALL
         .iter()
         .map(|case| format!("{} **{}** — {}", case.emoji(), case.title(), money_text(prices[*case as usize])))
@@ -242,10 +250,16 @@ pub async fn cases(ctx: Context<'_>) -> Result<(), Error> {
             .join(" · ");
         blocks.push(format!("**{}** — {odds}\n{pets}", rarity.name));
     }
+    blocks.join("\n\n")
+}
+
+/// Какие питомцы бывают в кейсах и с каким шансом
+#[poise::command(slash_command)]
+pub async fn cases(ctx: Context<'_>) -> Result<(), Error> {
     let embed = serenity::CreateEmbed::new()
         .color(0x8B5CF6)
         .title("🎁 Кейсы с питомцами")
-        .description(blocks.join("\n\n"))
+        .description(case_catalogue(ctx.data().pets.case_prices))
         .footer(serenity::CreateEmbedFooter::new(
             "Корм поднимает питомца на 1 уровень (+25% к доходу) и дорожает с каждым уровнем: \
              на ур. 2 — цена «корм от», на ур. 3 — вдвое больше, на ур. 4 — втрое и так далее."));
@@ -372,7 +386,7 @@ pub async fn pet_sell(
     let Some((pet, species)) = found else {
         return whisper(ctx, "Такого питомца у тебя нет — выбери из списка.").await;
     };
-    if matches!(species.rarity,"rare"|"epic"|"legendary"|"mythic") {
+    if needs_sale_confirmation(species) {
         if !crate::qol::confirm(ctx,format!("Продать {}? Вернуть питомца после продажи нельзя.",title(species,pet.level))).await?{return Ok(())}
     }
     let Some(current)=data.db.own_pet(pet.id,guild,user)? else{return whisper(ctx,"Питомец уже продан или передан.").await};
@@ -521,6 +535,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secret_case_price_choices_and_catalogue() {
+        let defaults = PetSettings::load(&crate::config::Settings::default());
+        assert_eq!(defaults.case_prices, [500, 2000, 7500, 25000]);
+        let custom = PetSettings::load(&crate::config::Settings::parse("[pets]\nsecret_case_price = 30000\n"));
+        assert_eq!(custom.case_prices[Case::Secret as usize], 30000);
+        let command = open_case();
+        let choices = &command.parameters[0].choices;
+        assert_eq!(choices.iter().map(|choice| choice.name.as_ref()).collect::<Vec<_>>(),
+                   ["📦 Дешёвый", "🎁 Средний", "💎 Дорогой", "🔮 Секретный"]);
+        let catalogue = case_catalogue(defaults.case_prices);
+        for text in ["Секретный", "Стеллочка", "Фоидка романа", "Даня собака", "0.05%", "25 000"] {
+            assert!(catalogue.contains(text), "missing {text}: {catalogue}");
+        }
+        assert!(catalogue.encode_utf16().count() <= 4096);
+    }
+
+    #[test]
+    fn secret_case_boundaries_and_exclusivity() {
+        assert_eq!(roll_pet(Case::Secret, 0.0, 0).rarity, "epic");
+        assert_eq!(roll_pet(Case::Secret, 59.999, 0).rarity, "epic");
+        assert_eq!(roll_pet(Case::Secret, 60.0, 0).rarity, "legendary");
+        assert_eq!(roll_pet(Case::Secret, 94.949, 0).rarity, "legendary");
+        assert_eq!(roll_pet(Case::Secret, 94.95, 0).rarity, "mythic");
+        assert_eq!(roll_pet(Case::Secret, 99.949, 0).rarity, "mythic");
+        for pick in 0..25 { assert_eq!(roll_pet(Case::Secret, 99.95, pick).key, "stellochka"); }
+        assert_eq!(roll_pet(Case::Secret, 99.99999, 3).key, "stellochka");
+        let secret = RARITIES.iter().find(|rarity| rarity.key == "secret").unwrap();
+        assert_eq!(secret.chances, [0.0, 0.0, 0.0, 0.05]);
+        assert_eq!(SPECIES.iter().filter(|species| species.rarity == "secret").count(), 1);
+        for case in [Case::Cheap, Case::Medium, Case::Expensive] {
+            for step in 0..10000 { assert_ne!(roll_pet(case, step as f64 / 100.0, step).rarity, "secret"); }
+        }
+    }
+
+    #[test]
+    fn new_pet_economy_and_existing_keys_remain_compatible() {
+        for (key, rarity, hourly) in [("stellochka", "secret", 1500), ("foidka_romana", "mythic", 550), ("danya_dog", "legendary", 170)] {
+            let species = kind(key);
+            assert_eq!((species.rarity, income(species, 1)), (rarity, hourly));
+            assert_eq!(pending(species, 1, 0.0, 3600.0, 24), hourly);
+            assert_eq!(feed_cost(species, 1), hourly * 20);
+            assert!(needs_sale_confirmation(species));
+        }
+        for key in ["valera", "gena", "tolik", "frog", "arkady", "tamara", "boris", "igor", "edik", "zhorik", "vasily", "lyudmila", "lion", "sergey"] {
+            assert!(find_species(key).is_some());
+        }
+        assert!(!needs_sale_confirmation(kind("valera")));
+        let unique = SPECIES.iter().map(|species| species.key).collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), SPECIES.len());
+    }
+
+    #[test]
     fn battle_chances() {
         assert_eq!([battle_chance(500, 10), battle_chance(10, 500), battle_chance(60, 60), battle_chance(500, 150)],
                    [90, 10, 50, 77]);
@@ -532,7 +598,7 @@ mod tests {
 
     #[test]
     fn chances_sum_to_100() {
-        for case in 0..3 {
+        for case in 0..Case::ALL.len() {
             let total: f64 = RARITIES.iter().map(|rarity| rarity.chances[case]).sum();
             assert!((total - 100.0).abs() < 1e-9, "кейс {case}: {total}");
         }
@@ -577,7 +643,7 @@ mod tests {
         assert_eq!(roll_pet(Case::Cheap, 75.0, 0).rarity, "rare");
         assert_eq!(roll_pet(Case::Cheap, 99.995, 0).key, "sergey");
         assert_eq!(roll_pet(Case::Expensive, 0.0, 0).rarity, "rare"); // обычных в дорогом кейсе нет
-        assert_eq!(roll_pet(Case::Expensive, 99.0, 5).key, "sergey");
+        assert_eq!(roll_pet(Case::Expensive, 99.0, 5).rarity, "mythic");
         assert_eq!(roll_pet(Case::Medium, 50.0, 1).key, "tamara");
     }
 
