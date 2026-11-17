@@ -25,11 +25,26 @@ html, body {
 }
 
 button { font: inherit; color: inherit; cursor: pointer; }
+[hidden] { display: none !important; }
+
+.game-switch {
+  width: min(max-content, 100%); width: fit-content; max-width: calc(100% - 24px);
+  margin: 0 auto; padding: 4px; display: flex; gap: 4px;
+  border: 1px solid var(--line); border-radius: 10px; background: #18191e;
+}
+#game-switch { margin-top: 10px; }
+.game-switch button {
+  min-height: 36px; padding: 5px 14px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: #aeb0ba; font-size: 13px; font-weight: 650;
+}
+.game-switch button:hover { color: var(--text); }
+.game-switch button[aria-pressed="true"] { color: var(--text); background: #282a34; border-color: #424553; }
+.game-switch button:focus-visible, .words-retry:focus-visible { outline: 2px solid #bdb2ff; outline-offset: 2px; }
 
 #app {
   max-width: 500px;
   margin: 0 auto;
-  min-height: 100%;
+  min-height: calc(100% - 57px);
   padding: 10px 12px 14px;
   display: flex;
   flex-direction: column;
@@ -50,6 +65,7 @@ h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: .04em; }
 }
 .mode.active { color: var(--text); border-color: var(--line-strong); }
 .help-button { flex: 0 0 28px; padding: 3px 0; font-size: 12px; }
+.words-retry { flex: none; align-self: center; color: var(--text); }
 
 /* ---------- Поле ---------- */
 .board {
@@ -180,4 +196,9 @@ h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: .04em; }
 
 @media (max-height: 640px) {
   .key { height: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash, .progress-bar { transition: none; }
+  .splash-logo span { animation: none; }
 }

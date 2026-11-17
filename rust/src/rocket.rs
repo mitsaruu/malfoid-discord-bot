@@ -1,52 +1,80 @@
-//! Личная ракетка. Сообщение показывает снимок; время и выплата считаются на сервере.
+//! Ракетка в Discord Activity. Часы, взрыв и выплата принадлежат серверу.
 
-use crate::reply::{user_name, whisper};
-use crate::text::money_text;
-use crate::{wagers, Context, Data, Error};
+use crate::economy::MAX_BET;
+use crate::reply::whisper;
+use crate::{wagers, Context, Data, Error, Shared};
 use poise::serenity_prelude as s;
 use rand::Rng;
+use rusqlite::{params, OptionalExtension};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::{sync::Notify, time::Instant};
+use tokio::time::Instant;
 
 const COUNTDOWN: Duration = Duration::from_secs(3);
-const REFRESH: Duration = Duration::from_secs(2);
 const MAX: u32 = 1000;
 const DOUBLE_SECONDS: f64 = 6.0;
-const BUTTON: &str = "rocket:cash:";
+const OPEN_WINDOW: Duration = Duration::from_secs(120);
+const RESULT_WINDOW: Duration = Duration::from_secs(12 * 3600);
 
-#[derive(Clone, Copy)]
-enum FlightStatus {
-    Countdown,
-    Flying(u32),
+type Player = (u64, u64); // сервер, игрок
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
     Crashed,
-    Paid { multiplier: u32, payout: i64 },
+    Paid {
+        multiplier: u32,
+        payout: i64,
+        automatic: bool,
+    },
+    Refunded,
 }
 
 struct Flight {
     id: u64,
-    channel: s::ChannelId,
     stake: i64,
     crash_at: u32,
-    launch: Option<Instant>,
-    finished: Option<FlightStatus>,
-    changed: Arc<Notify>,
+    auto: Option<u32>,
+    launch: Instant,
+    finished: Option<(Instant, Outcome)>,
 }
 
-type Player = (u64, u64); // сервер, игрок
-
 #[derive(Default)]
-pub struct State(Mutex<HashMap<Player, Flight>>);
+pub struct State {
+    flights: Mutex<HashMap<Player, Flight>>,
+    opening: Mutex<HashMap<Player, Instant>>,
+}
 
 impl State {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Player, Flight>> {
-        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    fn flights(&self) -> std::sync::MutexGuard<'_, HashMap<Player, Flight>> {
+        self.flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn mark_open(&self, player: Player) {
+        let now = Instant::now();
+        let mut opening = self
+            .opening
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        opening.retain(|_, expires| *expires > now);
+        opening.insert(player, now + OPEN_WINDOW);
+    }
+
+    pub(crate) fn take_open(&self, guild: u64, user: u64) -> bool {
+        let mut opening = self
+            .opening
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        opening
+            .remove(&(guild, user))
+            .is_some_and(|expires| expires > Instant::now())
     }
 }
 
 fn crash_point(random: u32) -> u32 {
-    // 3% преимущества игры до округления. random равномерно распределён от 1 до 1 000 000.
     (97_000_000 / random).clamp(100, MAX)
 }
 
@@ -54,323 +82,350 @@ fn flight_time(multiplier: u32) -> Duration {
     Duration::from_secs_f64((f64::from(multiplier) / 100.0).log2() * DOUBLE_SECONDS)
 }
 
+fn parse_auto(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    let (whole, fraction) = raw.split_once(['.', ',']).unwrap_or((raw, ""));
+    if whole.len() != 1
+        || fraction.len() > 2
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let decimals = match fraction.len() {
+        0 => 0,
+        1 => fraction.parse::<u32>().ok()? * 10,
+        _ => fraction.parse::<u32>().ok()?,
+    };
+    let value = whole.parse::<u32>().ok()? * 100 + decimals;
+    (101..MAX).contains(&value).then_some(value)
+}
+
 impl Flight {
-    fn status(&self, now: Instant) -> FlightStatus {
-        if let Some(status) = self.finished {
-            return status;
+    fn deadline(&self) -> (Instant, Outcome) {
+        if let Some(target) = self.auto.filter(|target| *target < self.crash_at) {
+            // Сравниваем события по моменту, когда они должны были произойти, даже если воркер проснулся поздно.
+            return (self.launch + flight_time(target), self.payout(target, true));
         }
-        let Some(launch) = self.launch.filter(|&launch| launch <= now) else {
-            return FlightStatus::Countdown;
+        (self.launch + flight_time(self.crash_at), Outcome::Crashed)
+    }
+
+    fn payout(&self, multiplier: u32, automatic: bool) -> Outcome {
+        Outcome::Paid {
+            multiplier,
+            payout: self.stake * i64::from(multiplier) / 100,
+            automatic,
+        }
+    }
+
+    fn live_multiplier(&self, now: Instant) -> u32 {
+        let elapsed = now.saturating_duration_since(self.launch).as_secs_f64();
+        ((100.0 * (elapsed / DOUBLE_SECONDS).exp2()) as u32)
+            .min(self.crash_at.saturating_sub(1))
+            .max(100)
+    }
+
+    fn settle(&mut self, data: &Data, at: Instant, outcome: Outcome) -> rusqlite::Result<()> {
+        let payout = match outcome {
+            Outcome::Paid { payout, .. } => payout,
+            _ => 0,
         };
-        let elapsed = now - launch;
-        if elapsed >= flight_time(self.crash_at) {
-            return FlightStatus::Crashed;
-        }
-        let multiplier = (100.0 * (elapsed.as_secs_f64() / DOUBLE_SECONDS).exp2()) as u32;
-        FlightStatus::Flying(multiplier.min(self.crash_at - 1))
+        wagers::settle(&data.db, self.id, &[(self.id, payout)])?;
+        self.finished = Some((at, outcome));
+        Ok(())
     }
 
-    fn next_update(&self, now: Instant) -> Instant {
-        let launch = self.launch.expect("flight starts after the opening reply");
-        if now < launch {
-            launch
-        } else {
-            (now + REFRESH).min(launch + flight_time(self.crash_at))
-        }
-    }
-}
-
-struct RefundOnDrop<'a> {
-    data: &'a Data,
-    player: Player,
-    round: u64,
-}
-
-impl Drop for RefundOnDrop<'_> {
-    fn drop(&mut self) {
-        let mut flights = self.data.rocket.lock();
-        if flights
-            .get(&self.player)
-            .is_some_and(|flight| flight.id == self.round)
-        {
-            flights.remove(&self.player);
-            if let Err(error) = wagers::refund(&self.data.db, Some(self.round)) {
-                eprintln!(
-                    "Ракетка {}: возврат не удался, ставка сохранена до восстановления: {error}",
-                    self.round
-                );
+    fn advance(&mut self, data: &Data, now: Instant) -> rusqlite::Result<()> {
+        if self.finished.is_none() {
+            let (at, outcome) = self.deadline();
+            if at <= now {
+                self.settle(data, at, outcome)?;
             }
         }
+        Ok(())
+    }
+
+    fn snapshot(&self, now: Instant) -> Value {
+        let (at, outcome) = self
+            .finished
+            .map_or((now, None), |(at, outcome)| (at, Some(outcome)));
+        let elapsed_ms = if at < self.launch {
+            -((self.launch - at).as_millis() as i64)
+        } else {
+            (at - self.launch).as_millis() as i64
+        };
+        let (status, multiplier, payout, automatic) = match outcome {
+            Some(Outcome::Paid {
+                multiplier,
+                payout,
+                automatic,
+            }) => ("paid", multiplier, Some(payout), automatic),
+            Some(Outcome::Crashed) => ("crashed", self.crash_at, None, false),
+            Some(Outcome::Refunded) => ("refunded", 100, None, false),
+            None if at < self.launch => ("countdown", 100, None, false),
+            None => ("flying", self.live_multiplier(at), None, false),
+        };
+        json!({ "id": self.id.to_string(), "status": status, "stake": self.stake, "elapsed_ms": elapsed_ms,
+                "multiplier": multiplier, "auto": self.auto, "payout": payout, "automatic": automatic })
     }
 }
 
-fn factor(multiplier: u32) -> String {
-    format!("{}.{:02}×", multiplier / 100, multiplier % 100)
-}
-
-fn card(
-    owner: u64,
-    id: u64,
-    stake: i64,
-    status: FlightStatus,
-    crash_at: u32,
-) -> poise::CreateReply {
-    let (title, text, color, active) = match status {
-        FlightStatus::Countdown => (
-            "🚀 Ракетка",
-            "Старт через 3 секунды.".into(),
-            0x6366F1,
-            true,
-        ),
-        FlightStatus::Flying(multiplier) => (
-            "🚀 Ракетка в полёте",
-            format!("Коэффициент **{}**", factor(multiplier)),
-            0x6366F1,
-            true,
-        ),
-        FlightStatus::Crashed => (
-            "💥 Полёт завершён",
-            format!(
-                "Ракета взорвалась на **{}**. Ставка проиграна.",
-                factor(crash_at)
-            ),
-            0xDC2626,
-            false,
-        ),
-        FlightStatus::Paid { multiplier, payout } => (
-            "🟢 Монеты выведены",
-            format!(
-                "Вывод на **{}**. Получено **{}**, чистый выигрыш **{}**.",
-                factor(multiplier),
-                money_text(payout),
-                money_text(payout - stake)
-            ),
-            0x16A34A,
-            false,
-        ),
-    };
-    let embed = s::CreateEmbed::new()
-        .title(title)
-        .color(color)
-        .description(format!(
-            "<@{owner}> · Ставка **{}**\n{text}",
-            money_text(stake)
-        ))
-        .footer(s::CreateEmbedFooter::new(
-            "Вывод считается в момент нажатия. Максимум полёта — 10×.",
-        ));
-    let buttons = if active {
-        vec![s::CreateActionRow::Buttons(vec![s::CreateButton::new(
-            format!("{BUTTON}{owner}:{id}"),
+fn result(
+    data: &Data,
+    player: Player,
+    flight: Option<&Flight>,
+    now: Instant,
+) -> rusqlite::Result<Value> {
+    let balance = data
+        .db
+        .lock()
+        .query_row(
+            "SELECT balance FROM economy WHERE guild_id = ?1 AND user_id = ?2",
+            params![player.0 as i64, player.1 as i64],
+            |row| row.get::<_, i64>(0),
         )
-        .style(s::ButtonStyle::Success)
-        .label("Забрать")])]
-    } else {
-        Vec::new()
-    };
-    poise::CreateReply::default()
-        .embed(embed)
-        .components(buttons)
-        .allowed_mentions(s::CreateAllowedMentions::new())
+        .optional()?
+        .unwrap_or(data.economy.start_balance);
+    Ok(
+        json!({ "balance": balance, "min_bet": data.economy.min_bet, "max_bet": MAX_BET,
+               "flight": flight.map(|flight| flight.snapshot(now)) }),
+    )
 }
 
-/// Поставь монеты и успей забрать их до взрыва ракеты
-#[poise::command(slash_command, guild_only)]
-pub async fn rocket(
-    ctx: Context<'_>,
-    #[description = "Сумма монет или all"] bet: String,
-) -> Result<(), Error> {
-    let data = ctx.data();
-    let player = (ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let id = ctx.id();
-    let crash_at = crash_point(rand::rng().random_range(1..=1_000_000));
-    let changed = Arc::new(Notify::new());
-    data.db.wallet(
+pub fn read(data: &Data, player: Player) -> rusqlite::Result<Value> {
+    let mut flights = data.rocket.flights();
+    let flight = flights.get_mut(&player);
+    let now = Instant::now();
+    if let Some(flight) = flight {
+        flight.advance(data, now)?;
+        result(data, player, Some(flight), now)
+    } else {
+        result(data, player, None, now)
+    }
+}
+
+pub fn start(
+    data: &Shared,
+    player: Player,
+    name: &str,
+    bet: &str,
+    auto: Option<&str>,
+    expected: Option<u64>,
+) -> rusqlite::Result<Result<Value, String>> {
+    let auto = match auto {
+        Some(raw) => match parse_auto(raw) {
+            Some(target) => Some(target),
+            None => {
+                return Ok(Err(
+                    "Коэффициент автовывода — от 1,01 до 9,99, до двух знаков после запятой."
+                        .into(),
+                ))
+            }
+        },
+        None => None,
+    };
+    let mut flights = data.rocket.flights();
+    let now = Instant::now();
+    flights.retain(|key, flight| {
+        *key == player
+            || flight
+                .finished
+                .is_none_or(|(at, _)| now - at <= RESULT_WINDOW)
+    });
+    if let Some(previous) = flights.get_mut(&player) {
+        previous.advance(data, now)?;
+        if previous.finished.is_none() {
+            return Ok(Err("У тебя уже идёт полёт.".into()));
+        }
+    }
+    if expected != flights.get(&player).map(|flight| flight.id) {
+        return Ok(Err(
+            "Раунд уже изменился. Проверь состояние игры и поставь снова.".into(),
+        ));
+    }
+    data.db
+        .wallet(player.0, player.1, name, data.economy.start_balance)?;
+    // Старший бит отделяет билеты Activity от положительных идентификаторов Discord.
+    let id = rand::random::<u64>() | (1 << 63);
+    let stake = match wagers::place(
+        &data.db,
+        id,
+        id,
         player.0,
         player.1,
-        &user_name(ctx.author()),
-        data.economy.start_balance,
-    )?;
-    let placed = {
-        let mut flights = data.rocket.lock();
-        if flights.contains_key(&player) {
-            Err("Твоя ракета уже в игре.".into())
-        } else {
-            wagers::place(
-                &data.db,
-                id,
-                id,
-                player.0,
-                player.1,
-                &bet,
-                data.economy.min_bet,
-            )?
-            .map(|stake| {
-                flights.insert(
-                    player,
-                    Flight {
-                        id,
-                        channel: ctx.channel_id(),
-                        stake,
-                        crash_at,
-                        launch: None,
-                        finished: None,
-                        changed: changed.clone(),
-                    },
-                );
-                stake
-            })
-        }
-    };
-    let stake = match placed {
+        bet,
+        data.economy.min_bet,
+    )? {
         Ok(stake) => stake,
-        Err(error) => return whisper(ctx, error).await,
+        Err(error) => return Ok(Err(error)),
     };
-    let _refund = RefundOnDrop {
-        data,
-        player,
-        round: id,
+    let now = Instant::now();
+    let flight = Flight {
+        id,
+        stake,
+        crash_at: crash_point(rand::rng().random_range(1..=1_000_000)),
+        auto,
+        launch: now + COUNTDOWN,
+        finished: None,
     };
-    let reply = ctx
-        .send(card(player.1, id, stake, FlightStatus::Countdown, crash_at))
-        .await?;
-    let mut next = Instant::now() + COUNTDOWN;
-    if let Some(flight) = data.rocket.lock().get_mut(&player) {
-        flight.launch = Some(next);
-    }
+    let (deadline, _) = flight.deadline();
+    flights.insert(player, flight);
+    tokio::spawn(settle_at_deadline(data.clone(), player, id, deadline));
+    Ok(Ok(result(data, player, flights.get(&player), now)?))
+}
+
+async fn settle_at_deadline(data: Shared, player: Player, id: u64, deadline: Instant) {
+    tokio::time::sleep_until(deadline).await;
     loop {
-        tokio::select! { _ = tokio::time::sleep_until(next) => {}, _ = changed.notified() => {} }
-        let (status, terminal) = {
-            let mut flights = data.rocket.lock();
-            let Some(flight) = flights.get_mut(&player) else {
-                return Ok(());
+        {
+            let mut flights = data.rocket.flights();
+            let Some(flight) = flights.get_mut(&player).filter(|flight| flight.id == id) else {
+                return;
             };
             let now = Instant::now();
-            let status = flight.status(now);
-            let terminal = matches!(status, FlightStatus::Crashed | FlightStatus::Paid { .. });
-            if matches!(status, FlightStatus::Crashed) {
-                wagers::settle(&data.db, id, &[(id, 0)])?;
-                flight.finished = Some(status);
+            match flight.advance(&data, now) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!("Ракетка {id}: расчёт не удался: {error}");
+                    if wagers::refund(&data.db, Some(id)).is_ok() {
+                        flight.finished = Some((now, Outcome::Refunded));
+                        return;
+                    }
+                }
             }
-            if !terminal {
-                next = flight.next_update(now);
-            }
-            (status, terminal)
-        };
-        if let Err(error) = reply
-            .edit(ctx, card(player.1, id, stake, status, crash_at))
-            .await
-        {
-            eprintln!(
-                "Ракетка {id}: не удалось обновить карточку: {}",
-                crate::interactions::sanitize_error(&error.to_string())
-            );
         }
-        if terminal {
-            return Ok(());
-        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-pub async fn pressed(ctx: &s::Context, data: &Data, press: &s::ComponentInteraction) -> bool {
-    let Some(parameters) = press.data.custom_id.strip_prefix(BUTTON) else {
-        return false;
+pub fn cash_out(data: &Data, player: Player, id: u64) -> rusqlite::Result<Result<Value, String>> {
+    let mut flights = data.rocket.flights();
+    let Some(flight) = flights.get_mut(&player).filter(|flight| flight.id == id) else {
+        return Ok(Err("Этот раунд уже закрыт.".into()));
     };
-    let Some((owner, id)) = parameters
-        .split_once(':')
-        .and_then(|(owner, id)| Some((owner.parse::<u64>().ok()?, id.parse::<u64>().ok()?)))
-    else {
-        return false;
-    };
-    let text = if press.user.id.get() != owner {
-        "Забрать монеты может только игрок, запустивший ракету.".into()
-    } else if let Some(guild) = press.guild_id {
-        let mut flights = data.rocket.lock();
-        let flight = flights
-            .get_mut(&(guild.get(), owner))
-            .filter(|flight| flight.id == id && flight.channel == press.channel_id);
-        match flight {
-            Some(flight) => cash_out(data, flight, Instant::now()),
-            None => {
-                "Этот раунд уже закрыт. Если бот перезапускался, незавершённая ставка возвращена."
-                    .into()
-            }
+    let now = Instant::now();
+    flight.advance(data, now)?;
+    if flight.finished.is_none() {
+        if now < flight.launch {
+            return Ok(Err("Ракета ещё не стартовала.".into()));
         }
-    } else {
-        "Этот раунд уже закрыт.".into()
-    };
-    let answer = s::CreateInteractionResponse::Message(
-        s::CreateInteractionResponseMessage::new()
-            .content(text)
-            .ephemeral(true),
-    );
-    if let Err(error) = press.create_response(ctx, answer).await {
-        eprintln!(
-            "Ракетка {id}: не удалось подтвердить нажатие: {}",
-            crate::interactions::sanitize_error(&error.to_string())
-        );
+        let outcome = flight.payout(flight.live_multiplier(now), false);
+        flight.settle(data, now, outcome)?;
     }
+    Ok(Ok(result(data, player, Some(flight), now)?))
+}
+
+/// Открыть ракетку в мини-приложении Discord
+#[poise::command(slash_command, guild_only)]
+pub async fn rocket(ctx: Context<'_>) -> Result<(), Error> {
+    if !ctx.data().miniapp_ready {
+        return whisper(ctx, "Мини-приложение ещё не настроено.").await;
+    }
+    let poise::Context::Application(app) = ctx else {
+        return Ok(());
+    };
+    let player = (ctx.guild_id().unwrap().get(), ctx.author().id.get());
+    ctx.data().rocket.mark_open(player);
+    if !crate::wordboard::launch_activity(|response| {
+        app.interaction.create_response(ctx.http(), response)
+    })
+    .await
+    {
+        ctx.data().rocket.take_open(player.0, player.1);
+    }
+    Ok(())
+}
+
+pub async fn pressed(ctx: &s::Context, press: &s::ComponentInteraction) -> bool {
+    if !press.data.custom_id.starts_with("rocket:cash:") {
+        return false;
+    }
+    let _ = press
+        .create_response(
+            ctx,
+            s::CreateInteractionResponse::Message(
+                s::CreateInteractionResponseMessage::new()
+                    .content("Открой ракетку через /rocket.")
+                    .ephemeral(true),
+            ),
+        )
+        .await;
     true
-}
-
-fn cash_out(data: &Data, flight: &mut Flight, now: Instant) -> String {
-    let multiplier = match flight.status(now) {
-        FlightStatus::Countdown => return "Ракета ещё не стартовала.".into(),
-        FlightStatus::Crashed => return "Ракета уже взорвалась.".into(),
-        FlightStatus::Paid { .. } => return "Монеты уже выведены.".into(),
-        FlightStatus::Flying(multiplier) => multiplier,
-    };
-    let payout = flight.stake * i64::from(multiplier) / 100;
-    match wagers::settle(&data.db, flight.id, &[(flight.id, payout)]) {
-        Ok(()) => {
-            flight.finished = Some(FlightStatus::Paid { multiplier, payout });
-            flight.changed.notify_one();
-            format!(
-                "Забрал {} на **{}**.",
-                money_text(payout),
-                factor(multiplier)
-            )
-        }
-        Err(error) => {
-            eprintln!(
-                "Ракетка {}: не удалось зачислить выигрыш: {error}",
-                flight.id
-            );
-            "Не удалось вывести монеты. Попробуй ещё раз, если ракета в полёте.".into()
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn auto_pays_once_offline_only_when_target_precedes_crash() {
+        let settings = crate::config::Settings::default();
+        let data = std::sync::Arc::new(Data::new(
+            crate::db::Database::in_memory().unwrap(),
+            &settings,
+            Default::default(),
+            false,
+        ));
+        let player = (1, 2);
+        data.db.wallet(1, 2, "pilot", 500).unwrap();
+        let launch = Instant::now() - Duration::from_secs(30);
+        for (id, target, expected) in [(5, 150, 150), (6, 200, 0), (7, 220, 0)] {
+            assert_eq!(
+                wagers::place(&data.db, id, id, 1, 2, "100", 10).unwrap(),
+                Ok(100)
+            );
+            let flight = Flight {
+                id,
+                stake: 100,
+                crash_at: 200,
+                auto: Some(target),
+                launch,
+                finished: None,
+            };
+            let (deadline, _) = flight.deadline();
+            data.rocket.flights().insert(player, flight);
+            settle_at_deadline(data.clone(), player, id, deadline).await;
+            let snapshot = cash_out(&data, player, id).unwrap().unwrap();
+            assert_eq!(snapshot["flight"]["payout"].as_i64().unwrap_or(0), expected);
+            assert_eq!(snapshot["flight"]["automatic"], expected > 0);
+        }
+        assert_eq!(data.db.wallet(1, 2, "pilot", 500).unwrap().0, 350);
+    }
+
     #[test]
-    fn server_clock_blocks_cashout_at_crash_even_before_card_refresh() {
-        let launch = Instant::now() + COUNTDOWN;
-        let flight = Flight {
-            id: 1,
-            channel: s::ChannelId::new(1),
-            stake: 100,
-            crash_at: 200,
-            launch: Some(launch),
-            finished: None,
-            changed: Arc::new(Notify::new()),
-        };
-        assert!(matches!(
-            flight.status(launch - Duration::from_millis(1)),
-            FlightStatus::Countdown
+    fn cashout_target_is_exact_and_bounded() {
+        assert_eq!(parse_auto("1,01"), Some(101));
+        assert_eq!(parse_auto("2.5"), Some(250));
+        assert_eq!(parse_auto("9.99"), Some(999));
+        for invalid in ["1", "10", "1.001", "+2", "2e0", "NaN", ""] {
+            assert_eq!(parse_auto(invalid), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn round_guard_prevents_duplicate_debit_and_other_players_cashout() {
+        let settings = crate::config::Settings::default();
+        let data = std::sync::Arc::new(Data::new(
+            crate::db::Database::in_memory().unwrap(),
+            &settings,
+            Default::default(),
+            false,
         ));
-        assert!(matches!(flight.status(launch), FlightStatus::Flying(100)));
-        assert!(matches!(
-            flight.status(launch + Duration::from_millis(5999)),
-            FlightStatus::Flying(199)
-        ));
-        assert!(matches!(
-            flight.status(launch + Duration::from_secs(6)),
-            FlightStatus::Crashed
-        ));
-        assert_eq!(crash_point(1), MAX);
-        assert_eq!(crash_point(1_000_000), 100);
+        data.db.wallet(1, 2, "pilot", 500).unwrap();
+        let opened = start(&data, (1, 2), "pilot", "100", Some("2.00"), None)
+            .unwrap()
+            .unwrap();
+        let round = opened["flight"]["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(opened["balance"], 400);
+        assert_eq!(opened["flight"]["status"], "countdown");
+        assert!(opened["flight"].get("crash_at").is_none());
+        assert!(start(&data, (1, 2), "pilot", "100", None, None)
+            .unwrap()
+            .is_err());
+        assert!(cash_out(&data, (1, 3), round).unwrap().is_err());
+        assert!(cash_out(&data, (1, 2), round).unwrap().is_err());
+        assert_eq!(read(&data, (1, 2)).unwrap()["balance"], 400);
     }
 }

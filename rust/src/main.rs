@@ -423,7 +423,7 @@ async fn main() {
                     let (ctx, data) = (framework.serenity_context, framework.user_data);
                     // Кнопка «Играть!» под картинкой игры в слова
                     if let serenity::FullEvent::InteractionCreate { interaction: serenity::Interaction::Component(press) } = event {
-                        if rocket::pressed(ctx, data, press).await { return Ok(()); }
+                        if rocket::pressed(ctx, press).await { return Ok(()); }
                         if roulette::pressed(ctx, press).await? { return Ok(()); }
                         if qol::help_pressed(ctx,press,&framework.options.commands).await{return Ok(())}
                         if ["music:", "library:", "queue:", "version:"].iter().any(|prefix| press.data.custom_id.starts_with(prefix))
@@ -529,8 +529,7 @@ mod tests {
         assert!(!names.contains("welcome_channel"));
         assert!(names.contains("music_channel") && names.contains("status"));
         let rocket = list.iter().find(|c| c["name"] == "rocket").unwrap();
-        assert_eq!(rocket["options"][0]["name"], "bet");
-        assert_eq!(rocket["options"][0]["required"], true);
+        assert!(rocket["options"].as_array().is_none_or(Vec::is_empty));
         let roulette = list.iter().find(|c| c["name"] == "roulette").unwrap();
         assert_eq!(roulette["options"][1]["name"], "space");
         assert_eq!(roulette["options"][1]["autocomplete"], true);

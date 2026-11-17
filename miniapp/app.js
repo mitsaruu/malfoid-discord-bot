@@ -1,4 +1,4 @@
-// Wortjagd (немецкие слова) и «5 букв» (русские слова) — мини-приложение Discord (Activity).
+// Игры в слова и «Ракетка» используют одну Discord Activity и общую сессию.
 // Связь с Discord — по протоколу Embedded App SDK (сообщения postMessage окну Discord),
 // ходы и проверка слов — на сервере бота (/api/...), поэтому загаданное слово страница не знает.
 "use strict";
@@ -36,6 +36,12 @@ let session = null;   // пропуск от сервера бота
 let state = null;     // состояние партии с сервера
 let typed = "";       // что игрок сейчас набирает
 let busy = false;     // ждём ответа сервера
+let activeGame = null;
+let rocket = null;
+let reloadWords = false;
+
+const gameSwitch = document.getElementById("game-switch");
+const wordsRetry = document.getElementById("words-retry");
 
 // ---------- Связь с Discord (минимальный Embedded App SDK) ----------
 const OP = { HANDSHAKE: 0, FRAME: 1, CLOSE: 2, HELLO: 3 };
@@ -48,7 +54,9 @@ window.addEventListener("message", (event) => {
   if (event.source !== discordWindow || !Array.isArray(event.data)) return;
   const [opcode, data] = event.data;
   if (opcode === OP.CLOSE) {
-    setStatus("Discord закрыл соединение: " + (data && data.message ? data.message : ""), "error");
+    const reason = "Discord закрыл соединение" + (data?.message ? ": " + data.message : ".");
+    if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
+    else setStatus(reason, "error");
     return;
   }
   if (opcode !== OP.FRAME || !data) return;
@@ -82,15 +90,18 @@ function connectToDiscord(clientId) {
 }
 
 // ---------- Запросы к серверу бота ----------
-async function api(path, body) {
-  const options = { headers: { "Content-Type": "application/json" } };
+async function api(path, body, { signal } = {}) {
+  const options = { cache: "no-store", signal, headers: { "Content-Type": "application/json" } };
   if (session) options.headers.Authorization = "Bearer " + session;
   if (body !== undefined) {
     options.method = "POST";
     options.body = JSON.stringify(body);
   }
   const response = await fetch(path, options);
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(() => {
+    if (signal?.aborted) throw signal.reason;
+    return {};
+  });
   if (!response.ok) throw new Error(data.error || "Сервер бота не ответил (" + response.status + ")");
   return data;
 }
@@ -137,8 +148,10 @@ function setLanguage(newLang) {
   lang = newLang;
   const game = GAMES[lang];
   LETTERS = new Set(game.keys.flat().filter((key) => key.length === 1));
-  document.title = game.name;
-  document.documentElement.lang = lang;
+  if (activeGame !== "rocket") {
+    document.title = game.name;
+    document.documentElement.lang = lang;
+  }
   document.getElementById("game-name").textContent = game.name;
   document.getElementById("help-what").textContent = game.what;
   for (const button of document.querySelectorAll(".lang")) {
@@ -266,10 +279,11 @@ function renderPlayers(data) {
 
 let refreshingPlayers = false;
 async function refreshPlayers() {
-  if (!session || document.hidden || refreshingPlayers) return;
+  if (!session || document.hidden || refreshingPlayers || document.body?.dataset.game === "rocket") return;
   refreshingPlayers = true;
   try {
     const data = await api("api/players");
+    if (document.body?.dataset.game === "rocket") return;
     if (data.lang && data.lang !== lang) return;
     renderPlayers(data);
     // Открытая игра тоже переходит к новому слову после московской полуночи.
@@ -342,6 +356,7 @@ async function press(key) {
 }
 
 window.addEventListener("keydown", (event) => {
+  if (activeGame !== "words" || event.target?.closest?.("#game-switch, #words-retry")) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (!helpEl.hidden) return;
   let key = event.key.toLowerCase();
@@ -378,16 +393,89 @@ for (const button of document.querySelectorAll(".lang")) {
   });
 }
 
+function applyWords(next) {
+  if (!next) throw new Error("Сервер не вернул слово дня.");
+  if (next.day !== state?.day || next.lang !== state?.lang) {
+    typed = "";
+    playersKey = "";
+  }
+  state = next;
+  setLanguage(state.lang);
+  render(-1);
+  showGameStatus();
+}
+
+async function loadWords() {
+  if (!reloadWords || activeGame !== "words" || busy) return;
+  reloadWords = false;
+  busy = true;
+  wordsRetry.hidden = true;
+  if (!state) setStatus("Загружаем слово дня…");
+  try {
+    applyWords((await api("api/state")).state);
+    refreshPlayers();
+  } catch (error) {
+    setStatus(error.message, "error");
+    wordsRetry.hidden = false;
+  } finally {
+    busy = false;
+    if (reloadWords) loadWords();
+  }
+}
+
+function openGame(game, initialWords) {
+  if (game === activeGame) return;
+  activeGame = game;
+  document.body.dataset.game = game;
+  const words = game === "words";
+  document.getElementById("app").hidden = !words;
+  playersEl.hidden = !words;
+  document.getElementById("rocket").hidden = words;
+  for (const button of gameSwitch.querySelectorAll("button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.game === game));
+  }
+  if (words) {
+    rocket?.hide();
+    document.title = GAMES[lang].name;
+    document.documentElement.lang = lang;
+    if (initialWords) {
+      applyWords(initialWords);
+      refreshPlayers();
+    } else {
+      reloadWords = true;
+      loadWords();
+    }
+  } else {
+    helpEl.hidden = true;
+    document.title = "Ракетка";
+    document.documentElement.lang = "ru";
+    if (rocket) rocket.show();
+    else {
+      document.getElementById("rocket-phase").textContent = "Нет соединения";
+      document.getElementById("rocket-message").textContent = "Не удалось загрузить игру. Откройте Activity заново.";
+      document.getElementById("rocket-action").textContent = "Запуск недоступен";
+    }
+  }
+}
+
+for (const button of gameSwitch.querySelectorAll("button")) {
+  button.addEventListener("click", () => openGame(button.dataset.game));
+}
+wordsRetry.addEventListener("click", () => {
+  reloadWords = true;
+  loadWords();
+});
+
 // ---------- Запуск ----------
 async function start() {
   buildBoard();
   setLanguage("ru");
   if (!params.get("frame_id")) {
-    loadingFailed("Эта страница открывается внутри Discord: команда /words или кнопка запуска приложения.");
+    loadingFailed("Откройте Activity внутри Discord через /rocket, /words или меню приложений.");
     return;
   }
   try {
-    loading("Загружаем словарь…", 20);
+    loading("Загружаем игры…", 20);
     const config = await api("api/config");
     loading("Подключаемся к Discord…", 45);
     await connectToDiscord(config.client_id);
@@ -400,13 +488,18 @@ async function start() {
     });
     session = login.session;
     await discordCommand("AUTHENTICATE", { access_token: login.access_token }).catch(() => {});
-    state = login.state;
-    setLanguage(state.lang);
-    render(-1);
-    showGameStatus();
+    if (typeof createRocketView === "function") {
+      rocket = createRocketView((path, body) => api(path, body, {
+        signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
+      }));
+    }
+    openGame(login.game === "rocket" ? "rocket" : "words", login.state);
+    gameSwitch.hidden = false;
     hideSplash();
-    refreshPlayers();
-    setInterval(refreshPlayers, 2000);  // поля других игроков обновляются почти сразу
+    setInterval(() => {
+      loadWords();
+      refreshPlayers();
+    }, 2000);
   } catch (error) {
     loadingFailed("Не получилось войти: " + error.message);
   }

@@ -2,26 +2,32 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Wortjagd</title>
   <link rel="stylesheet" href="static/style.css">
+  <link rel="stylesheet" href="static/rocket.css">
 </head>
 <body>
   <div class="splash" id="splash">
     <div class="splash-center">
       <div class="splash-logo" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
-      <h2>Wortjagd · 5 букв</h2>
-      <p class="splash-text" id="splash-text">Загружаем словарь…</p>
+      <h2>Ракетка · Слово дня</h2>
+      <p class="splash-text" id="splash-text" role="status">Загружаем игры…</p>
       <div class="progress"><div class="progress-bar" id="progress"></div></div>
-      <p class="tip"><code>/words</code> — слово дня на русском и немецком</p>
+      <p class="tip"><code>/rocket</code> · <code>/words</code></p>
     </div>
     <footer class="splash-footer">The BakaSoft Solution Games</footer>
   </div>
 
-  <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
-  <aside class="players" id="players" aria-label="Игроки"></aside>
+  <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru" hidden>
+    <button type="button" data-game="words" aria-controls="app" aria-pressed="false">Слово дня</button>
+    <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false">Ракетка</button>
+  </nav>
 
-  <main id="app">
+  <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
+  <aside class="players" id="players" aria-label="Игроки" hidden></aside>
+
+  <main id="app" hidden>
     <header class="top">
       <h1 id="game-name">Wortjagd</h1>
       <div class="langs" aria-label="Язык">
@@ -35,8 +41,73 @@
     <section class="board" id="board" aria-label="Поле игры"></section>
 
     <p class="status" id="status">Подключаюсь к Discord…</p>
+    <button class="mode words-retry" id="words-retry" type="button" hidden>Загрузить слово дня</button>
 
     <section class="keyboard" id="keyboard" aria-label="Клавиатура"></section>
+  </main>
+
+  <main class="rocket" id="rocket" aria-labelledby="rocket-title" data-phase="idle" lang="ru" hidden>
+    <header class="rocket-header">
+      <div>
+        <h1 id="rocket-title">Ракетка</h1>
+        <p>Заберите монеты до аварии.</p>
+      </div>
+      <div class="rocket-wallet">
+        <span>Баланс</span>
+        <strong id="rocket-balance">—</strong>
+      </div>
+    </header>
+
+    <div class="rocket-layout">
+      <section class="rocket-scene" aria-label="Телеметрия полёта">
+        <div class="rocket-hud">
+          <div class="rocket-phase"><i aria-hidden="true"></i><span id="rocket-phase" role="status">Подключение</span></div>
+          <div class="rocket-clock"><span id="rocket-time-label">Время полёта</span><strong id="rocket-time">—</strong></div>
+          <div class="rocket-readout">
+            <span>Коэффициент</span>
+            <strong id="rocket-multiplier">1,00×</strong>
+          </div>
+        </div>
+        <canvas class="rocket-chart" id="rocket-chart" aria-hidden="true"></canvas>
+      </section>
+
+      <section class="rocket-controls" aria-labelledby="rocket-controls-title">
+        <h2 id="rocket-controls-title">Управление полётом</h2>
+        <p class="rocket-message" id="rocket-message" role="status"></p>
+        <button class="rocket-secondary rocket-retry" id="rocket-retry" type="button" hidden>Обновить состояние</button>
+
+        <dl class="rocket-flight" id="rocket-flight" hidden>
+          <div><dt>Ставка</dt><dd id="rocket-stake">—</dd></div>
+          <div><dt>Автовывод</dt><dd id="rocket-target">—</dd></div>
+          <div id="rocket-payout-row" hidden><dt id="rocket-payout-label">Выплата</dt><dd id="rocket-payout">—</dd></div>
+        </dl>
+
+        <form class="rocket-form" id="rocket-form">
+          <fieldset id="rocket-settings" disabled>
+            <div class="rocket-field">
+              <label for="rocket-bet">Ставка</label>
+              <div class="rocket-field-row">
+                <input id="rocket-bet" type="text" inputmode="numeric" maxlength="12" autocomplete="off" aria-describedby="rocket-bet-hint">
+                <button class="rocket-secondary" id="rocket-min" type="button" aria-label="Минимальная ставка">Мин.</button>
+                <button class="rocket-secondary" id="rocket-max" type="button" aria-label="Максимальная доступная ставка">Макс.</button>
+              </div>
+              <small id="rocket-bet-hint">Ставка в монетах</small>
+            </div>
+
+            <div class="rocket-field">
+              <label for="rocket-auto">Автовывод <span>по желанию</span></label>
+              <div class="rocket-input-unit">
+                <input id="rocket-auto" type="text" inputmode="decimal" maxlength="8" autocomplete="off" placeholder="Например, 2,00" aria-describedby="rocket-auto-hint">
+                <span aria-hidden="true">×</span>
+              </div>
+              <small id="rocket-auto-hint">Оставьте пустым для ручного вывода.</small>
+            </div>
+          </fieldset>
+
+          <button class="rocket-primary" id="rocket-action" type="submit" aria-disabled="true">Подключение…</button>
+        </form>
+      </section>
+    </div>
   </main>
 
   <div class="help" id="help" hidden>
@@ -52,6 +123,7 @@
       <button class="mode" id="help-close">Понятно</button>
     </div>
   </div>
+  <script src="static/rocket.js"></script>
   <script src="static/app.js"></script>
 </body>
 </html>

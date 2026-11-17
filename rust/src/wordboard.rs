@@ -229,17 +229,28 @@ where
     }
     if let Some(guild) = guild {
         // страница спросит при входе, какую игру открыть
+        data.rocket.take_open(guild.get(), user.get());
         crate::wordsummary::set_lang(data, guild.get(), user.get(), lang)?;
     }
+    launch_activity(respond).await;
+    Ok(())
+}
+
+pub(crate) async fn launch_activity<F, Fut>(respond: F) -> bool
+where
+    F: Fn(serenity::CreateInteractionResponse) -> Fut,
+    Fut: std::future::Future<Output = serenity::Result<()>>,
+{
     if let Err(error) = respond(serenity::CreateInteractionResponse::LaunchActivity).await {
         println!("Не получилось открыть мини-приложение: {}", crate::interactions::sanitize_error(&error.to_string()));
         if matches!(error_code(&error), Some(10062 | 40060)) {
-            return Ok(()); // interaction уже истёк или подтверждён — второй callback тоже не сработает
+            return false; // interaction уже истёк или подтверждён — второй callback тоже не сработает
         }
         // Discord мог уже перестать ждать ответа на эту команду — тогда подсказка останется только в консоли
         let _ = respond(ephemeral(launch_problem(error_code(&error)))).await;
+        return false;
     }
-    Ok(())
+    true
 }
 
 async fn open_from_command(ctx: Context<'_>, lang: Lang) -> Result<(), Error> {

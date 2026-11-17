@@ -4,7 +4,7 @@
 
 use crate::wordboard::{self, Player};
 use crate::words::{self, Lang, MAX_GUESSES};
-use crate::{db, Shared};
+use crate::{db, rocket, Shared};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -102,11 +102,13 @@ async fn index(State(app): State<App>) -> Response {
     file(&app, "index.html", "text/html; charset=utf-8").await
 }
 
-/// style.css и app.js. Другие файлы не отдаём.
+/// Разрешённые файлы интерфейса.
 async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Response {
     match name.as_str() {
         "style.css" => file(&app, "style.css", "text/css; charset=utf-8").await,
         "app.js" => file(&app, "app.js", "text/javascript; charset=utf-8").await,
+        "rocket.css" => file(&app, "rocket.css", "text/css; charset=utf-8").await,
+        "rocket.js" => file(&app, "rocket.js", "text/javascript; charset=utf-8").await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -200,12 +202,69 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         sessions.retain(|_, old| now - old.time <= SESSION_HOURS * 3600.0); // старые пропуска выбрасываем
         sessions.insert(pass.clone(), session.clone());
     }
+    if app.data.rocket.take_open(guild, user) {
+        return Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": "rocket", "state": null })).into_response());
+    }
     let game = words::daily_game(&app.data, guild, user, lang).map_err(failed)?;
     if !game.finished() {
         app.refresh_board(&session, lang);
     }
     let state = app.state_of(&session, &game)?;
-    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "state": state })).into_response())
+    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": "words", "state": state })).into_response())
+}
+
+async fn rocket_state(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.session(&headers)?;
+    Ok(Json(rocket::read(&app.data, (session.guild, session.user)).map_err(failed)?).into_response())
+}
+
+async fn rocket_can_start(app: &Miniapp, session: &Session) -> Result<(), Response> {
+    let guild_id = serenity::GuildId::new(session.guild);
+    // Для платной ставки проверяем актуальное членство через Discord, без кэша аватарок.
+    let member = tokio::time::timeout(std::time::Duration::from_secs(5),
+        app.ctx.http.get_member(guild_id, serenity::UserId::new(session.user)))
+        .await.ok().and_then(Result::ok).ok_or_else(|| json_error("Discord не подтвердил участие на сервере.", StatusCode::FORBIDDEN))?;
+    let allowed = app.data.db.games_channel(session.guild).map_err(failed)?;
+    let Some(allowed) = allowed.filter(|_| app.data.games_commands.contains("rocket")) else { return Ok(()) };
+    let wrong_channel = || json_error("Ракетка доступна в игровом канале сервера. Запусти там /rocket.", StatusCode::FORBIDDEN);
+    let channel_id = session.channel.ok_or_else(wrong_channel)?;
+    let channel = tokio::time::timeout(std::time::Duration::from_secs(5), serenity::ChannelId::new(channel_id).to_channel(&app.ctx))
+        .await.ok().and_then(Result::ok).and_then(|channel| channel.guild()).ok_or_else(wrong_channel)?;
+    let guild = app.ctx.cache.guild(guild_id).ok_or_else(wrong_channel)?;
+    if channel.guild_id != guild_id || !guild.user_permissions_in(&channel, &member).view_channel()
+        || !crate::admin::allowed_here(&app.data.games_commands, "rocket", Some(allowed), channel_id, channel.parent_id.map(|id| id.get())) {
+        return Err(wrong_channel());
+    }
+    Ok(())
+}
+
+async fn rocket_start(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let (_, session) = app.session(&headers)?;
+    let bad = || json_error("Проверь ставку и коэффициент автовывода.", StatusCode::BAD_REQUEST);
+    let bet = body.get("bet").and_then(Value::as_str).filter(|text| text.len() <= 32).ok_or_else(bad)?;
+    let auto = match body.get("auto") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.len() <= 12 => Some(value.as_str()),
+        _ => return Err(bad()),
+    };
+    let expected = match body.get("expected_id") {
+        Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.parse::<u64>().map_err(|_| bad())?),
+        _ => return Err(bad()),
+    };
+    rocket_can_start(&app, &session).await?;
+    let state = rocket::start(&app.data, (session.guild, session.user), &session.name, bet, auto, expected)
+        .map_err(failed)?.map_err(|error| json_error(&error, StatusCode::CONFLICT))?;
+    Ok(Json(state).into_response())
+}
+
+async fn rocket_cashout(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let (_, session) = app.session(&headers)?;
+    let id = body.get("id").and_then(Value::as_str).and_then(|id| id.parse::<u64>().ok())
+        .ok_or_else(|| json_error("Нужен номер раунда.", StatusCode::BAD_REQUEST))?;
+    let state = rocket::cash_out(&app.data, (session.guild, session.user), id)
+        .map_err(failed)?.map_err(|error| json_error(&error, StatusCode::CONFLICT))?;
+    Ok(Json(state).into_response())
 }
 
 async fn state(State(app): State<App>, headers: HeaderMap) -> Reply {
@@ -301,6 +360,9 @@ pub fn router(app: App) -> axum::Router {
         .route("/api/guess", post(guess))
         .route("/api/new", post(new_game))
         .route("/api/players", get(players))
+        .route("/api/rocket/state", get(rocket_state))
+        .route("/api/rocket/start", post(rocket_start))
+        .route("/api/rocket/cashout", post(rocket_cashout))
         .route("/api/avatar/{guild}/{file}", get(avatar))
         .with_state(app)
 }

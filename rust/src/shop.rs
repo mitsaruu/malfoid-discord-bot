@@ -22,6 +22,27 @@ pub fn new_expiry(current: Option<f64>, now: f64, days: i64) -> f64 {
     current.map_or(now, |expires| expires.max(now)) + days as f64 * 86400.0
 }
 
+fn shop_admin_guild(ctx: Context<'_>) -> Option<serenity::GuildId> {
+    let poise::Context::Application(app) = ctx else {
+        return None;
+    };
+    let guild_id = app.interaction.guild_id?;
+    // Discord присылает права вызвавшего команду участника, включая права владельца сервера.
+    let permissions = app.interaction.member.as_ref()?.permissions?;
+    permissions.administrator().then_some(guild_id)
+}
+
+fn sale_rejection(guild_id: serenity::GuildId, role: &serenity::Role) -> Option<&'static str> {
+    if role.id.get() == guild_id.get() || role.managed {
+        return Some("Эту роль продавать нельзя (она служебная).");
+    }
+    let permissions = role.permissions;
+    if permissions.administrator() || permissions.manage_guild() || permissions.moderate_members() {
+        return Some("Эту роль продавать нельзя: у неё права админа или модератора.");
+    }
+    None
+}
+
 /// Может ли бот выдавать эту роль: есть право «Управлять ролями», и роль бота выше неё.
 fn bot_can_manage(guild: &serenity::Guild, bot: serenity::UserId, role: &serenity::Role) -> bool {
     let Some(member) = guild.members.get(&bot) else { return false };
@@ -96,6 +117,11 @@ pub async fn shop_buy(
     if has_role && (days == 0 || bought_until.is_none()) {
         return whisper(ctx, "Эта роль у тебя уже есть.").await;
     }
+    // Права роли могли измениться после выставления на продажу, а кэш мог ещё не обновиться.
+    let role = ctx.http().get_guild_role(guild_id, role.id).await?;
+    if let Some(reason) = sale_rejection(guild_id, &role) {
+        return whisper(ctx, reason).await;
+    }
     let bot = ctx.framework().bot_id();
     if !ctx.guild().is_some_and(|guild| bot_can_manage(&guild, bot, &role)) {
         return whisper(ctx,
@@ -119,7 +145,7 @@ pub async fn shop_buy(
 }
 
 /// Выставить роль на продажу в магазине (или поменять цену)
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD")]
+#[poise::command(slash_command, guild_only, default_member_permissions = "ADMINISTRATOR")]
 pub async fn shop_add(
     ctx: Context<'_>,
     #[description = "Какую роль продавать"] role: serenity::Role,
@@ -132,13 +158,12 @@ pub async fn shop_add(
     #[max = 365]
     days: Option<i64>,
 ) -> Result<(), Error> {
-    let (guild_id, days) = (ctx.guild_id().unwrap(), days.unwrap_or(0));
-    if role.id.get() == guild_id.get() || role.managed {
-        return whisper(ctx, "Эту роль продавать нельзя (она служебная).").await;
-    }
-    let permissions = role.permissions;
-    if permissions.administrator() || permissions.manage_guild() || permissions.moderate_members() {
-        return whisper(ctx, "У этой роли права админа или модератора — такие роли в магазин не ставлю.").await;
+    let Some(guild_id) = shop_admin_guild(ctx) else {
+        return whisper(ctx, "Управлять магазином могут только администраторы сервера.").await;
+    };
+    let days = days.unwrap_or(0);
+    if let Some(reason) = sale_rejection(guild_id, &role) {
+        return whisper(ctx, reason).await;
     }
     let bot = ctx.framework().bot_id();
     if !ctx.guild().is_some_and(|guild| bot_can_manage(&guild, bot, &role)) {
@@ -150,9 +175,12 @@ pub async fn shop_add(
 }
 
 /// Убрать роль из магазина
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD")]
+#[poise::command(slash_command, guild_only, default_member_permissions = "ADMINISTRATOR")]
 pub async fn shop_remove(ctx: Context<'_>, #[description = "Какую роль убрать"] role: serenity::Role) -> Result<(), Error> {
-    let removed = ctx.data().db.remove_shop_role(ctx.guild_id().unwrap().get(), role.id.get())?;
+    let Some(guild_id) = shop_admin_guild(ctx) else {
+        return whisper(ctx, "Управлять магазином могут только администраторы сервера.").await;
+    };
+    let removed = ctx.data().db.remove_shop_role(guild_id.get(), role.id.get())?;
     whisper(ctx, if removed {
         format!("✅ <@&{}> убрана из магазина. У кого она уже куплена — остаётся.", role.id)
     } else {
@@ -202,6 +230,41 @@ pub fn start_expiry_loop(http: Arc<serenity::Http>, database: Arc<db::Database>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shop_command_registration() {
+        for command in [shop_add(), shop_remove()] {
+            assert_eq!(command.default_member_permissions, serenity::Permissions::ADMINISTRATOR);
+        }
+        for command in [shop(), shop_buy()] {
+            assert!(command.default_member_permissions.is_empty());
+            assert!(command.required_permissions.is_empty());
+        }
+    }
+
+    #[test]
+    fn sale_filter_rechecks_role_permissions() {
+        use serenity::Permissions;
+
+        let guild_id = serenity::GuildId::new(1);
+        let mut role = serenity::Role::default();
+        role.id = serenity::RoleId::new(2);
+        role.permissions = Permissions::VIEW_CHANNEL;
+        assert!(sale_rejection(guild_id, &role).is_none());
+
+        for permission in [Permissions::ADMINISTRATOR, Permissions::MANAGE_GUILD, Permissions::MODERATE_MEMBERS] {
+            role.permissions = Permissions::VIEW_CHANNEL | permission;
+            assert!(sale_rejection(guild_id, &role).is_some());
+        }
+
+        role.permissions = Permissions::empty();
+        role.managed = true;
+        assert!(sale_rejection(guild_id, &role).is_some());
+
+        role.managed = false;
+        role.id = serenity::RoleId::new(guild_id.get());
+        assert!(sale_rejection(guild_id, &role).is_some());
+    }
 
     #[test]
     fn texts_and_expiry() {
