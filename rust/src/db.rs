@@ -1,7 +1,7 @@
 //! База данных — тот же файл levels.db, что у bot.py, с теми же таблицами.
 //! Пока здесь только то, что нужно уже перенесённым командам: кошельки и ежедневный бонус.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -53,6 +53,51 @@ pub struct WordDuel {
 pub struct Database {
     /// SQLite-соединение нельзя использовать из двух потоков сразу, поэтому оно под замком.
     connection: Mutex<Connection>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Wallet<'a> {
+    pub guild: u64,
+    pub user: u64,
+    pub name: &'a str,
+    pub start: i64,
+}
+
+impl Wallet<'_> {
+    pub(crate) fn open(self, connection: &Connection) -> rusqlite::Result<(i64, f64)> {
+        connection.execute(
+            "INSERT INTO economy (guild_id, user_id, name, balance, last_work) VALUES (?1, ?2, ?3, ?4, 0)
+             ON CONFLICT (guild_id, user_id) DO UPDATE SET name = excluded.name, balance = COALESCE(economy.balance, 0)
+             WHERE economy.name IS NOT excluded.name OR economy.balance IS NULL",
+            params![self.guild as i64, self.user as i64, self.name, self.start.max(0)],
+        )?;
+        connection.query_row(
+            "SELECT balance, COALESCE(last_work, 0) FROM economy WHERE guild_id = ?1 AND user_id = ?2",
+            params![self.guild as i64, self.user as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+}
+
+/// Изменяет уже открытый кошелёк внутри транзакции. Ошибка отменяет всю операцию.
+pub(crate) fn change_balance(tx: &Transaction<'_>, guild: u64, user: u64, amount: i64) -> rusqlite::Result<i64> {
+    let balance: i64 = tx.query_row(
+        "SELECT COALESCE(balance, 0) FROM economy WHERE guild_id = ?1 AND user_id = ?2",
+        params![guild as i64, user as i64],
+        |row| row.get(0),
+    )?;
+    let next = balance
+        .checked_add(amount)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, balance))?;
+    // Старые отрицательные остатки можно пополнять, но нельзя уменьшать дальше.
+    if amount < 0 && next < 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    tx.execute(
+        "UPDATE economy SET balance = ?3 WHERE guild_id = ?1 AND user_id = ?2",
+        params![guild as i64, user as i64, next],
+    )?;
+    Ok(next)
 }
 
 /// Текущее время в секундах (как time.time() в Python).
@@ -215,8 +260,17 @@ impl Database {
         // Single-bot startup: unfinished requests died with the previous process.
         // Successful usage survives; callers must not reopen during active requests.
         connection.execute("UPDATE ai_model_usage SET reserved = 0 WHERE reserved != 0", [])?;
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS ai_history_channel_id ON ai_history(channel_id, id DESC);
+             CREATE INDEX IF NOT EXISTS word_daily_guild_day ON word_daily(guild_id, day);
+             CREATE INDEX IF NOT EXISTS word_daily_ru_guild_day ON word_daily_ru(guild_id, day);
+             CREATE INDEX IF NOT EXISTS levels_guild_xp ON levels(guild_id, xp DESC);
+             CREATE INDEX IF NOT EXISTS economy_guild_balance ON economy(guild_id, balance DESC);",
+        )?;
         let database = Self { connection: Mutex::new(connection) };
         crate::wordsummary::prepare(&database)?;
+        crate::wordstats::prepare_duels(&database)?;
+        crate::shop::prepare(&database)?;
         crate::music_channels::prepare(&database)?;
         crate::wagers::prepare(&database)?;
         #[cfg(feature = "voice")]
@@ -233,33 +287,31 @@ impl Database {
         self.connection.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Синхронная операция с несколькими связанными записями. Сетевые вызовы выполняются за её пределами.
+    pub(crate) fn transaction<T>(&self, run: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+        let mut connection = self.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = run(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// (баланс, время последней работы). Если кошелька ещё нет — создаёт его со стартовыми монетами,
     /// а у старого игрока только обновляет имя.
     pub fn wallet(&self, guild: u64, user: u64, name: &str, start_balance: i64) -> rusqlite::Result<(i64, f64)> {
-        let connection = self.lock();
-        connection.execute(
-            "INSERT INTO economy (guild_id, user_id, name, balance, last_work) VALUES (?1, ?2, ?3, ?4, 0)
-             ON CONFLICT (guild_id, user_id) DO UPDATE SET name = excluded.name",
-            params![guild as i64, user as i64, name, start_balance],
-        )?;
-        connection.query_row(
-            "SELECT balance, last_work FROM economy WHERE guild_id = ?1 AND user_id = ?2",
-            params![guild as i64, user as i64],
-            |row| Ok((row.get(0)?, row.get::<_, Option<f64>>(1)?.unwrap_or(0.0))),
-        )
+        Wallet { guild, user, name, start: start_balance }.open(&self.lock())
     }
 
     /// Прибавляет монеты (отрицательное число — отнимает). Возвращает новый баланс.
     pub fn add_money(&self, guild: u64, user: u64, name: &str, start_balance: i64, amount: i64) -> rusqlite::Result<i64> {
-        self.wallet(guild, user, name, start_balance)?;
-        self.lock().execute(
-            "UPDATE economy SET balance = balance + ?1 WHERE guild_id = ?2 AND user_id = ?3",
-            params![amount, guild as i64, user as i64],
-        )?;
-        Ok(self.wallet(guild, user, name, start_balance)?.0)
+        self.transaction(|tx| {
+            Wallet { guild, user, name, start: start_balance }.open(tx)?;
+            change_balance(tx, guild, user, amount)
+        })
     }
 
     /// Записывает заработок за /work и время смены.
+    #[cfg(test)]
     pub fn record_work(&self, guild: u64, user: u64, earned: i64, time: f64) -> rusqlite::Result<()> {
         self.lock().execute(
             "UPDATE economy SET balance = balance + ?1, last_work = ?2 WHERE guild_id = ?3 AND user_id = ?4",
@@ -278,6 +330,7 @@ impl Database {
     }
 
     /// Ежедневный бонус: (день последнего бонуса, дней подряд) или None, если ещё не забирал.
+    #[cfg(test)]
     pub fn daily_bonus(&self, guild: u64, user: u64) -> rusqlite::Result<Option<(String, i64)>> {
         self.lock()
             .query_row(
@@ -290,7 +343,10 @@ impl Database {
 
     /// Питомцы человека в том порядке, в каком они появились.
     pub fn user_pets(&self, guild: u64, user: u64) -> rusqlite::Result<Vec<Pet>> {
-        let connection = self.lock();
+        Self::pets_on(&self.lock(), guild, user)
+    }
+
+    pub(crate) fn pets_on(connection: &Connection, guild: u64, user: u64) -> rusqlite::Result<Vec<Pet>> {
         let mut statement = connection.prepare(
             "SELECT id, species, level, last_collect, spent FROM pets WHERE guild_id = ?1 AND user_id = ?2 ORDER BY id",
         )?;
@@ -300,7 +356,11 @@ impl Database {
 
     /// Питомец по номеру, только если он принадлежит этому человеку.
     pub fn own_pet(&self, id: i64, guild: u64, user: u64) -> rusqlite::Result<Option<Pet>> {
-        self.lock()
+        Self::own_pet_on(&self.lock(), id, guild, user)
+    }
+
+    pub(crate) fn own_pet_on(connection: &Connection, id: i64, guild: u64, user: u64) -> rusqlite::Result<Option<Pet>> {
+        connection
             .query_row(
                 "SELECT id, species, level, last_collect, spent FROM pets WHERE id = ?1 AND guild_id = ?2 AND user_id = ?3",
                 params![id, guild as i64, user as i64],
@@ -310,6 +370,7 @@ impl Database {
     }
 
     /// Новый питомец 1 уровня. Возвращает его номер.
+    #[cfg(test)]
     pub fn add_pet(&self, guild: u64, user: u64, species: &str, time: f64, spent: i64) -> rusqlite::Result<i64> {
         let connection = self.lock();
         connection.execute(
@@ -320,6 +381,7 @@ impl Database {
     }
 
     /// Питомец поел: +1 уровень, корм добавляется к вложенному, отсчёт дохода сдвигается.
+    #[cfg(test)]
     pub fn feed_pet(&self, id: i64, cost: i64, last_collect: f64) -> rusqlite::Result<()> {
         self.lock().execute(
             "UPDATE pets SET level = level + 1, spent = spent + ?1, last_collect = ?2 WHERE id = ?3",
@@ -328,12 +390,14 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete_pet(&self, id: i64) -> rusqlite::Result<()> {
         self.lock().execute("DELETE FROM pets WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     /// Доход забрали — у всех питомцев человека отсчёт начинается заново.
+    #[cfg(test)]
     pub fn mark_pets_collected(&self, guild: u64, user: u64, time: f64) -> rusqlite::Result<()> {
         self.lock().execute(
             "UPDATE pets SET last_collect = ?1 WHERE guild_id = ?2 AND user_id = ?3",
@@ -612,11 +676,7 @@ impl Database {
 
     /// Прибавляет монеты по id участника, когда его имени под рукой нет (кошелёк уже должен быть).
     pub fn add_money_by_id(&self, guild: u64, user: u64, amount: i64) -> rusqlite::Result<()> {
-        self.lock().execute(
-            "UPDATE economy SET balance = balance + ?1 WHERE guild_id = ?2 AND user_id = ?3",
-            params![amount, guild as i64, user as i64],
-        )?;
-        Ok(())
+        self.transaction(|tx| change_balance(tx, guild, user, amount).map(|_| ()))
     }
 
     /// Партии слова дня с ходами: (участник, день, загаданное слово, догадки), по дням.
@@ -703,6 +763,7 @@ impl Database {
         Ok(row.unwrap_or((0, 0.0)))
     }
 
+    #[cfg(test)]
     pub fn set_dick(&self, guild: u64, user: u64, name: &str, size: i64, time: f64) -> rusqlite::Result<()> {
         self.lock().execute(
             "INSERT INTO dick (guild_id, user_id, name, size, last_growth) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1150,6 +1211,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_daily_bonus(&self, guild: u64, user: u64, day: &str, streak: i64) -> rusqlite::Result<()> {
         self.lock().execute(
             "INSERT INTO daily_bonus (guild_id, user_id, last_day, streak) VALUES (?1, ?2, ?3, ?4)
@@ -1163,6 +1225,15 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debit_cannot_overdraw_wallet_and_overflow_does_not_poison_balance() {
+        let db = Database::in_memory().unwrap();
+        assert!(db.add_money(1, 2, "test", 100, -101).is_err());
+        assert_eq!(db.wallet(1, 2, "test", 100).unwrap().0, 100);
+        assert!(db.add_money(1, 2, "test", 100, i64::MAX).is_err());
+        assert_eq!(db.wallet(1, 2, "test", 100).unwrap().0, 100);
+    }
 
     struct QuotaTestFile(std::path::PathBuf);
 

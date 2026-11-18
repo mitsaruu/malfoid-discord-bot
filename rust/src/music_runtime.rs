@@ -14,7 +14,7 @@ pub fn prepare(db: &Database) -> rusqlite::Result<()> {
     db.lock().execute_batch("CREATE TABLE IF NOT EXISTS music_current (guild_id INTEGER PRIMARY KEY, url TEXT NOT NULL, title TEXT NOT NULL, details TEXT NOT NULL);")
 }
 
-fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
+pub(crate) fn row_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     Ok(Item {
         id: row.get(0)?,
         url: row.get(1)?,
@@ -55,6 +55,14 @@ pub fn claim(db: &Database, guild: u64) -> rusqlite::Result<Option<Item>> {
 }
 
 /// The selected page and original request details survive restart; never store audio URLs.
+pub(crate) fn has_current(db: &Database, guild: u64) -> rusqlite::Result<bool> {
+    db.lock().query_row(
+        "SELECT EXISTS(SELECT 1 FROM music_current WHERE guild_id=?1)",
+        [guild as i64],
+        |row| row.get(0),
+    )
+}
+
 pub fn selected(
     db: &Database,
     guild: u64,
@@ -227,7 +235,12 @@ pub fn recover(db: &Database) -> rusqlite::Result<usize> {
 
 const TTL: Duration = Duration::from_secs(600);
 const CAPACITY: usize = 128;
-type SearchResult = Result<Vec<Value>, String>;
+type SearchResult = Result<Vec<Value>, SearchFailure>;
+#[derive(Clone)]
+enum SearchFailure {
+    Cancelled,
+    Lookup(String),
+}
 struct Entry {
     created: Instant,
     result: watch::Receiver<Option<SearchResult>>,
@@ -241,7 +254,7 @@ fn safe_candidates(list: Vec<Value>) -> Vec<Value> {
     list.into_iter()
         .map(|v| {
             let mut m = serde_json::Map::new();
-            for field in ["title", "webpage_url", "duration", "thumbnail", "uploader"] {
+            for field in ["title", "webpage_url", "duration", "thumbnail", "uploader", "is_live"] {
                 if let Some(value) = v.get(field) {
                     m.insert(field.into(), value.clone());
                 }
@@ -256,7 +269,7 @@ impl Drop for Flight<'_> {
     fn drop(&mut self) {
         if self.0.borrow().is_none() {
             self.0
-                .send_replace(Some(Err("metadata lookup cancelled".into())));
+                .send_replace(Some(Err(SearchFailure::Cancelled)));
             self.1.notify_waiters();
         }
     }
@@ -268,61 +281,71 @@ impl MetadataCache {
         Fut: Future<Output = Result<Vec<Value>, Error>>,
     {
         let key = (query.trim().to_owned(), count.clamp(1, 5));
-        let (entry, leader) = loop {
-            // Register before checking capacity to avoid a lost wakeup.
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let found = {
-                let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-                entries.retain(|_, e| {
-                    let r = e.result.borrow();
-                    r.is_none() || (e.created.elapsed() < TTL && matches!(&*r, Some(Ok(_))))
-                });
-                if let Some(e) = entries.get(&key) {
-                    Some((e.clone(), None))
-                } else {
-                    if entries.len() >= CAPACITY {
-                        let oldest = entries
-                            .iter()
-                            .filter(|(_, e)| e.result.borrow().is_some())
-                            .min_by_key(|(_, e)| e.created)
-                            .map(|(k, _)| k.clone());
-                        if let Some(oldest) = oldest {
-                            entries.remove(&oldest);
+        let mut load = Some(load);
+        loop {
+            let (entry, leader) = loop {
+                // Register before checking capacity to avoid a lost wakeup.
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let found = {
+                    let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+                    entries.retain(|_, e| {
+                        let r = e.result.borrow();
+                        r.is_none() || (e.created.elapsed() < TTL && matches!(&*r, Some(Ok(_))))
+                    });
+                    if let Some(e) = entries.get(&key) {
+                        Some((e.clone(), None))
+                    } else {
+                        if entries.len() >= CAPACITY {
+                            let oldest = entries
+                                .iter()
+                                .filter(|(_, e)| e.result.borrow().is_some())
+                                .min_by_key(|(_, e)| e.created)
+                                .map(|(k, _)| k.clone());
+                            if let Some(oldest) = oldest {
+                                entries.remove(&oldest);
+                            }
+                        }
+                        if entries.len() < CAPACITY {
+                            let (tx, rx) = watch::channel(None);
+                            let e = Arc::new(Entry {
+                                created: Instant::now(),
+                                result: rx,
+                            });
+                            entries.insert(key.clone(), e.clone());
+                            Some((e, Some(Flight(tx, &self.changed))))
+                        } else {
+                            None
                         }
                     }
-                    if entries.len() < CAPACITY {
-                        let (tx, rx) = watch::channel(None);
-                        let e = Arc::new(Entry {
-                            created: Instant::now(),
-                            result: rx,
-                        });
-                        entries.insert(key.clone(), e.clone());
-                        Some((e, Some(Flight(tx, &self.changed))))
-                    } else {
-                        None
-                    }
+                };
+                if let Some(found) = found {
+                    break found;
                 }
+                notified.await;
             };
-            if let Some(found) = found {
-                break found;
+            if let Some(flight) = leader {
+                let load = load.take().expect("only the leader consumes the loader");
+                let result = load()
+                    .await
+                    .map(safe_candidates)
+                    .map_err(|error| SearchFailure::Lookup(error.to_string()));
+                flight.0.send_replace(Some(result));
+                self.changed.notify_waiters();
             }
-            notified.await;
-        };
-        if let Some(flight) = leader {
-            let result = load().await.map(safe_candidates).map_err(|e| e.to_string());
-            flight.0.send_replace(Some(result));
-            self.changed.notify_waiters();
-        }
-        let mut rx = entry.result.clone();
-        loop {
-            let result = rx.borrow_and_update().clone();
-            if let Some(result) = result {
-                return result.map_err(Into::into);
-            }
-            if rx.changed().await.is_err() {
-                return Err("metadata lookup cancelled".into());
+            let mut rx = entry.result.clone();
+            loop {
+                let result = rx.borrow_and_update().clone();
+                match result {
+                    Some(Ok(list)) => return Ok(list),
+                    Some(Err(SearchFailure::Lookup(error))) => return Err(error.into()),
+                    Some(Err(SearchFailure::Cancelled)) => break,
+                    None => {}
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -365,10 +388,13 @@ fn same_item(a: &Item, b: &Item) -> bool {
     a.id == b.id && a.url == b.url && a.title == b.title && a.details == b.details
 }
 fn next_unresolved(data: &Data, guild: u64) -> Option<Item> {
-    crate::music_qol::items(data, guild)
-        .ok()?
-        .into_iter()
-        .find(|i| i.details["resolved"] != true)
+    data.db.lock().query_row(
+        "SELECT id,url,title,details FROM queue WHERE guild_id=?1
+         AND CASE WHEN json_valid(details) THEN json_type(details,'$.resolved') IS NOT 'true' ELSE 1 END
+         ORDER BY COALESCE(sort_order,id),id LIMIT 1",
+        [guild as i64],
+        row_item,
+    ).optional().ok().flatten()
 }
 /// Call after queue edits/enqueues. A single metadata-only task per guild; no global lock across await.
 pub fn queue_changed(data: &Shared, guild: u64) {
@@ -421,13 +447,11 @@ pub fn take_prefetched(data: &Data, guild: u64, item: &Item) -> Option<Resolved>
         .prefetch
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let old = tasks.remove(&guild)?;
-    old.task.abort();
-    if same_item(&old.item, item) {
-        old.result
-    } else {
-        None
+    if !same_item(&tasks.get(&guild)?.item, item) {
+        return None;
     }
+    // A matching in-flight task may lead the foreground lookup. Leave it to finish.
+    tasks.remove(&guild)?.result
 }
 
 #[cfg(test)]

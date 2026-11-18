@@ -2,10 +2,16 @@
 //! Когда время выйдет, бот подводит итог. Кнопки работают и после перезапуска.
 
 use crate::reply::whisper;
-use crate::{db, Context, Data, Error};
+use crate::reminders::{clear_delivery_retry, delivery_schema, destination_gone, retry_delivery};
+use crate::{db::{self, Database}, Context, Data, Error};
 use poise::serenity_prelude as serenity;
+use rusqlite::{params, Connection, OptionalExtension};
+use tokio::sync::Mutex;
 
 const MAX_OPTIONS: usize = 5;
+const CLOSE_BATCH: usize = 32;
+const POLL_JOB: &str = "poll";
+static MESSAGE_LOCKS: [Mutex<()>; 64] = [const { Mutex::const_new(()) }; 64];
 
 /// Варианты из строки «Пицца | Суши | Бургеры». None — их меньше 2, больше 5 или есть одинаковые.
 pub fn parse_options(text: &str) -> Option<Vec<String>> {
@@ -54,9 +60,94 @@ fn buttons(options: &[String]) -> Vec<serenity::CreateActionRow> {
     vec![serenity::CreateActionRow::Buttons(buttons)]
 }
 
-fn counts(data: &Data, message: u64, options: usize) -> rusqlite::Result<Vec<i64>> {
-    let votes = data.db.poll_votes(message)?;
-    Ok((0..options as i64).map(|option| votes.get(&option).copied().unwrap_or(0)).collect())
+struct Poll {
+    channel: u64,
+    author: u64,
+    question: String,
+    options: Vec<String>,
+    ends: f64,
+}
+
+impl Poll {
+    fn load(connection: &Connection, message: u64) -> rusqlite::Result<Option<Self>> {
+        connection.query_row(
+            "SELECT channel_id, author_id, question, options, ends FROM polls WHERE message_id = ?1",
+            [message as i64],
+            |row| {
+                let options: String = row.get(3)?;
+                Ok(Self {
+                    channel: row.get::<_, i64>(0)? as u64,
+                    author: row.get::<_, i64>(1)? as u64,
+                    question: row.get(2)?,
+                    options: serde_json::from_str(&options).unwrap_or_default(),
+                    ends: row.get(4)?,
+                })
+            },
+        ).optional()
+    }
+
+    fn tally(&self, connection: &Connection, message: u64) -> rusqlite::Result<Vec<i64>> {
+        let mut votes = vec![0; self.options.len()];
+        let mut statement = connection.prepare(
+            "SELECT option, COUNT(*) FROM poll_votes WHERE message_id = ?1 GROUP BY option",
+        )?;
+        let rows = statement.query_map([message as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (option, count) = row?;
+            if let Some(slot) = votes.get_mut(option as usize) {
+                *slot = count;
+            }
+        }
+        Ok(votes)
+    }
+
+    fn card(&self, votes: &[i64], closed: bool) -> serenity::CreateEmbed {
+        embed(&self.question, &self.options, votes, self.ends, self.author, closed)
+    }
+}
+
+fn accept_vote(
+    db: &Database, message: u64, user: u64, option: i64, now: f64,
+) -> rusqlite::Result<Option<(Poll, Vec<i64>)>> {
+    let mut connection = db.lock();
+    let transaction = connection.transaction()?;
+    let Some(poll) = Poll::load(&transaction, message)?
+        .filter(|poll| poll.ends > now && (0..poll.options.len() as i64).contains(&option))
+    else {
+        return Ok(None);
+    };
+    transaction.execute(
+        "INSERT INTO poll_votes (message_id, user_id, option) VALUES (?1, ?2, ?3)
+         ON CONFLICT (message_id, user_id) DO UPDATE SET option = excluded.option",
+        params![message as i64, user as i64, option],
+    )?;
+    let votes = poll.tally(&transaction, message)?;
+    transaction.commit()?;
+    Ok(Some((poll, votes)))
+}
+
+fn finish_poll(db: &Database, message: u64) -> rusqlite::Result<()> {
+    let mut connection = db.lock();
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM poll_votes WHERE message_id = ?1", [message as i64])?;
+    transaction.execute("DELETE FROM polls WHERE message_id = ?1", [message as i64])?;
+    clear_delivery_retry(&transaction, POLL_JOB, message as i64)?;
+    transaction.commit()
+}
+
+fn close_batch(db: &Database, now: f64) -> rusqlite::Result<Vec<u64>> {
+    let connection = db.lock();
+    delivery_schema(&connection)?;
+    connection.execute_batch("CREATE INDEX IF NOT EXISTS polls_ends ON polls (ends);")?;
+    let mut statement = connection.prepare(
+        "SELECT p.message_id FROM polls p
+         LEFT JOIN delivery_retry d ON d.job = 'poll' AND d.id = p.message_id
+         WHERE p.ends <= ?1 AND COALESCE(d.retry_at, 0) <= ?1 ORDER BY p.ends, p.message_id LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![now, CLOSE_BATCH as i64], |row| row.get::<_, i64>(0).map(|id| id as u64))?;
+    rows.collect()
 }
 
 /// Опрос с кнопками: вопрос и до 5 вариантов ответа
@@ -82,11 +173,17 @@ pub async fn poll(
     let reply = ctx
         .send(poise::CreateReply::default()
             .embed(embed(&question, &choices, &vec![0; choices.len()], ends, author, false))
-            .components(buttons(&choices))
             .allowed_mentions(serenity::CreateAllowedMentions::new()))
         .await?;
     let message = reply.message().await?.id.get();
-    ctx.data().db.add_poll(message, ctx.channel_id().get(), author, &question, &serde_json::to_string(&choices)?, ends)?;
+    let _update = MESSAGE_LOCKS[message as usize % MESSAGE_LOCKS.len()].lock().await;
+    let channel = ctx.channel_id();
+    if let Err(error) = ctx.data().db.add_poll(message, channel.get(), author, &question, &serde_json::to_string(&choices)?, ends) {
+        let _ = channel.delete_message(ctx.http(), serenity::MessageId::new(message)).await;
+        return Err(error.into());
+    }
+    channel.edit_message(ctx.http(), serenity::MessageId::new(message),
+        serenity::EditMessage::new().components(buttons(&choices))).await?;
     Ok(())
 }
 
@@ -104,29 +201,41 @@ pub async fn vote_pressed(ctx: &serenity::Context, data: &Data, press: &serenity
 async fn vote(ctx: &serenity::Context, data: &Data, press: &serenity::ComponentInteraction, option: i64) -> Result<(), Error> {
     press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await?;
     let message = press.message.id.get();
-    let open = data.db.poll(message)?.filter(|poll| poll.2 > db::now());
-    let Some((question, options, ends, author)) = open else {
-        let note = serenity::CreateInteractionResponseFollowup::new().content("Этот опрос уже закончился.").ephemeral(true);
+    let _update = MESSAGE_LOCKS[message as usize % MESSAGE_LOCKS.len()].lock().await;
+    let Some((poll, votes)) = accept_vote(&data.db, message, press.user.id.get(), option, db::now())? else {
+        let note = serenity::CreateInteractionResponseFollowup::new().content("Этот опрос уже закончился или вариант недоступен.").ephemeral(true);
         press.create_followup(ctx, note).await?;
         return Ok(());
     };
-    let options: Vec<String> = serde_json::from_str(&options)?;
-    data.db.set_poll_vote(message, press.user.id.get(), option)?;
-    let update = serenity::EditInteractionResponse::new()
-        .embed(embed(&question, &options, &counts(data, message, options.len())?, ends, author, false));
-    press.edit_response(ctx, update).await?;
+    // Serialize edits with closure so an earlier vote cannot restore an open card.
+    press.edit_response(ctx, serenity::EditInteractionResponse::new().embed(poll.card(&votes, false))).await?;
     Ok(())
 }
 
-/// Закрывает опросы, у которых вышло время: показывает итоги и убирает кнопки.
+/// Публикует итог. При временном отказе закрытый опрос и голоса остаются в БД.
 pub async fn close_finished(http: &serenity::Http, data: &Data) -> Result<(), Error> {
-    for (message, channel, author, question, options, ends) in data.db.finished_polls(db::now())? {
-        let options: Vec<String> = serde_json::from_str(&options).unwrap_or_default();
-        let votes = counts(data, message, options.len())?;
-        data.db.delete_poll(message)?;
-        let edit = serenity::EditMessage::new().embed(embed(&question, &options, &votes, ends, author, true)).components(Vec::new());
-        // если сообщение с опросом удалили — ничего страшного
-        let _ = serenity::ChannelId::new(channel).edit_message(http, serenity::MessageId::new(message), edit).await;
+    for message in close_batch(&data.db, db::now())? {
+        let _update = MESSAGE_LOCKS[message as usize % MESSAGE_LOCKS.len()].lock().await;
+        let result = {
+            let connection = data.db.lock();
+            Poll::load(&connection, message)?
+                .filter(|poll| poll.ends <= db::now())
+                .map(|poll| poll.tally(&connection, message).map(|votes| (poll, votes)))
+                .transpose()?
+        };
+        let Some((poll, votes)) = result else { continue };
+        let edit = serenity::EditMessage::new().embed(poll.card(&votes, true)).components(Vec::new());
+        match serenity::ChannelId::new(poll.channel).edit_message(http, serenity::MessageId::new(message), edit).await {
+            Ok(_) => finish_poll(&data.db, message)?,
+            Err(error) if destination_gone(&error) => {
+                eprintln!("Опрос {message}: удалён канал или сообщение: {error}");
+                finish_poll(&data.db, message)?;
+            }
+            Err(error) => {
+                eprintln!("Опрос {message}: не удалось опубликовать итог, будет повтор: {error}");
+                retry_delivery(&data.db.lock(), POLL_JOB, message as i64, db::now())?;
+            }
+        }
     }
     Ok(())
 }
@@ -134,6 +243,25 @@ pub async fn close_finished(http: &serenity::Http, data: &Data) -> Result<(), Er
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closure_preserves_votes_for_retry_and_rejects_late_votes() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        db.add_poll(42, 3, 2, "Question", r#"["Yes","No"]"#, 5.0).unwrap();
+        let (_, votes) = accept_vote(&db, 42, 9, 1, 4.0).unwrap().unwrap();
+        assert_eq!(votes, [0, 1]);
+        assert!(accept_vote(&db, 42, 9, 0, 5.0).unwrap().is_none());
+        assert!(accept_vote(&db, 42, 10, -1, 4.0).unwrap().is_none());
+        assert_eq!(close_batch(&db, 5.0).unwrap(), [42]);
+        retry_delivery(&db.lock(), POLL_JOB, 42, 5.0).unwrap();
+        assert!(close_batch(&db, 34.0).unwrap().is_empty());
+        assert_eq!(close_batch(&db, 35.0).unwrap(), [42]);
+        let votes = db.poll_votes(42).unwrap();
+        assert_eq!(votes.get(&1), Some(&1));
+        finish_poll(&db, 42).unwrap();
+        assert!(close_batch(&db, 40.0).unwrap().is_empty());
+        assert!(db.poll_votes(42).unwrap().is_empty());
+    }
 
     #[test]
     fn options() {

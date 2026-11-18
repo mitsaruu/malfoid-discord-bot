@@ -2,13 +2,14 @@
 name = "musicbot"
 version = "0.1.0"
 edition = "2021"
-description = "Discord-бот на Rust (переписывается с bot.py по частям)"
+rust-version = "1.96"
+description = "Discord-бот на Rust"
 
 [dependencies]
 # Discord: poise — слэш-команды поверх serenity
 poise = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
-# Та же база levels.db, что и у bot.py. bundled — SQLite собирается вместе с ботом, ставить его отдельно не нужно
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt-multi-thread", "macros", "process", "sync", "time"] }
+# bundled — SQLite собирается вместе с ботом.
 rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 rand = "0.9"
 chrono = "0.4"
@@ -19,6 +20,8 @@ ab_glyph = "0.2"
 # Мини-приложение игры в слова: веб-сервер и JSON
 axum = "0.8"
 serde_json = "1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+math-core = "0.9"
 # Картинки для ИИ отправляются в Gemini в виде base64
 base64 = "0.22"
 # Скачивание аватарок

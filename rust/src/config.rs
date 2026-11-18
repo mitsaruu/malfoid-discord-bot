@@ -1,7 +1,8 @@
-//! Чтение config/settings.ini — того же файла, что читает bot.py.
+//! Чтение config/settings.ini.
 //! Формат: разделы `[name]`, строки `ключ = значение`, комментарии начинаются с `;` или `#`.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 
 #[derive(Debug, Default)]
@@ -11,14 +12,21 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Читает файл. Если файла нет или он не читается — пустые настройки (везде значения по умолчанию).
+    /// Читает локальную фикстуру теста с настройками по умолчанию при её отсутствии.
+    #[cfg(test)]
     pub fn load(path: &Path) -> Self {
+        Self::load_checked(path).expect("не удалось прочитать настройки теста")
+    }
+
+    pub fn load_checked(path: &Path) -> io::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text),
-            Err(error) => {
-                println!("settings.ini не прочитан ({error}) — беру значения по умолчанию");
-                Self::default()
-            }
+            Ok(text) => Ok(Self::parse(&text)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: пересохрани файл в UTF-8", path.display()),
+            )),
+            Err(error) => Err(io::Error::new(error.kind(), format!("{}: {error}", path.display()))),
         }
     }
 
@@ -31,7 +39,7 @@ impl Settings {
                 continue;
             }
             if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
-                section = name.trim().to_string();
+                section = name.trim().to_lowercase();
             } else if let Some((key, value)) = line.split_once('=') {
                 values.insert((section.clone(), key.trim().to_lowercase()), value.trim().to_string());
             }
@@ -41,7 +49,7 @@ impl Settings {
 
     /// Строка из настроек; если её нет или она пустая — значение по умолчанию.
     pub fn text(&self, section: &str, key: &str, default: &str) -> String {
-        match self.values.get(&(section.to_string(), key.to_lowercase())) {
+        match self.values.get(&(section.to_lowercase(), key.to_lowercase())) {
             Some(value) if !value.is_empty() => value.clone(),
             _ => default.to_string(),
         }
@@ -49,7 +57,7 @@ impl Settings {
 
     /// Целое число из настроек; если его нет или там не число — значение по умолчанию.
     pub fn int(&self, section: &str, key: &str, default: i64) -> i64 {
-        match self.values.get(&(section.to_string(), key.to_lowercase())) {
+        match self.values.get(&(section.to_lowercase(), key.to_lowercase())) {
             None => default,
             Some(value) => value.parse().unwrap_or_else(|_| {
                 println!("settings.ini: «{key} = {value}» — нужно целое число, беру {default}");

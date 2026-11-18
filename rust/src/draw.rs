@@ -95,15 +95,22 @@ pub fn fit_text(font: &FontVec, size: f32, text: &str, max_width: f32) -> String
     if text_width(font, size, text) <= max_width {
         return text.to_string();
     }
-    let mut characters: Vec<char> = text.chars().collect();
-    while !characters.is_empty() {
-        let shorter: String = characters.iter().collect::<String>() + "…";
-        if text_width(font, size, &shorter) <= max_width {
-            return shorter;
+    let scaled = font.as_scaled(scale(font, size));
+    let ellipsis = scaled.glyph_id('…');
+    let ellipsis_width = scaled.h_advance(ellipsis);
+    let (mut width, mut previous, mut end) = (0.0, None, 0);
+    for (start, character) in text.char_indices() {
+        let glyph = scaled.glyph_id(character);
+        if let Some(previous) = previous {
+            width += scaled.kern(previous, glyph);
         }
-        characters.pop();
+        width += scaled.h_advance(glyph);
+        if width + scaled.kern(glyph, ellipsis) + ellipsis_width <= max_width {
+            end = start + character.len_utf8();
+        }
+        previous = Some(glyph);
     }
-    "…".to_string()
+    format!("{}…", &text[..end])
 }
 
 fn blend(image: &mut RgbaImage, x: i32, y: i32, color: Rgba<u8>, coverage: f32) {

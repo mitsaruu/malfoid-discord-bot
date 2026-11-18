@@ -13,15 +13,26 @@ use crate::{db, Context, Data, Error, Shared};
 use poise::serenity_prelude as serenity;
 use rand::seq::{IndexedRandom, SliceRandom};
 use rusqlite::{params, OptionalExtension};
-use songbird::events::{Event, EventContext, TrackEvent};
-use songbird::input::{ChildContainer, Input};
-use songbird::tracks::{PlayMode, TrackHandle};
+use songbird::events::{Event, EventContext, EventData, TrackEvent};
+use songbird::input::{AudioStream, Input, LiveInput};
+#[cfg(test)]
+use songbird::input::ChildContainer;
+use songbird::tracks::{PlayMode, Track, TrackHandle};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const TRACK_TOO_SHORT: Duration = Duration::from_secs(3); // трек «закончился» быстрее — значит, звук не загрузился
+type PlaylistTrack = (String, String, serde_json::Value);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SavePlaylist {
+    Saved,
+    Denied,
+    Limit,
+}
+
 const MAX_PLAYLISTS: usize = 25; // сколько плейлистов может сохранить один сервер
 const MAX_PLAYLIST_SAVE: usize = 100; // сколько треков помещается в один плейлист
 const NOT_PLAYING: &str = "Сейчас ничего не играет.";
@@ -40,17 +51,40 @@ const MONTH_NAMES: [&str; 12] = [
     "Декабрь",
 ];
 
-/// Что передать yt-dlp: ссылку — как есть, обычный текст — как поиск первого результата на YouTube.
-pub fn ytdlp_target(query: &str) -> String {
-    let query = query.trim();
-    if query.starts_with("http://")
-        || query.starts_with("https://")
-        || query.starts_with("ytsearch")
+/// Only page URLs for the supported playback providers may cross the downloader boundary.
+pub(crate) fn provider_url(text: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(text.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
     {
-        query.to_string()
-    } else {
-        format!("ytsearch1:{query}")
+        return None;
     }
+    let host = url.host_str()?;
+    matches!(
+        host,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com"
+            | "youtu.be" | "www.youtube-nocookie.com"
+            | "soundcloud.com" | "www.soundcloud.com" | "m.soundcloud.com"
+            | "on.soundcloud.com" | "snd.sc"
+    )
+    .then_some(url)
+}
+
+pub(crate) fn ytdlp_target(query: &str, count: usize) -> Result<String, Error> {
+    let query = query.trim();
+    if let Some(url) = provider_url(query) {
+        return Ok(url.to_string());
+    }
+    if query.contains("://") || query.starts_with("//") {
+        return Err("Поддерживаются ссылки YouTube, SoundCloud и Spotify.".into());
+    }
+    let query = query.strip_prefix("ytsearch1:").unwrap_or(query);
+    if query.trim().is_empty() || query.chars().any(char::is_control) {
+        return Err("Укажи название трека или ссылку.".into());
+    }
+    Ok(format!("ytsearch{}:{query}", count.clamp(1, 5)))
 }
 
 fn tracks_text(count: usize) -> String {
@@ -68,6 +102,9 @@ pub(crate) struct GuildMusic {
     pub(crate) playing_url: Option<String>, // страница трека, который играет (для автоплея)
     track: Option<TrackHandle>,
     instance: Option<String>,
+    pub(crate) snapshot_id: Option<i64>,
+    voice_generation: u64,
+    autoplay_generation: u64,
     pub(crate) details: serde_json::Value,
     skipped: bool,       // трек остановили сами (/skip, /leave) — это не ошибка звука
     repeat: bool,        // кнопка 🔁
@@ -118,6 +155,7 @@ fn take_playback(state: &mut GuildMusic, instance: &str) -> Option<(Option<Strin
     state.instance = None;
     state.track = None;
     state.now_playing = None;
+    state.snapshot_id = None;
     Some((
         state.playing_url.take(),
         std::mem::take(&mut state.skipped),
@@ -273,40 +311,58 @@ impl db::Database {
         rows.collect()
     }
 
-    pub fn playlist(&self, guild: u64, name: &str) -> rusqlite::Result<Vec<(String, String)>> {
+    fn playlist(&self, guild: u64, name: &str) -> rusqlite::Result<Vec<PlaylistTrack>> {
         let connection = self.lock();
         let mut statement = connection.prepare(
-            "SELECT url, title FROM playlists WHERE guild_id = ?1 AND name = ?2 ORDER BY position",
+            "SELECT url,title,details FROM playlists WHERE guild_id=?1 AND name=?2 ORDER BY position",
         )?;
         let rows = statement.query_map(params![guild as i64, name], |row| {
-            Ok((
-                row.get(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            ))
+            let url: String = row.get(0)?;
+            let details = row.get::<_, Option<String>>(2)?
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .filter(|value| value.is_object())
+                .unwrap_or_else(|| serde_json::json!({"original":url}));
+            Ok((url, row.get::<_, Option<String>>(1)?.unwrap_or_default(), details))
         })?;
         rows.collect()
     }
 
-    /// Сохраняет плейлист (то же имя — перезаписывает).
-    pub fn save_playlist(
+    fn save_playlist(
         &self,
         guild: u64,
         name: &str,
-        tracks: &[(String, String)],
-    ) -> rusqlite::Result<()> {
+        tracks: &[PlaylistTrack],
+        can_replace: bool,
+    ) -> rusqlite::Result<SavePlaylist> {
         let mut connection = self.lock();
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM playlists WHERE guild_id = ?1 AND name = ?2",
-            params![guild as i64, name],
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM playlists WHERE guild_id=?1 AND name=?2)",
+            params![guild as i64, name], |r| r.get(0),
         )?;
-        for (position, (url, title)) in tracks.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO playlists (guild_id, name, position, url, title) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![guild as i64, name, position as i64, url, title],
-            )?;
+        if exists && !can_replace {
+            return Ok(SavePlaylist::Denied);
         }
-        transaction.commit()
+        if !exists {
+            let count: i64 = tx.query_row(
+                "SELECT COUNT(DISTINCT name) FROM playlists WHERE guild_id=?1",
+                [guild as i64], |r| r.get(0),
+            )?;
+            if count >= MAX_PLAYLISTS as i64 {
+                return Ok(SavePlaylist::Limit);
+            }
+        }
+        tx.execute("DELETE FROM playlists WHERE guild_id=?1 AND name=?2", params![guild as i64, name])?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO playlists(guild_id,name,position,url,title,details) VALUES(?1,?2,?3,?4,?5,?6)",
+            )?;
+            for (position, (url, title, details)) in tracks.iter().enumerate() {
+                insert.execute(params![guild as i64, name, position as i64, url, title, details.to_string()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(SavePlaylist::Saved)
     }
 
     pub fn delete_playlist(&self, guild: u64, name: &str) -> rusqlite::Result<bool> {
@@ -320,11 +376,71 @@ impl db::Database {
 // ---------- yt-dlp ----------
 
 /// Команда yt-dlp («yt-dlp» или «python -m yt_dlp» из переменной YTDLP).
-pub(crate) fn ytdlp_command(data: &Data) -> tokio::process::Command {
-    let mut parts = data.ytdlp.split_whitespace();
-    let mut command = tokio::process::Command::new(parts.next().unwrap_or("yt-dlp"));
-    command.args(parts).stdin(Stdio::null()).kill_on_drop(true);
+fn downloader_environment() -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os().filter(|(key, _)| {
+        matches!(
+            key.to_string_lossy().to_ascii_uppercase().as_str(),
+            "PATH" | "PATHEXT" | "HOME" | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA"
+                | "SYSTEMROOT" | "WINDIR" | "TEMP" | "TMP" | "TMPDIR"
+                | "LANG" | "LC_ALL" | "LC_CTYPE" | "XDG_CONFIG_HOME" | "XDG_CACHE_HOME"
+                | "SSL_CERT_FILE" | "SSL_CERT_DIR" | "DENO_DIR" | "VIRTUAL_ENV"
+        )
+    })
+}
+
+fn downloader(data: &Data) -> std::process::Command {
+    let (program, args) = crate::ytdlp_parts(&data.ytdlp);
+    let mut command = std::process::Command::new(program);
     command
+        .args(args.split_whitespace())
+        .env_clear()
+        .envs(downloader_environment())
+        .stdin(Stdio::null())
+        .args(["--use-extractors", "youtube.*,soundcloud.*", "--socket-timeout", "15"]);
+    command
+}
+
+pub(crate) fn ytdlp_command(data: &Data) -> tokio::process::Command {
+    let mut command = tokio::process::Command::from(downloader(data));
+    command.kill_on_drop(true);
+    command
+}
+
+pub(crate) async fn downloader_output(
+    mut command: tokio::process::Command,
+) -> Result<std::process::Output, Error> {
+    use tokio::io::{AsyncRead, AsyncReadExt};
+
+    async fn capped(reader: impl AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        reader.take(limit + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::other("yt-dlp превысил лимит вывода"));
+        }
+        Ok(bytes)
+    }
+
+    static DOWNLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let _permit = DOWNLOADS.acquire().await?;
+        let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let stdout = child.stdout.take().ok_or("yt-dlp stdout недоступен")?;
+        let stderr = child.stderr.take().ok_or("yt-dlp stderr недоступен")?;
+        let result = tokio::try_join!(
+            capped(stdout, 16 * 1024 * 1024),
+            capped(stderr, 64 * 1024),
+            child.wait(),
+        );
+        match result {
+            Ok((stdout, stderr, status)) => Ok(std::process::Output {stdout, stderr, status}),
+            Err(error) => {
+                let _ = child.kill().await;
+                Err(error.into())
+            }
+        }
+    })
+    .await
+    .map_err(|_| "yt-dlp ждал дольше минуты")?
 }
 
 /// Ищет трек. Возвращает (название, ссылка на страницу трека) — звук по ней качается заново перед включением.
@@ -342,10 +458,10 @@ async fn search(data: &Data, query: &str) -> Result<(String, String), Error> {
             "--print",
             "webpage_url",
         ])
-        .arg(ytdlp_target(query));
-    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .arg("--")
+        .arg(ytdlp_target(query, 1)?);
+    let output = downloader_output(command)
         .await
-        .map_err(|_| "yt-dlp думал дольше минуты")?
         .map_err(|error| {
             format!(
                 "не получилось запустить yt-dlp (`{}`): {error}. Задай переменную YTDLP",
@@ -368,15 +484,25 @@ async fn search(data: &Data, query: &str) -> Result<(String, String), Error> {
 
 /// id видео YouTube из ссылки (v=…, youtu.be/…, /shorts/…).
 pub fn youtube_id(url: &str) -> Option<String> {
-    ["v=", "youtu.be/", "/shorts/"].iter().find_map(|marker| {
-        let start = url.find(marker)? + marker.len();
-        let id: String = url[start..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .take(11)
-            .collect();
-        (id.chars().count() == 11).then_some(id)
-    })
+    let url = provider_url(url)?;
+    let id = match url.host_str()? {
+        "youtu.be" => url.path_segments()?.next()?.to_owned(),
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com"
+        | "www.youtube-nocookie.com" => {
+            if url.path() == "/watch" {
+                url.query_pairs().find(|(key, _)| key == "v")?.1.into_owned()
+            } else {
+                let mut parts = url.path_segments()?;
+                if !matches!(parts.next()?, "shorts" | "live" | "embed" | "v") {
+                    return None;
+                }
+                parts.next()?.to_owned()
+            }
+        }
+        _ => return None,
+    };
+    (id.len() == 11 && id.bytes().all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)))
+        .then_some(id)
 }
 
 /// Строки yt-dlp «id, название, id, название…» → треки без самого видео.
@@ -416,11 +542,12 @@ async fn similar_tracks(data: &Data, url: &str) -> Vec<(String, String)> {
             "--print",
             "title",
         ])
+        .arg("--")
         .arg(format!(
             "https://www.youtube.com/watch?v={video}&list=RD{video}"
         ));
-    match tokio::time::timeout(Duration::from_secs(60), command.output()).await {
-        Ok(Ok(output)) => parse_mix(&String::from_utf8_lossy(&output.stdout), &video),
+    match downloader_output(command).await {
+        Ok(output) if output.status.success() => parse_mix(&String::from_utf8_lossy(&output.stdout), &video),
         other => {
             println!("Автоплей: не получилось найти похожие треки: {other:?}");
             Vec::new()
@@ -544,6 +671,25 @@ async fn join_inner(
 }
 
 /// Replay a selected saved song through the normal queue/resolver/play_next flow.
+async fn join_for_command(ctx: Context<'_>, guild: serenity::GuildId) -> Result<(), Error> {
+    let discord = ctx.serenity_context();
+    let data = ctx.data();
+    let _operation = data.music.voice_operation(guild.get()).await;
+    if !crate::music_channels::ctx_allowed(ctx)? {
+        return Err("Используй настроенный музыкальный канал.".into());
+    }
+    let voice = user_channel(discord, guild, ctx.author().id).ok_or("Сначала зайди в голосовой канал.")?;
+    join_inner(discord, guild, voice).await.map_err(|error| format!("Не получилось зайти в голосовой канал: {error}"))?;
+    let bot = bot_channel(discord, guild).await;
+    if bot.is_none_or(|bot| bot.0.get() != voice.get())
+        || user_channel(discord, guild, ctx.author().id) != Some(voice)
+        || !crate::music_channels::ctx_allowed(ctx)?
+    {
+        return Err("Голосовой или музыкальный канал изменился.".into());
+    }
+    Ok(())
+}
+
 /// Callers must defer their interaction before awaiting this helper.
 pub async fn enqueue_saved(
     ctx: &serenity::Context,
@@ -670,14 +816,136 @@ impl songbird::EventHandler for LibraryPlayback {
     }
 }
 
+struct AudioDownload(Mutex<Option<std::process::Child>>);
+
+impl AudioDownload {
+    fn stop(&self) {
+        if let Some(mut child) = locked(&self.0).take() {
+            let mut cleanup = move || {
+                let _ = child.kill();
+                if let Err(error) = child.wait() {
+                    eprintln!("yt-dlp cleanup: {error}");
+                }
+            };
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn_blocking(cleanup);
+            } else {
+                cleanup();
+            }
+        }
+    }
+}
+
+struct PlaybackPipe {
+    stdout: std::process::ChildStdout,
+    download: Arc<AudioDownload>,
+}
+
+impl std::io::Read for PlaybackPipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stdout.read(buffer)
+    }
+}
+
+impl Drop for PlaybackPipe {
+    fn drop(&mut self) {
+        self.download.stop();
+    }
+}
+
+const STDERR_TAIL: usize = 20_000;
+
+fn append_tail(log: &mut Vec<u8>, bytes: &[u8]) {
+    let bytes = &bytes[bytes.len().saturating_sub(STDERR_TAIL)..];
+    let remove = (log.len() + bytes.len()).saturating_sub(STDERR_TAIL);
+    log.drain(..remove);
+    log.extend_from_slice(bytes);
+}
+
+fn audio_download(
+    data: &Data,
+    url: &reqwest::Url,
+) -> std::io::Result<(Input, Arc<AudioDownload>, Arc<Mutex<Vec<u8>>>)> {
+    use std::io::Read;
+
+    let mut child = downloader(data)
+        .args([
+            "--format", "bestaudio/best", "--no-playlist", "--quiet", "--no-warnings",
+            "--no-part", "--output", "-", "--",
+        ])
+        .arg(url.as_str())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("yt-dlp output is piped");
+    let stderr = child.stderr.take().expect("yt-dlp errors are piped");
+    let download = Arc::new(AudioDownload(Mutex::new(Some(child))));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let tail = log.clone();
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buffer = [0; 4096];
+        while let Ok(size @ 1..) = stderr.read(&mut buffer) {
+            append_tail(&mut locked(&tail), &buffer[..size]);
+        }
+    });
+    let pipe = PlaybackPipe { stdout, download: download.clone() };
+    let input = Input::Live(
+        LiveInput::Raw(AudioStream {
+            input: Box::new(symphonia::core::io::ReadOnlySource::new(pipe)),
+        }),
+        None,
+    );
+    Ok((input, download, log))
+}
+
+/// Check actual playout progress, including a decoder stalled on the input pipe.
+async fn watch_playback(handle: TrackHandle, end: TrackEnd) {
+    let mut progress = Instant::now();
+    let mut played = Duration::ZERO;
+    while !end.done.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match tokio::time::timeout(Duration::from_secs(2), handle.get_info()).await {
+            Ok(Ok(info)) if matches!(info.playing, PlayMode::Play | PlayMode::Pause) => {
+                if info.play_time > played || info.playing == PlayMode::Pause {
+                    progress = Instant::now();
+                }
+                played = info.play_time;
+            }
+            Ok(Ok(info)) => {
+                let error = match info.playing {
+                    PlayMode::Errored(error) => Some(error.to_string()),
+                    _ => None,
+                };
+                end.complete(info.play_time, error);
+                return;
+            }
+            Ok(Err(_)) => {
+                end.complete(played, Some("источник аудио исчез".into()));
+                return;
+            }
+            Err(_) => {}
+        }
+        if progress.elapsed() >= Duration::from_secs(45) && end.complete(
+            played,
+            Some("yt-dlp не передавал звук 45 секунд".into()),
+        ) {
+            let _ = handle.stop();
+            return;
+        }
+    }
+}
+
 /// Обработчик «трек закончился» (или сломался).
+#[derive(Clone)]
 struct TrackEnd {
     ctx: serenity::Context,
     data: Shared,
     guild: serenity::GuildId,
     channel: serenity::ChannelId,
     title: String,
-    log: Arc<Mutex<String>>,                  // что написал yt-dlp
+    log: Arc<Mutex<Vec<u8>>>,
+    download: Arc<AudioDownload>,
     done: Arc<std::sync::atomic::AtomicBool>, // End и Error могут прийти оба — обрабатываем один раз
     library: Option<LibraryPlayback>,
     instance: String,
@@ -686,9 +954,6 @@ struct TrackEnd {
 #[async_trait::async_trait]
 impl songbird::EventHandler for TrackEnd {
     async fn act(&self, event: &EventContext<'_>) -> Option<Event> {
-        if self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return None;
-        }
         if let Some(library) = &self.library {
             library.observe(event); // catches a manual skip after 3s but before the next periodic tick
         }
@@ -704,25 +969,26 @@ impl songbird::EventHandler for TrackEnd {
             }
             _ => (Duration::ZERO, None),
         };
-        let (ctx, data, guild, channel, title, log) = (
-            self.ctx.clone(),
-            self.data.clone(),
-            self.guild,
-            self.channel,
-            self.title.clone(),
-            self.log.clone(),
-        );
-        let instance = self.instance.clone();
+        self.complete(played, error);
+        Some(Event::Cancel)
+    }
+}
+
+impl TrackEnd {
+    fn complete(&self, played: Duration, error: Option<String>) -> bool {
+        if self.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        self.download.stop();
+        let end = self.clone();
         tokio::spawn(async move {
-            // yt-dlp мог ещё дописывать сообщение об ошибке — даём ему мгновение
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let details = locked(&log).clone();
+            let details = String::from_utf8_lossy(&locked(&end.log)).into_owned();
             on_track_end(
-                &ctx, &data, guild, channel, &title, played, error, &details, &instance,
-            )
-            .await;
+                &end.ctx, &end.data, end.guild, end.channel, &end.title, played,
+                error, &details, &end.instance,
+            ).await;
         });
-        None
+        true
     }
 }
 
@@ -739,35 +1005,36 @@ async fn on_track_end(
     details: &str,
     instance: &str,
 ) {
-    let lock = data.music.lock_for(guild.get());
-    let guard = lock.lock().await;
-    if !data.music.with(guild.get(), |state| {
-        state.instance.as_deref() == Some(instance)
-    }) {
-        return;
-    }
-    let disconnected = bot_channel(ctx, guild).await.is_none();
-    let (skipped, repeat) = data
-        .music
-        .with(guild.get(), |state| (state.skipped, state.repeat));
-    let failed = !skipped && (error.is_some() || played < TRACK_TOO_SHORT);
-    let transition = if disconnected {
-        crate::music_runtime::return_current(&data.db, guild.get()).map(|_| ())
-    } else {
-        crate::music_runtime::finish(&data.db, guild.get(), repeat && !skipped && !failed)
+    let mut delay = Duration::from_secs(1);
+    let (playing_url, skipped, repeat, failed, disconnected, voice_generation) = loop {
+        let lock = data.music.lock_for(guild.get());
+        let guard = lock.lock().await;
+        let (matches, skipped, repeat, voice_generation) = data.music.with(guild.get(), |state| {
+            (state.instance.as_deref() == Some(instance), state.skipped, state.repeat, state.voice_generation)
+        });
+        if !matches {
+            return;
+        }
+        let disconnected = bot_channel(ctx, guild).await.is_none();
+        let failed = !skipped && (error.is_some() || played < TRACK_TOO_SHORT);
+        let transition = if disconnected {
+            crate::music_runtime::return_current(&data.db, guild.get()).map(|_| ())
+        } else {
+            crate::music_runtime::finish(&data.db, guild.get(), repeat && !skipped && !failed)
+        };
+        if let Err(error) = transition {
+            eprintln!("Playback retirement: {error}");
+            drop(guard);
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+            continue;
+        }
+        let Some((playing_url, skipped, repeat)) = data.music.with(
+            guild.get(), |state| take_playback(state, instance),
+        ) else { return };
+        crate::music_runtime::queue_changed(data, guild.get());
+        break (playing_url, skipped, repeat, failed, disconnected, voice_generation);
     };
-    if let Err(error) = transition {
-        println!("Playback retirement: {error}");
-        return; // Keep the durable claim: startup recovery can still restore it.
-    }
-    let Some((playing_url, skipped, repeat)) = data
-        .music
-        .with(guild.get(), |state| take_playback(state, instance))
-    else {
-        return;
-    };
-    crate::music_runtime::queue_changed(data, guild.get());
-    drop(guard);
     if disconnected {
         return;
     }
@@ -799,7 +1066,7 @@ async fn on_track_end(
     if !repeat || skipped || failed {
         if let (Some(url), false) = (&playing_url, failed) {
             if data.db.queue_count(guild.get()).unwrap_or(1) == 0 {
-                autoplay_add(ctx, data, guild, channel, url).await;
+                autoplay_add(ctx, data, guild, channel, url, voice_generation).await;
             }
         }
     }
@@ -829,11 +1096,21 @@ pub async fn play_next(
     {
         return; // не в канале или что-то уже играет
     }
-    // Пробуем треки по очереди, пока какой-нибудь не найдётся
+    // With no live instance under the playback lock, a current row is an
+    // abandoned selection. It can be put back without touching active audio.
+    if let Err(error) = crate::music_runtime::return_current(&data.db, guild.get()) {
+        eprintln!("Playback claim recovery: {error}");
+        return;
+    }
     let (item, title, url, details) = loop {
-        let Ok(Some(item)) = crate::music_runtime::claim(&data.db, guild.get()) else {
-            return;
-        }; // очередь закончилась
+        let item = match crate::music_runtime::claim(&data.db, guild.get()) {
+            Ok(Some(item)) => item,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("Playback claim: {error}");
+                return;
+            }
+        };
         let prefetched = crate::music_runtime::take_prefetched(data, guild.get(), &item);
         crate::music_runtime::queue_changed(data, guild.get());
         let resolved = match prefetched {
@@ -899,119 +1176,87 @@ pub async fn play_next(
         crate::music_runtime::queue_changed(data, guild.get());
         return;
     }
-    // Звук качает yt-dlp и отдаёт его через «трубу»; его сообщения собираем — покажем, если трек оборвётся
-    let mut command =
-        std::process::Command::new(data.ytdlp.split_whitespace().next().unwrap_or("yt-dlp"));
-    command
-        .args(data.ytdlp.split_whitespace().skip(1))
-        .args([
-            "--format",
-            "bestaudio/best",
-            "--no-playlist",
-            "--quiet",
-            "--no-warnings",
-            "--no-part",
-            "--output",
-            "-",
-        ])
-        .arg(&url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let Some(target) = provider_url(&url) else {
+        if let Err(error) = crate::music_runtime::finish(&data.db, guild.get(), false) {
+            eprintln!("Playback invalid target retirement: {error}");
+        }
+        return;
+    };
+    let (input, download, log) = match audio_download(data, &target) {
+        Ok(stream) => stream,
         Err(error) => {
             if let Err(error) = crate::music_runtime::return_current(&data.db, guild.get()) {
-                println!("Playback return: {error}");
+                eprintln!("Playback return: {error}");
             }
             crate::music_runtime::queue_changed(data, guild.get());
-            say_in(
-                ctx,
-                channel,
-                &format!("⚠️ Не получилось запустить yt-dlp: `{error}`"),
-            )
-            .await;
+            drop(_guard);
+            say_in(ctx, channel, &format!("⚠️ Не получилось запустить yt-dlp: {error}")).await;
             return;
         }
     };
-    let log = Arc::new(Mutex::new(String::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let log = log.clone();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stderr)
-                .lines()
-                .map_while(Result::ok)
-            {
-                let mut log = locked(&log);
-                log.push_str(&line);
-                log.push('\n');
-                if log.len() > 20_000 {
-                    log.drain(..10_000); // держим только конец
-                }
-            }
-        });
-    }
-    let input: Input = ChildContainer::from(child).into();
-    let volume = data
-        .music
-        .with(guild.get(), |state| state.volume.unwrap_or(1.0));
-    let handle = {
-        let mut call = call.lock().await;
-        if call.current_channel().is_none() {
-            drop(input);
-            if let Err(error) = crate::music_runtime::return_current(&data.db, guild.get()) {
-                println!("Playback voice loss: {error}");
-            }
-            crate::music_runtime::queue_changed(data, guild.get());
-            return;
+    let volume = data.music.with(guild.get(), |state| state.volume.unwrap_or(1.0));
+    let mut track = Track::new(input).volume(volume);
+    let instance = track.uuid.to_string();
+    let snapshot = match crate::music_library::snapshot(&data.db, guild.get(), &url, &title, &details) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            eprintln!("Снимок трека: {error}");
+            None
         }
-        call.play_input(input)
     };
-    let _ = handle.set_volume(volume);
-    let snapshot =
-        match crate::music_library::snapshot(&data.db, guild.get(), &url, &title, &details) {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => {
-                println!("Снимок трека: {error}");
-                None
-            }
-        };
     let library = snapshot.as_ref().map(|snapshot| LibraryPlayback {
         data: data.clone(),
         guild: guild.get(),
         snapshot_id: snapshot.id,
-        instance: handle.uuid().to_string(),
+        instance: instance.clone(),
         confirmed: Arc::new(Mutex::new(false)),
     });
     if let Some(library) = &library {
-        let _ = handle.add_event(
-            Event::Periodic(Duration::from_secs(1), None),
-            library.clone(),
+        track.events.add_event(
+            EventData::new(Event::Periodic(Duration::from_secs(1), None), library.clone()),
+            Duration::ZERO,
         );
     }
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let end = || TrackEnd {
+    let end = TrackEnd {
         ctx: ctx.clone(),
         data: data.clone(),
         guild,
         channel,
         title: title.clone(),
-        log: log.clone(),
-        done: done.clone(),
-        library: library.clone(),
-        instance: handle.uuid().to_string(),
+        log,
+        download,
+        done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        library,
+        instance: instance.clone(),
     };
-    data.music.with(guild.get(), |state| {
-        state.details = details.clone();
-        state.instance = Some(handle.uuid().to_string());
-        state.track = Some(handle.clone());
-        state.now_playing = Some((item.0, title.clone()));
-        state.playing_url = Some(url.clone());
-        state.skipped = false;
-    });
-    let _ = handle.add_event(Event::Track(TrackEvent::End), end());
-    let _ = handle.add_event(Event::Track(TrackEvent::Error), end());
+    for event in [TrackEvent::End, TrackEvent::Error] {
+        track.events.add_event(
+            EventData::new(Event::Track(event), end.clone()),
+            Duration::ZERO,
+        );
+    }
+    {
+        let mut call = call.lock().await;
+        if call.current_channel().is_none() {
+            drop(track);
+            if let Err(error) = crate::music_runtime::return_current(&data.db, guild.get()) {
+                eprintln!("Playback voice loss: {error}");
+            }
+            crate::music_runtime::queue_changed(data, guild.get());
+            return;
+        }
+        let handle = call.play(track);
+        data.music.with(guild.get(), |state| {
+            state.details = details.clone();
+            state.instance = Some(instance);
+            state.snapshot_id = snapshot.as_ref().map(|snapshot| snapshot.id);
+            state.track = Some(handle.clone());
+            state.now_playing = Some((item.0, title.clone()));
+            state.playing_url = Some(url.clone());
+            state.skipped = false;
+        });
+        tokio::spawn(watch_playback(handle, end));
+    }
     crate::music_runtime::queue_changed(data, guild.get());
     drop(_guard);
     let message = serenity::CreateMessage::new()
@@ -1045,6 +1290,7 @@ async fn autoplay_add(
     guild: serenity::GuildId,
     channel: serenity::ChannelId,
     url: &str,
+    voice_generation: u64,
 ) {
     if !data.db.autoplay(guild.get()).unwrap_or(false) {
         return;
@@ -1065,6 +1311,7 @@ async fn autoplay_add(
     if !listeners {
         return; // в канале никого нет — не играем в пустоту
     }
+    let generation = data.music.with(guild.get(), |state| state.autoplay_generation);
     let recent = {
         let mut all = locked(&data.music.autoplay_recent);
         let recent = all.entry(guild.get()).or_default();
@@ -1085,7 +1332,24 @@ async fn autoplay_add(
     else {
         return;
     };
-    if data.db.queue_add(guild.get(), &link, &title).is_ok() {
+    let lock = data.music.lock_for(guild.get());
+    let guard = lock.lock().await;
+    if bot_channel(ctx, guild).await != Some(voice) || !data.music.with(guild.get(), |state| {
+        state.voice_generation == voice_generation && state.autoplay_generation == generation
+            && state.instance.is_none()
+    }) {
+        return;
+    }
+    let added = data.db.lock().execute(
+        "INSERT INTO queue(guild_id,url,title,sort_order,details)
+         SELECT ?1,?2,?3,1,?4
+         WHERE EXISTS (SELECT 1 FROM music_settings WHERE guild_id=?1 AND autoplay=1)
+         AND NOT EXISTS (SELECT 1 FROM queue WHERE guild_id=?1)
+         AND NOT EXISTS (SELECT 1 FROM music_current WHERE guild_id=?1)",
+        params![guild.get() as i64, link, title, serde_json::json!({"request_id": rand::random::<u64>()}).to_string()],
+    );
+    drop(guard);
+    if matches!(added, Ok(1)) {
         crate::music_runtime::queue_changed(data, guild.get());
         say_in(
             ctx,
@@ -1107,17 +1371,10 @@ pub async fn play(
     query: String,
 ) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap());
-    let Some(voice) = user_channel(ctx.serenity_context(), guild, ctx.author().id) else {
-        return whisper(ctx, "Сначала зайди в голосовой канал.").await;
-    };
-    ctx.defer().await?; // поиск дольше 3 секунд, которые даёт Discord
+    ctx.defer().await?;
     let was_playing = current_mode(data, guild.get()).await.is_some();
-    if let Err(error) = join(ctx.serenity_context(), data, guild, voice).await {
-        ctx.say(format!(
-            "⚠️ Не получилось зайти в голосовой канал: `{error}`"
-        ))
-        .await?;
-        return Ok(());
+    if let Err(error) = join_for_command(ctx, guild).await {
+        return whisper(ctx, error.to_string()).await;
     }
     let mut details = serde_json::json!({"requester":ctx.author().id.get(),"original":query});
     let mut query = query;
@@ -1237,10 +1494,10 @@ pub async fn play(
     let Some(selected) = selected else {
         return Ok(());
     };
-    if !crate::music_qol::same_voice(ctx) {
+    if !crate::music_qol::mutation_allowed(ctx)? {
         return whisper(
             ctx,
-            "Ты вышел из голосового канала бота — трек не добавлен.",
+            "Голосовой или музыкальный канал изменился — трек не добавлен.",
         )
         .await;
     }
@@ -1276,40 +1533,59 @@ pub async fn play(
 #[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
-    if current_mode(data, guild).await != Some(PlayMode::Play) {
+    let expected = data.music.with(guild, |state| state.instance.clone());
+    let lock = data.music.lock_for(guild);
+    let guard = lock.lock().await;
+    if !crate::music_qol::mutation_allowed(ctx)? {
+        drop(guard);
+        return whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
+    }
+    let skipped = stop_current(data, guild, expected.as_deref())?;
+    drop(guard);
+    if !skipped {
         return whisper(ctx, NOT_PLAYING).await;
     }
-    stop_current(data, guild).await?;
     ctx.say("⏭️ Пропущено.").await?;
     Ok(())
 }
 
-/// Останавливает текущий трек как «пропущенный» (это не ошибка звука). Следующий включит обработчик конца трека.
-async fn stop_current(data: &Shared, guild: u64) -> Result<(), Error> {
-    let lock = data.music.lock_for(guild);
-    let _guard = lock.lock().await;
-    // A crash after /skip must not resurrect the skipped request.
+/// Caller holds the guild playback lock, including the permission check.
+fn stop_current(data: &Shared, guild: u64, expected: Option<&str>) -> Result<bool, Error> {
+    let Some(expected) = expected else { return Ok(false) };
+    let Some(track) = data.music.with(guild, |state| {
+        (state.instance.as_deref() == Some(expected)).then(|| state.track.clone()).flatten()
+    }) else { return Ok(false) };
     crate::music_runtime::finish(&data.db, guild, false)?;
-    if let Some(track) = data.music.with(guild, |state| {
-        state.skipped = true;
-        state.track.clone()
-    }) {
-        track.stop()?;
-    }
+    data.music.with(guild, |state| state.skipped = true);
+    // The watchdog also retires the instance if its event source has disappeared.
+    let _ = track.stop();
     crate::music_runtime::queue_changed(data, guild);
-    Ok(())
+    Ok(true)
 }
 
 /// Поставить на паузу
 #[poise::command(slash_command, guild_only)]
 pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
-    if current_mode(data, guild).await != Some(PlayMode::Play) {
-        return whisper(ctx, NOT_PLAYING).await;
+    let expected = data.music.with(guild, |state| state.instance.clone());
+    let lock = data.music.lock_for(guild);
+    let guard = lock.lock().await;
+    let mode = current_mode(data, guild).await;
+    if !crate::music_qol::mutation_allowed(ctx)? {
+        drop(guard);
+        return whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
     }
-    if let Some(track) = data.music.with(guild, |state| state.track.clone()) {
-        track.pause()?;
+    let track = data.music.with(guild, |state| {
+        (state.instance == expected).then(|| state.track.clone()).flatten()
+    });
+    match (mode, track) {
+        (Some(PlayMode::Play), Some(track)) => track.pause()?,
+        _ => {
+            drop(guard);
+            return whisper(ctx, NOT_PLAYING).await;
+        }
     }
+    drop(guard);
     ctx.say("⏸️ Пауза.").await?;
     Ok(())
 }
@@ -1318,31 +1594,38 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(slash_command, guild_only)]
 pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap());
+    let expected = data.music.with(guild.get(), |state| state.instance.clone());
+    let lock = data.music.lock_for(guild.get());
+    let guard = lock.lock().await;
     let mode = current_mode(data, guild.get()).await;
     if mode == Some(PlayMode::Pause) {
-        if let Some(track) = data.music.with(guild.get(), |state| state.track.clone()) {
-            track.play()?;
+        if !crate::music_qol::mutation_allowed(ctx)? {
+            drop(guard);
+            return whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
         }
-        ctx.say("▶️ Продолжаю.").await?;
-        return Ok(());
+        let track = data.music.with(guild.get(), |state| {
+            (state.instance == expected).then(|| state.track.clone()).flatten()
+        });
+        drop(guard);
+        if let Some(track) = track {
+            track.play()?;
+            ctx.say("▶️ Продолжаю.").await?;
+            return Ok(());
+        }
+        return whisper(ctx, "Трек уже сменился.").await;
     }
-    let waiting = data.db.queue_count(guild.get())?;
-    if waiting == 0 {
-        return whisper(ctx, "Очередь пуста — включи что-нибудь через /play.").await;
-    }
+    let waiting = data.db.queue_count(guild.get())?
+        + usize::from(expected.is_none() && crate::music_runtime::has_current(&data.db, guild.get())?);
+    drop(guard);
     if mode.is_some() {
         return whisper(ctx, "Музыка и так играет 🙂").await;
     }
-    let Some(voice) = user_channel(ctx.serenity_context(), guild, ctx.author().id) else {
-        return whisper(ctx, "Сначала зайди в голосовой канал.").await;
-    };
+    if waiting == 0 {
+        return whisper(ctx, "Очередь пуста — включи что-нибудь через /play.").await;
+    }
     ctx.defer().await?;
-    if let Err(error) = join(ctx.serenity_context(), data, guild, voice).await {
-        ctx.say(format!(
-            "⚠️ Не получилось зайти в голосовой канал: `{error}`"
-        ))
-        .await?;
-        return Ok(());
+    if let Err(error) = join_for_command(ctx, guild).await {
+        return whisper(ctx, error.to_string()).await;
     }
     ctx.say(format!(
         "▶️ Продолжаю сохранённую очередь: {}.",
@@ -1371,6 +1654,15 @@ pub async fn remove_all(ctx: Context<'_>) -> Result<(), Error> {
         return whisper(ctx, "Очередь уже пуста.").await;
     }
     if !crate::qol::confirm(ctx,format!("Очистить очередь? Удалится треков: {}. Новые заявки, добавленные после этого вопроса, останутся.",snapshot.len())).await?{return Ok(())}
+    let can_clear_others = ctx.author_member().await.is_some_and(|member| {
+        crate::moderation::permissions(ctx.serenity_context(), ctx.guild_id().unwrap(), &member).manage_guild()
+    });
+    if !crate::music_qol::mutation_allowed(ctx)? {
+        return whisper(ctx, "Голосовой или музыкальный канал изменился.").await;
+    }
+    if !can_clear_others && snapshot.iter().any(|track| track.details["requester"].as_u64() != Some(ctx.author().id.get())) {
+        return whisper(ctx, "Для удаления чужих треков нужно право «Управлять сервером». Свои треки можно удалить через /queue_clear_mine.").await;
+    }
     let removed = crate::music_qol::remove_snapshot(data, guild, &snapshot)?;
     crate::music_runtime::queue_changed(data, guild);
     let mut text = format!("🗑️ Очередь очищена, удалено треков: {removed}.");
@@ -1390,6 +1682,12 @@ pub async fn setvolume(
     #[max = 200]
     level: u32,
 ) -> Result<(), Error> {
+    let lock = ctx.data().music.lock_for(ctx.guild_id().unwrap().get());
+    let guard = lock.lock().await;
+    if !crate::music_qol::mutation_allowed(ctx)? {
+        drop(guard);
+        return whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
+    }
     let volume = level.min(200) as f32 / 100.0;
     let track = ctx
         .data()
@@ -1401,6 +1699,7 @@ pub async fn setvolume(
     if let Some(track) = track {
         let _ = track.set_volume(volume); // и для той, что играет
     }
+    drop(guard);
     ctx.say(format!("🔊 Громкость: **{}%**", level.min(200)))
         .await?;
     Ok(())
@@ -1417,7 +1716,16 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         return whisper(ctx, "Я и так не в канале.").await;
     }
     ctx.defer().await?;
-    disconnect_saved(ctx.serenity_context(), data, guild).await?;
+    {
+        let _operation = data.music.voice_operation(guild.get()).await;
+        let lock = data.music.lock_for(guild.get());
+        let guard = lock.lock().await;
+        if !crate::music_qol::mutation_allowed(ctx)? {
+            drop(guard);
+            return whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
+        }
+        disconnect_saved_locked(ctx.serenity_context(), data, guild).await?;
+    }
     let saved = data.db.queue_count(guild.get())?;
     let mut text = "👋 Вышел из канала.".to_string();
     if saved > 0 {
@@ -1436,6 +1744,7 @@ pub async fn autoplay(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
     let enabled = !data.db.autoplay(guild)?;
     data.db.set_autoplay(guild, enabled)?;
+    data.music.with(guild, |state| state.autoplay_generation = state.autoplay_generation.wrapping_add(1));
     ctx.say(if enabled {
         "📻 Автоплей включён: когда очередь закончится, я сам подберу похожий трек (работает для треков с YouTube)."
     } else {
@@ -1449,6 +1758,9 @@ async fn playlist_autocomplete(
     ctx: Context<'_>,
     current: &str,
 ) -> serenity::CreateAutocompleteResponse {
+    if !crate::music_channels::ctx_allowed(ctx).unwrap_or(false) {
+        return serenity::CreateAutocompleteResponse::new();
+    }
     let names = ctx
         .guild_id()
         .and_then(|guild| ctx.data().db.playlists(guild.get()).ok())
@@ -1473,45 +1785,31 @@ pub async fn playlist_save(
     #[max_length = 40]
     name: String,
 ) -> Result<(), Error> {
-    let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
-    let name = name.trim().to_string();
-    let current = data.music.with(guild, |state| {
-        state
-            .now_playing
-            .clone()
-            .map(|track| (track, state.details.clone()))
+    let (data, guild) = (ctx.data(), ctx.guild_id().unwrap());
+    let name = name.trim();
+    let can_replace = ctx.author_member().await.is_some_and(|member| {
+        crate::moderation::permissions(ctx.serenity_context(), guild, &member).manage_guild()
     });
-    let mut saved: Vec<_> = current.into_iter().collect();
-    saved.extend(
-        crate::music_qol::items(data, guild)?
-            .into_iter()
-            .map(|item| ((item.url, item.title), item.details)),
-    );
-    saved.truncate(MAX_PLAYLIST_SAVE);
-    let tracks: Vec<_> = saved.iter().map(|(track, _)| track.clone()).collect();
+    if !crate::music_channels::ctx_allowed(ctx)? {
+        return whisper(ctx, "Используй настроенный музыкальный канал.").await;
+    }
+    let lock = data.music.lock_for(guild.get());
+    let guard = lock.lock().await;
+    let mut tracks: Vec<_> = data.music.with(guild.get(), |state| {
+        state.now_playing.as_ref().map(|(url, title)| (url.clone(), title.clone(), state.details.clone()))
+    }).into_iter().collect();
+    let queued = crate::music_qol::queue_slice(data, guild.get(), MAX_PLAYLIST_SAVE - tracks.len(), 0)?;
+    tracks.extend(queued.into_iter().map(|item| (item.url, item.title, item.details)));
     if name.is_empty() || tracks.is_empty() {
-        return whisper(
-            ctx,
-            "Сохранять нечего: сейчас ничего не играет и очередь пуста.",
-        )
-        .await;
+        drop(guard);
+        return whisper(ctx, "Сохранять нечего: укажи название и добавь трек.").await;
     }
-    let names = data.db.playlists(guild)?;
-    if !names.iter().any(|(existing, _)| *existing == name) && names.len() >= MAX_PLAYLISTS {
-        return whisper(
-            ctx,
-            format!(
-                "На сервере уже {MAX_PLAYLISTS} плейлистов — удали ненужный: /playlist_delete."
-            ),
-        )
-        .await;
-    }
-    data.db.save_playlist(guild, &name, &tracks)?;
-    {
-        let conn = data.db.lock();
-        for (i, ((url, title), details)) in saved.iter().enumerate() {
-            conn.execute("UPDATE playlists SET details=?1 WHERE guild_id=?2 AND name=?3 AND position=?4 AND url=?5 AND title=?6",params![details.to_string(),guild as i64,name,i as i64,url,title])?;
-        }
+    let saved = data.db.save_playlist(guild.get(), name, &tracks, can_replace)?;
+    drop(guard);
+    match saved {
+        SavePlaylist::Saved => {}
+        SavePlaylist::Denied => return whisper(ctx, "Заменять плейлист может участник с правом «Управлять сервером».").await,
+        SavePlaylist::Limit => return whisper(ctx, format!("На сервере уже {MAX_PLAYLISTS} плейлистов. Удаление — /playlist_delete.")).await,
     }
     ctx.say(format!(
         "💾 Плейлист **{name}** сохранён: {}. Включить — /playlist_play.",
@@ -1534,39 +1832,22 @@ pub async fn playlist_play(
     if tracks.is_empty() {
         return whisper(ctx, "Такого плейлиста нет — выбери из списка (/playlists).").await;
     }
-    let Some(voice) = user_channel(ctx.serenity_context(), guild, ctx.author().id) else {
-        return whisper(ctx, "Сначала зайди в голосовой канал.").await;
-    };
     ctx.defer().await?;
-    if let Err(error) = join(ctx.serenity_context(), data, guild, voice).await {
-        ctx.say(format!(
-            "⚠️ Не получилось зайти в голосовой канал: `{error}`"
-        ))
-        .await?;
-        return Ok(());
+    if let Err(error) = join_for_command(ctx, guild).await {
+        return whisper(ctx, error.to_string()).await;
     }
-    for (index, (url, title)) in tracks.iter().enumerate() {
-        let stored: Option<String> = data
-            .db
-            .lock()
-            .query_row(
-                "SELECT details FROM playlists WHERE guild_id=?1 AND name=?2 AND position=?3",
-                params![guild.get() as i64, name, index as i64],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        let mut meta = stored
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| serde_json::json!({"original":url}));
-        meta["requester"] = ctx.author().id.get().into();
-        crate::music_qol::enqueue(data, guild.get(), url, title, &meta, false)?;
-        crate::music_runtime::queue_changed(data, guild.get());
-    }
+    let count = crate::music_qol::enqueue_batch(
+        data, guild.get(),
+        tracks.into_iter().map(|(url, title, mut details)| {
+            details["requester"] = ctx.author().id.get().into();
+            (url, title, details)
+        }),
+        false,
+    )?;
+    crate::music_runtime::queue_changed(data, guild.get());
     ctx.say(format!(
         "📜 Плейлист **{name}**: добавил в очередь {}.",
-        tracks_text(tracks.len())
+        tracks_text(count)
     ))
     .await?;
     play_next(ctx.serenity_context(), data, guild, ctx.channel_id()).await;
@@ -1594,7 +1875,11 @@ pub async fn show_playlists(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Удалить сохранённый плейлист сервера
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD")]
+#[poise::command(
+    slash_command, guild_only,
+    default_member_permissions = "MANAGE_GUILD",
+    required_permissions = "MANAGE_GUILD"
+)]
 pub async fn playlist_delete(
     ctx: Context<'_>,
     #[description = "Какой плейлист удалить"]
@@ -1769,21 +2054,18 @@ pub async fn button_pressed(
             .allowed_mentions(serenity::CreateAllowedMentions::new());
         press.create_followup(ctx, message)
     };
-    // Нажимать может тот, кто сидит с ботом в одном голосовом канале
-    let same_voice = match (
-        bot_channel(ctx, guild).await,
-        user_channel(ctx, guild, press.user.id),
-    ) {
-        (Some(bot), Some(user)) => bot.0.get() == user.get(),
-        _ => false,
-    };
-    if !same_voice {
-        let _ = answer("Зайди в голосовой канал, где играет бот.".into(), true).await;
+    let lock = data.music.lock_for(guild.get());
+    let guard = lock.lock().await;
+    let mode = current_mode(data, guild.get()).await;
+    let (track, instance) = data.music.with(guild.get(), |state| (state.track.clone(), state.instance.clone()));
+    if !crate::music_qol::user_in_bot_voice(ctx, guild, press.user.id)
+        || !crate::music_channels::press_allowed(data, press).unwrap_or(false)
+    {
+        drop(guard);
+        let _ = answer("Зайди в голосовой канал бота и используй музыкальный канал.".into(), true).await;
         return true;
     }
     let who = format!("<@{}>", press.user.id);
-    let mode = current_mode(data, guild.get()).await;
-    let track = data.music.with(guild.get(), |state| state.track.clone());
     let (text, private) = match (action, mode, track) {
         ("pause", Some(PlayMode::Pause), Some(track)) => {
             let _ = track.play();
@@ -1794,11 +2076,11 @@ pub async fn button_pressed(
             (format!("⏸️ {who} ставит на паузу."), false)
         }
         ("skip", Some(_), Some(_)) => {
-            if let Err(error) = stop_current(data, guild.get()).await {
-                let _ = answer(format!("Не получилось пропустить трек: {error}"), true).await;
-                return true;
+            match stop_current(data, guild.get(), instance.as_deref()) {
+                Ok(true) => (format!("⏭️ {who} пропускает трек."), false),
+                Ok(false) => (NOT_PLAYING.to_string(), true),
+                Err(error) => (format!("Не получилось пропустить трек: {error}"), true),
             }
-            (format!("⏭️ {who} пропускает трек."), false)
         }
         ("repeat", _, _) => {
             let repeat = data.music.with(guild.get(), |state| {
@@ -1824,6 +2106,7 @@ pub async fn button_pressed(
         },
         _ => (NOT_PLAYING.to_string(), true),
     };
+    drop(guard);
     let _ = answer(text, private).await;
     true
 }
@@ -1946,9 +2229,9 @@ mod tests {
 
     #[test]
     fn helpers() {
-        assert_eq!(ytdlp_target("  dark days "), "ytsearch1:dark days");
-        assert_eq!(ytdlp_target("https://youtu.be/abc"), "https://youtu.be/abc");
-        assert_eq!(ytdlp_target("ytsearch1:A - B"), "ytsearch1:A - B");
+        assert_eq!(ytdlp_target("  dark days ", 1).unwrap(), "ytsearch1:dark days");
+        assert_eq!(ytdlp_target("https://youtu.be/abc", 1).unwrap(), "https://youtu.be/abc");
+        assert_eq!(ytdlp_target("ytsearch1:A - B", 1).unwrap(), "ytsearch1:A - B");
         assert_eq!(
             youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=5").as_deref(),
             Some("dQw4w9WgXcQ")
@@ -2044,12 +2327,13 @@ mod tests {
         assert!(db.autoplay(1).unwrap());
 
         let tracks = vec![
-            ("a".to_string(), "A".to_string()),
-            ("b".to_string(), "B".to_string()),
+            ("a".to_string(), "A".to_string(), serde_json::json!({"original":"a"})),
+            ("b".to_string(), "B".to_string(), serde_json::json!({"original":"b","duration":120})),
         ];
-        db.save_playlist(1, "вечер", &tracks).unwrap();
-        db.save_playlist(1, "вечер", &tracks[..1]).unwrap(); // то же имя — перезаписан
-        db.save_playlist(1, "утро", &tracks).unwrap();
+        db.save_playlist(1, "вечер", &tracks, false).unwrap();
+        assert!(matches!(db.save_playlist(1, "вечер", &tracks[..1], false).unwrap(), SavePlaylist::Denied));
+        db.save_playlist(1, "вечер", &tracks[..1], true).unwrap();
+        db.save_playlist(1, "утро", &tracks, false).unwrap();
         assert_eq!(
             db.playlists(1).unwrap(),
             [("вечер".to_string(), 1), ("утро".to_string(), 2)]
@@ -2057,17 +2341,6 @@ mod tests {
         assert_eq!(db.playlist(1, "утро").unwrap(), tracks);
         assert!(db.delete_playlist(1, "утро").unwrap() && !db.delete_playlist(1, "утро").unwrap());
     }
-}
-
-pub(crate) async fn disconnect_saved(
-    ctx: &serenity::Context,
-    data: &Shared,
-    guild: serenity::GuildId,
-) -> Result<(), Error> {
-    let _operation = data.music.voice_operation(guild.get()).await;
-    let lock = data.music.lock_for(guild.get());
-    let _guard = lock.lock().await;
-    disconnect_saved_locked(ctx, data, guild).await
 }
 
 /// Caller holds BOTH voice_operation and lock_for, acquired in that order.
@@ -2087,6 +2360,8 @@ pub(crate) async fn disconnect_saved_locked(
         state.skipped = true;
         state.now_playing = None;
         state.playing_url = None;
+        state.snapshot_id = None;
+        state.voice_generation = state.voice_generation.wrapping_add(1);
         state.track.take()
     });
     if let Some(track) = track {

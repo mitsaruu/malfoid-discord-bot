@@ -7,6 +7,21 @@ const assert = require('node:assert/strict');
 // Run the production polling function, with only its HTTP/DOM boundary replaced.
 const app = readFileSync(join(__dirname, '../../miniapp/app.js'), 'utf8');
 const polling = app.slice(app.indexOf('let refreshingPlayers = false;'), app.indexOf('// ---------- Справка ----------'));
+
+test('an unanswered Discord command times out and removes its waiter', async () => {
+  let timer;
+  const context = vm.createContext({
+    crypto: { randomUUID: () => 'test-nonce' }, pending: new Map(),
+    discordWindow: { postMessage() {} }, discordOrigin: 'https://discord.com', OP: { FRAME: 1 },
+    setTimeout: callback => { timer = callback; }, clearTimeout() {},
+  });
+  vm.runInContext(app.slice(app.indexOf('function discordCommand('), app.indexOf('function connectToDiscord(')), context);
+  const result = vm.runInContext('discordCommand("AUTHORIZE", {})', context);
+  assert.equal(typeof timer, 'function');
+  timer();
+  await assert.rejects(result, /Discord не ответил/);
+  assert.equal(context.pending.size, 0);
+});
 function fixture(api) {
   const calls = [];
   const context = vm.createContext({

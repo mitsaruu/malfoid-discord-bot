@@ -2,12 +2,87 @@
 //! Админ выставляет роль на продажу: цена и на сколько дней (0 — навсегда). Роль на время бот снимает сам.
 //! Боту нужно право «Управлять ролями», и его роль должна быть выше продаваемых.
 
-use crate::db;
-use crate::reply::{display_name, say, take_money, whisper};
+use crate::db::{self, Database, Wallet};
+use crate::reply::whisper;
 use crate::text::{money_text, plural};
-use crate::{Context, Error};
+use crate::{Context, Error, Shared};
 use poise::serenity_prelude as serenity;
-use std::sync::Arc;
+use rusqlite::{params, OptionalExtension};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
+
+type Key = (serenity::GuildId, serenity::UserId, serenity::RoleId);
+
+#[derive(Default)]
+pub struct State {
+    operations: [tokio::sync::Mutex<()>; 32],
+}
+
+impl State {
+    fn operation(&self, key: Key) -> &tokio::sync::Mutex<()> {
+        let mut hash = DefaultHasher::new();
+        key.hash(&mut hash);
+        &self.operations[hash.finish() as usize % self.operations.len()]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Purchase {
+    price: i64,
+    expires: Option<f64>,
+}
+
+pub fn prepare(database: &Database) -> rusqlite::Result<()> {
+    database.lock().execute_batch(
+        "CREATE TABLE IF NOT EXISTS shop_pending (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role_id INTEGER NOT NULL,
+            price INTEGER NOT NULL CHECK(price > 0),
+            expires REAL,
+            retry_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id, role_id)
+         );
+         CREATE INDEX IF NOT EXISTS shop_expiry ON shop_purchases(expires);",
+    )
+}
+
+fn ids(key: Key) -> [i64; 3] {
+    [key.0.get() as i64, key.1.get() as i64, key.2.get() as i64]
+}
+
+fn pending(database: &Database, key: Key) -> rusqlite::Result<Option<Purchase>> {
+    database.lock().query_row(
+        "SELECT price, expires FROM shop_pending WHERE guild_id=?1 AND user_id=?2 AND role_id=?3",
+        ids(key),
+        |row| Ok(Purchase { price: row.get(0)?, expires: row.get(1)? }),
+    ).optional()
+}
+
+/// A successful Discord grant and the durable intent are reconciled together.
+fn finish_purchase(database: &Database, key: Key, purchase: Purchase, granted: bool) -> rusqlite::Result<()> {
+    let [guild, user, role] = ids(key);
+    database.transaction(|tx| {
+        let removed = tx.execute(
+            "DELETE FROM shop_pending WHERE guild_id=?1 AND user_id=?2 AND role_id=?3", [guild, user, role],
+        )?;
+        if removed == 0 {
+            return Ok(());
+        }
+        if !granted {
+            db::change_balance(tx, guild as u64, user as u64, purchase.price)?;
+        } else if let Some(expires) = purchase.expires {
+            tx.execute(
+                "INSERT INTO shop_purchases(guild_id,user_id,role_id,expires) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(guild_id,user_id,role_id) DO UPDATE SET expires=excluded.expires",
+                params![guild, user, role, expires],
+            )?;
+        } else {
+            tx.execute("DELETE FROM shop_purchases WHERE guild_id=?1 AND user_id=?2 AND role_id=?3", [guild, user, role])?;
+        }
+        Ok(())
+    })
+}
 
 pub fn days_text(days: i64) -> String {
     if days == 0 {
@@ -36,11 +111,26 @@ fn sale_rejection(guild_id: serenity::GuildId, role: &serenity::Role) -> Option<
     if role.id.get() == guild_id.get() || role.managed {
         return Some("Эту роль продавать нельзя (она служебная).");
     }
-    let permissions = role.permissions;
-    if permissions.administrator() || permissions.manage_guild() || permissions.moderate_members() {
+    if role.permissions.intersects(privileged_permissions()) {
         return Some("Эту роль продавать нельзя: у неё права админа или модератора.");
     }
     None
+}
+
+fn privileged_permissions() -> serenity::Permissions {
+    use serenity::Permissions as P;
+    P::ADMINISTRATOR | P::MANAGE_GUILD | P::MANAGE_ROLES | P::MANAGE_CHANNELS
+        | P::KICK_MEMBERS | P::BAN_MEMBERS | P::MODERATE_MEMBERS
+        | P::MANAGE_MESSAGES | P::MANAGE_THREADS | P::MANAGE_WEBHOOKS
+        | P::MUTE_MEMBERS | P::DEAFEN_MEMBERS | P::MOVE_MEMBERS
+        | P::MANAGE_EVENTS | P::MENTION_EVERYONE | P::VIEW_AUDIT_LOG
+}
+
+fn unsafe_channel_grant(guild: &serenity::Guild, role: serenity::RoleId) -> bool {
+    guild.channels.values().any(|channel| channel.permission_overwrites.iter().any(|overwrite| {
+        matches!(overwrite.kind, serenity::PermissionOverwriteType::Role(id) if id == role)
+            && overwrite.allow.intersects(privileged_permissions())
+    }))
 }
 
 /// Может ли бот выдавать эту роль: есть право «Управлять ролями», и роль бота выше неё.
@@ -112,36 +202,70 @@ pub async fn shop_buy(
     let Some((role, price, days)) = shop_items(ctx)?.into_iter().find(|(item, _, _)| item.id.to_string() == role) else {
         return whisper(ctx, "Такой роли в магазине нет — выбери из списка.").await;
     };
+    ctx.defer_ephemeral().await?;
+    let key = (guild_id, user, role.id);
+    let _operation = data.shop.operation(key).lock().await;
+    if pending(&data.db, key)?.is_some() {
+        return whisper(ctx, "Предыдущая покупка ещё проверяется. Повторное списание не требуется.").await;
+    }
     let bought_until = data.db.shop_purchase(guild_id.get(), user.get(), role.id.get())?;
-    let has_role = ctx.author_member().await.is_some_and(|member| member.roles.contains(&role.id));
+    let member = tokio::time::timeout(Duration::from_secs(12), ctx.http().get_member(guild_id, user)).await??;
+    let has_role = member.roles.contains(&role.id);
     if has_role && (days == 0 || bought_until.is_none()) {
         return whisper(ctx, "Эта роль у тебя уже есть.").await;
     }
     // Права роли могли измениться после выставления на продажу, а кэш мог ещё не обновиться.
-    let role = ctx.http().get_guild_role(guild_id, role.id).await?;
+    let role = tokio::time::timeout(Duration::from_secs(12), ctx.http().get_guild_role(guild_id, role.id)).await??;
     if let Some(reason) = sale_rejection(guild_id, &role) {
         return whisper(ctx, reason).await;
     }
     let bot = ctx.framework().bot_id();
-    if !ctx.guild().is_some_and(|guild| bot_can_manage(&guild, bot, &role)) {
+    if !ctx.guild().is_some_and(|guild| bot_can_manage(&guild, bot, &role) && !unsafe_channel_grant(&guild, role.id)) {
         return whisper(ctx,
             "Не могу выдать эту роль: мне нужно право «Управлять ролями», и моя роль должна быть выше неё. Скажи админу.").await;
     }
-    if !take_money(ctx, price, "цена роли").await? {
-        return Ok(());
+    let name = member.display_name();
+    let [guild, user_id, role_id] = ids(key);
+    let wallet = Wallet { guild: guild_id.get(), user: user.get(), name, start: data.economy.start_balance };
+    let purchase = Purchase { price, expires: (days > 0).then(|| new_expiry(bought_until, db::now(), days)) };
+    let reserved = data.db.transaction(|tx| {
+        let listed = tx.query_row(
+            "SELECT price, days FROM shop_roles WHERE guild_id=?1 AND role_id=?2", [guild, role_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ).optional()?;
+        if listed != Some((price, days)) || price <= 0 {
+            return Ok(Err("Условия покупки изменились. Выбери роль ещё раз.".into()));
+        }
+        let (balance, _) = wallet.open(tx)?;
+        if balance < price {
+            return Ok(Err(format!("Для покупки нужно {}, у тебя {}.", money_text(price), money_text(balance))));
+        }
+        db::change_balance(tx, wallet.guild, wallet.user, -price)?;
+        tx.execute(
+            "INSERT INTO shop_pending(guild_id,user_id,role_id,price,expires) VALUES(?1,?2,?3,?4,?5)",
+            params![guild, user_id, role_id, purchase.price, purchase.expires],
+        )?;
+        Ok(Ok(()))
+    })?;
+    if let Err(message) = reserved {
+        return whisper(ctx, message).await;
     }
-    if ctx.http().add_member_role(guild_id, user, role.id, Some("Покупка в магазине ролей")).await.is_err() {
-        // не получилось — возвращаем монеты
-        data.db.add_money(guild_id.get(), user.get(), &display_name(ctx).await, data.economy.start_balance, price)?;
-        return whisper(ctx, "Не получилось выдать роль — монеты вернул. Скажи админу.").await;
+    if !has_role {
+        match grant_role(ctx.http(), key).await {
+            Some(true) => {},
+            Some(false) => {
+                finish_purchase(&data.db, key, purchase, false)?;
+                return whisper(ctx, "Discord отказал в выдаче роли. Монеты возвращены.").await;
+            },
+            None => return whisper(ctx, "Discord пока не подтвердил выдачу. Бот повторно проверит заказ.").await,
+        }
     }
+    finish_purchase(&data.db, key, purchase, true)?;
     let mut text = format!("🛒 <@{user}> покупает роль <@&{}> за **{}**", role.id, money_text(price));
-    if days > 0 {
-        let expires = new_expiry(bought_until, db::now(), days);
-        data.db.set_shop_purchase(guild_id.get(), user.get(), role.id.get(), expires)?;
+    if let Some(expires) = purchase.expires {
         text += &format!(" — до <t:{}:f>", expires as i64);
     }
-    say(ctx, text + ".").await
+    whisper(ctx, text + ".").await
 }
 
 /// Выставить роль на продажу в магазине (или поменять цену)
@@ -166,7 +290,7 @@ pub async fn shop_add(
         return whisper(ctx, reason).await;
     }
     let bot = ctx.framework().bot_id();
-    if !ctx.guild().is_some_and(|guild| bot_can_manage(&guild, bot, &role)) {
+    if !ctx.guild().is_some_and(|guild| bot_can_manage(&guild, bot, &role) && !unsafe_channel_grant(&guild, role.id)) {
         return whisper(ctx,
             "Я не смогу выдавать эту роль: мне нужно право «Управлять ролями», и моя роль должна быть выше неё.").await;
     }
@@ -188,41 +312,139 @@ pub async fn shop_remove(ctx: Context<'_>, #[description = "Какую роль 
     }).await
 }
 
-/// Снимает роли, срок которых вышел. Вызывается раз в 10 минут.
-pub async fn expire_roles(http: &serenity::Http, database: &db::Database) {
-    let expired = match database.expired_shop_purchases(db::now()) {
-        Ok(expired) => expired,
-        Err(error) => return println!("Магазин ролей: база не ответила: {error}"),
-    };
-    for (guild, user, role) in expired {
-        let result = http
-            .remove_member_role(
-                serenity::GuildId::new(guild), serenity::UserId::new(user), serenity::RoleId::new(role),
-                Some("Закончился срок роли из магазина"))
-            .await;
-        match result {
-            Ok(()) => {}
-            // 404 — человек ушёл с сервера или роль удалили: снимать нечего, запись убираем
-            Err(serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)))
-                if response.status_code.as_u16() == 404 => {}
-            Err(error) => {
-                println!("Магазин ролей: не получилось снять роль: {error}");
-                continue; // попробуем в следующий раз
-            }
-        }
-        if let Err(error) = database.remove_shop_purchase(guild, user, role) {
-            println!("Магазин ролей: база не ответила: {error}");
-        }
+fn discord_status(error: &serenity::Error) -> Option<u16> {
+    match error {
+        serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)) => Some(response.status_code.as_u16()),
+        _ => None,
     }
 }
 
+async fn grant_role(http: &serenity::Http, key: Key) -> Option<bool> {
+    match tokio::time::timeout(Duration::from_secs(12),
+        http.add_member_role(key.0, key.1, key.2, Some("Покупка в магазине ролей"))).await
+    {
+        Ok(Ok(())) => Some(true),
+        Ok(Err(error)) if matches!(discord_status(&error), Some(400 | 403 | 404)) => Some(false),
+        _ => None,
+    }
+}
+
+async fn reconcile(ctx: &serenity::Context, data: &crate::Data, key: Key) -> Result<(), Error> {
+    let _operation = data.shop.operation(key).lock().await;
+    let Some(purchase) = pending(&data.db, key)? else { return Ok(()) };
+    let http = &ctx.http;
+    let member = match tokio::time::timeout(Duration::from_secs(12), http.get_member(key.0, key.1)).await? {
+        Ok(member) => member,
+        Err(error) if discord_status(&error) == Some(404) => {
+            finish_purchase(&data.db, key, purchase, false)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if member.roles.contains(&key.2) {
+        finish_purchase(&data.db, key, purchase, true)?;
+        return Ok(());
+    }
+    let role = match tokio::time::timeout(Duration::from_secs(12), http.get_guild_role(key.0, key.2)).await? {
+        Ok(role) => role,
+        Err(error) if discord_status(&error) == Some(404) => {
+            finish_purchase(&data.db, key, purchase, false)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if sale_rejection(key.0, &role).is_some()
+        || purchase.expires.is_some_and(|expires| expires <= db::now())
+    {
+        finish_purchase(&data.db, key, purchase, false)?;
+        return Ok(());
+    }
+    let may_grant = ctx.cache.guild(key.0).map(|guild| {
+        bot_can_manage(&guild, ctx.cache.current_user().id, &role) && !unsafe_channel_grant(&guild, role.id)
+    });
+    if may_grant == Some(false) {
+        finish_purchase(&data.db, key, purchase, false)?;
+        return Ok(());
+    }
+    if may_grant.is_none() {
+        return Ok(());
+    }
+    if let Some(granted) = grant_role(http, key).await {
+        finish_purchase(&data.db, key, purchase, granted)?;
+    }
+    Ok(())
+}
+
+fn pending_batch(database: &Database) -> rusqlite::Result<Vec<(u64, u64, u64)>> {
+    let connection = database.lock();
+    let mut query = connection.prepare(
+        "SELECT guild_id,user_id,role_id FROM shop_pending WHERE retry_at<=?1 ORDER BY retry_at,rowid LIMIT 50",
+    )?;
+    let rows = query.query_map([db::now()], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64, row.get::<_, i64>(2)? as u64)))?;
+    rows.collect()
+}
+
+fn key_from_ids(ids: (u64, u64, u64)) -> Option<Key> {
+    let (guild, user, role) = ids;
+    (guild != 0 && user != 0 && role != 0)
+        .then(|| (serenity::GuildId::new(guild), serenity::UserId::new(user), serenity::RoleId::new(role)))
+}
+
+/// Снимает роли, срок которых вышел, и восстанавливает незавершённые покупки.
+pub async fn expire_roles(ctx: &serenity::Context, data: &crate::Data) -> Result<(), Error> {
+    let database = &data.db;
+    for key in pending_batch(database)?.into_iter().filter_map(key_from_ids) {
+        if let Err(error) = reconcile(ctx, data, key).await {
+            eprintln!("Магазин ролей: покупка {key:?} ожидает сверки: {error}");
+        }
+        let [guild, user, role] = ids(key);
+        database.lock().execute(
+            "UPDATE shop_pending SET retry_at=?4 WHERE guild_id=?1 AND user_id=?2 AND role_id=?3",
+            params![guild, user, role, db::now() + 90.0],
+        )?;
+    }
+    let expired = match database.expired_shop_purchases(db::now()) {
+        Ok(expired) => expired,
+        Err(error) => return Err(error.into()),
+    };
+    for (guild, user, role) in expired.into_iter().take(50) {
+        let Some(key) = key_from_ids((guild, user, role)) else { continue };
+        let _operation = data.shop.operation(key).lock().await;
+        if pending(database, key)?.is_some()
+            || !database.shop_purchase(guild, user, role)?.is_some_and(|expires| expires <= db::now())
+        {
+            continue;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(12),
+            ctx.http.remove_member_role(key.0, key.1, key.2, Some("Закончился срок роли из магазина"))).await;
+        match result {
+            Ok(Ok(())) => {}
+            // 404 — человек ушёл с сервера или роль удалили: снимать нечего, запись убираем
+            Ok(Err(error)) if discord_status(&error) == Some(404) => {}
+            Ok(Err(error)) => {
+                eprintln!("Магазин ролей: не получилось снять роль: {error}");
+                continue;
+            }
+            Err(error) => {
+                eprintln!("Магазин ролей: Discord не подтвердил снятие роли: {error}");
+                continue;
+            }
+        }
+        database.remove_shop_purchase(guild, user, role)?;
+    }
+    Ok(())
+}
+
 /// Запускает проверку сроков ролей в фоне.
-pub fn start_expiry_loop(http: Arc<serenity::Http>, database: Arc<db::Database>) {
+pub fn start_expiry_loop(ctx: serenity::Context, data: Shared) {
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(std::time::Duration::from_secs(600));
+        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
-            expire_roles(&http, &database).await;
+            if let Err(error) = expire_roles(&ctx, &data).await {
+                eprintln!("Магазин ролей: {error}");
+            }
         }
     });
 }
@@ -230,6 +452,29 @@ pub fn start_expiry_loop(http: Arc<serenity::Http>, database: Arc<db::Database>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pending_role_refunds_once_and_a_permanent_grant_clears_the_old_expiry() {
+        let db = Database::in_memory().unwrap();
+        let key = (serenity::GuildId::new(1), serenity::UserId::new(2), serenity::RoleId::new(3));
+        db.wallet(1, 2, "Buyer", 300).unwrap();
+        db.set_shop_purchase(1, 2, 3, 100.0).unwrap();
+        let reserve = || db.transaction(|tx| {
+            db::change_balance(tx, 1, 2, -50)?;
+            tx.execute("INSERT INTO shop_pending(guild_id,user_id,role_id,price) VALUES(1,2,3,50)", [])?;
+            Ok(())
+        }).unwrap();
+        reserve();
+        let purchase = pending(&db, key).unwrap().unwrap();
+        finish_purchase(&db, key, purchase, false).unwrap();
+        finish_purchase(&db, key, purchase, false).unwrap();
+        assert_eq!(db.wallet(1, 2, "Buyer", 300).unwrap().0, 300);
+        assert_eq!(db.shop_purchase(1, 2, 3).unwrap(), Some(100.0));
+        reserve();
+        finish_purchase(&db, key, purchase, true).unwrap();
+        assert_eq!(db.shop_purchase(1, 2, 3).unwrap(), None);
+        assert_eq!(db.wallet(1, 2, "Buyer", 300).unwrap().0, 250);
+    }
 
     #[test]
     fn shop_command_registration() {
@@ -252,7 +497,14 @@ mod tests {
         role.permissions = Permissions::VIEW_CHANNEL;
         assert!(sale_rejection(guild_id, &role).is_none());
 
-        for permission in [Permissions::ADMINISTRATOR, Permissions::MANAGE_GUILD, Permissions::MODERATE_MEMBERS] {
+        for permission in [
+            Permissions::ADMINISTRATOR,
+            Permissions::MANAGE_GUILD,
+            Permissions::MODERATE_MEMBERS,
+            Permissions::MANAGE_ROLES,
+            Permissions::BAN_MEMBERS,
+            Permissions::MANAGE_CHANNELS,
+        ] {
             role.permissions = Permissions::VIEW_CHANNEL | permission;
             assert!(sale_rejection(guild_id, &role).is_some());
         }

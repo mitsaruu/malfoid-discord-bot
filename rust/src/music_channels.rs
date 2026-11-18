@@ -88,33 +88,44 @@ fn denial(channel: u64) -> String {
     format!("🎵 Музыкальные команды и кнопки работают только в <#{channel}>.")
 }
 
+fn ctx_restriction(ctx: Context<'_>) -> rusqlite::Result<Option<u64>> {
+    let Some(guild) = ctx.guild_id() else { return Ok(None) };
+    let parent = match ctx {
+        poise::Context::Application(app) => app.interaction.channel.as_ref().and_then(|c| c.parent_id),
+        poise::Context::Prefix(_) => ctx.guild().and_then(|guild| {
+            guild.channels.get(&ctx.channel_id()).and_then(|c| c.parent_id)
+        }),
+    }.map(|id| id.get());
+    restriction(ctx.data(), guild.get(), ctx.channel_id().get(), parent)
+}
+
+pub(crate) fn restriction(
+    data: &Data,
+    guild: u64,
+    id: u64,
+    parent: Option<u64>,
+) -> rusqlite::Result<Option<u64>> {
+    Ok(channel(&data.db, guild)?.filter(|configured| !allowed(Some(*configured), id, parent)))
+}
+
+#[cfg(feature = "voice")]
+pub(crate) fn ctx_allowed(ctx: Context<'_>) -> rusqlite::Result<bool> {
+    Ok(ctx_restriction(ctx)?.is_none())
+}
+
+#[cfg(feature = "voice")]
+pub(crate) fn press_allowed(data: &Data, press: &serenity::ComponentInteraction) -> rusqlite::Result<bool> {
+    let Some(guild) = press.guild_id else { return Ok(false) };
+    let parent = press.channel.as_ref().and_then(|c| c.parent_id).map(|id| id.get());
+    Ok(restriction(data, guild.get(), press.channel_id.get(), parent)?.is_none())
+}
+
 /// Read only the interaction payload/cache before the initial response; no HTTP lookup.
 pub async fn command_check(ctx: Context<'_>) -> Result<bool, Error> {
     if !is_music_command(&ctx.command().name) {
         return Ok(true);
     }
-    let Some(guild) = ctx.guild_id() else {
-        return Ok(true);
-    };
-    let configured = channel(&ctx.data().db, guild.get())?;
-    let Some(configured) = configured else {
-        return Ok(true);
-    };
-    let parent = match ctx {
-        poise::Context::Application(app) => {
-            app.interaction.channel.as_ref().and_then(|c| c.parent_id)
-        }
-        poise::Context::Prefix(_) => ctx.guild().and_then(|guild| {
-            guild
-                .channels
-                .get(&ctx.channel_id())
-                .and_then(|c| c.parent_id)
-        }),
-    }
-    .map(|id| id.get());
-    if allowed(Some(configured), ctx.channel_id().get(), parent) {
-        return Ok(true);
-    }
+    let Some(configured) = ctx_restriction(ctx)? else { return Ok(true) };
     crate::reply::whisper(ctx, denial(configured)).await?;
     Ok(false)
 }

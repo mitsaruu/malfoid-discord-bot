@@ -9,6 +9,7 @@ use crate::text::{number, plural};
 use crate::{db, Context, Data, Error};
 use poise::serenity_prelude as serenity;
 use rand::Rng;
+use rusqlite::{params, OptionalExtension};
 
 /// Настройки из settings.ini, раздел [levels].
 pub struct LevelSettings {
@@ -70,11 +71,23 @@ pub fn avatar_png_url(face: &str) -> String {
 
 /// Скачивает аватарку. None — не получилось (тогда нарисуется кружок с буквой).
 pub async fn fetch_avatar(data: &Data, face: &str) -> Option<Vec<u8>> {
-    let response = data.web.get(avatar_png_url(face)).send().await.ok()?;
+    const MAX_AVATAR_BYTES: usize = 1024 * 1024;
+    let url = reqwest::Url::parse(&avatar_png_url(face)).ok()?;
+    if url.scheme() != "https" || !matches!(url.host_str(), Some("cdn.discordapp.com" | "media.discordapp.net")) {
+        return None;
+    }
+    let mut response = data.web.get(url).timeout(std::time::Duration::from_secs(6)).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
-    response.bytes().await.ok().map(|bytes| bytes.to_vec())
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
 }
 
 /// Аватарка по id участника (для таблиц рейтинга).
@@ -205,22 +218,50 @@ pub async fn money_leaderboard(ctx: Context<'_>) -> Result<(), Error> {
     send_png(ctx, png, "money_leaderboard.png").await
 }
 
-/// Добавляет участнику опыт. Если вырос уровень — поздравляет (если это включено в settings.ini)
-/// в канале для игр, а если его нет — в канале channel.
-pub async fn give_xp(
+fn credit_xp(
+    database: &db::Database,
+    guild: u64,
+    user: u64,
+    name: &str,
+    amount: i64,
+    message_at: Option<(f64, i64)>,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    database.transaction(|tx| {
+        let key = [guild as i64, user as i64];
+        let (old_xp, last) = tx.query_row(
+            "SELECT COALESCE(xp,0),COALESCE(last_xp_time,0) FROM levels WHERE guild_id=?1 AND user_id=?2",
+            key, |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        ).optional()?.unwrap_or((0, 0.0));
+        if message_at.is_some_and(|(now, cooldown)| now - last < cooldown as f64) {
+            return Ok(None);
+        }
+        let total = old_xp.saturating_add(amount).max(0);
+        let last = message_at.map_or(last, |(now, _)| now);
+        tx.execute(
+            "INSERT INTO levels(guild_id,user_id,name,xp,last_xp_time) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(guild_id,user_id) DO UPDATE SET
+             name=excluded.name, xp=excluded.xp, last_xp_time=excluded.last_xp_time",
+            params![key[0], key[1], name, total, last],
+        )?;
+        Ok(Some((old_xp, total)))
+    })
+}
+
+/// Уведомление о новом уровне отправляется после начисления.
+async fn notify_level(
     ctx: &serenity::Context,
     data: &Data,
     guild: serenity::GuildId,
     user: &serenity::User,
     name: &str,
-    amount: i64,
+    (old_xp, total_xp): (i64, i64),
     channel: serenity::ChannelId,
 ) -> Result<(), Error> {
-    let old_xp = data.db.xp(guild.get(), user.id.get())?;
-    let total_xp = old_xp + amount;
-    data.db.set_xp(guild.get(), user.id.get(), name, total_xp)?;
+    if data.levels.level_up == LevelUp::Off {
+        return Ok(());
+    }
     let (old_level, new_level) = (level_info(old_xp).0, level_info(total_xp).0);
-    if new_level <= old_level || data.levels.level_up == LevelUp::Off {
+    if new_level <= old_level {
         return Ok(());
     }
     let text = format!("🎉 <@{}> получает **{new_level} уровень**!", user.id);
@@ -244,14 +285,12 @@ pub async fn message_xp(ctx: &serenity::Context, data: &Data, message: &serenity
         return Ok(());
     }
     let (now, user) = (db::now(), message.author.id.get());
-    if now - data.db.last_xp_time(guild.get(), user)? < data.levels.cooldown as f64 {
-        return Ok(());
-    }
     let amount = rand::rng().random_range(data.levels.xp_min..=data.levels.xp_max);
     // Имя на сервере (ник), а если ника нет — обычное имя
     let name = message.member.as_ref().and_then(|member| member.nick.clone()).unwrap_or_else(|| user_name(&message.author));
-    give_xp(ctx, data, guild, &message.author, &name, amount, message.channel_id).await?;
-    data.db.set_last_xp_time(guild.get(), user, now)?;
+    if let Some(total) = credit_xp(&data.db, guild.get(), user, &name, amount, Some((now, data.levels.cooldown)))? {
+        notify_level(ctx, data, guild, &message.author, &name, total, message.channel_id).await?;
+    }
     Ok(())
 }
 
@@ -299,7 +338,12 @@ pub fn start_voice_xp_loop(ctx: serenity::Context, data: std::sync::Arc<Data>) {
                     None => continue,
                 };
                 for (user, name, channel) in listeners {
-                    if let Err(error) = give_xp(&ctx, &data, guild_id, &user, &name, data.levels.voice_xp, channel).await {
+                    let result = match credit_xp(&data.db, guild_id.get(), user.id.get(), &name, data.levels.voice_xp, None) {
+                        Ok(Some(total)) => notify_level(&ctx, &data, guild_id, &user, &name, total, channel).await,
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error.into()),
+                    };
+                    if let Err(error) = result {
                         println!("Опыт за голосовой канал: {error}"); // ошибка с одним не останавливает остальных
                     }
                 }
@@ -311,6 +355,15 @@ pub fn start_voice_xp_loop(ctx: serenity::Context, data: std::sync::Arc<Data>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_and_message_xp_keep_the_shared_total_and_cooldown() {
+        let db = db::Database::in_memory().unwrap();
+        assert_eq!(credit_xp(&db, 1, 2, "Участник", 20, Some((120.0, 60))).unwrap(), Some((0, 20)));
+        assert_eq!(credit_xp(&db, 1, 2, "Участник", 10, None).unwrap(), Some((20, 30)));
+        assert_eq!(credit_xp(&db, 1, 2, "Участник", 20, Some((130.0, 60))).unwrap(), None);
+        assert_eq!(credit_xp(&db, 1, 2, "Участник", 20, Some((180.0, 60))).unwrap(), Some((30, 50)));
+    }
 
     #[test]
     fn levels_match_python() {

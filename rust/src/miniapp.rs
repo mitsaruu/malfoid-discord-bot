@@ -1,10 +1,10 @@
 //! Мини-приложение (Discord Activity) для игр в слова. Discord показывает страницу miniapp/index.html внутри
 //! себя; страницу и ответы на ходы отдаёт этот веб-сервер. Снаружи до него Discord достучится через туннель
-//! (например, cloudflared) — см. README. Адреса и ответы те же, что у bot.py, поэтому страница не менялась.
+//! (например, cloudflared) — см. README.
 
 use crate::wordboard::{self, Player};
-use crate::words::{self, Lang, MAX_GUESSES};
-use crate::{db, rocket, Shared};
+use crate::words::{self, Lang};
+use crate::{rocket, Shared};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -15,8 +15,12 @@ use rand::distr::{Alphanumeric, SampleString};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-const SESSION_HOURS: f64 = 12.0;
+const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 3600);
+const SESSION_LIMIT: usize = 2048;
+const AUTH_TTL: Duration = Duration::from_secs(15);
+const DISCORD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Кто играет: выдаётся после входа через Discord, страница присылает «пропуск» с каждым запросом.
 #[derive(Clone)]
@@ -25,8 +29,10 @@ struct Session {
     user: u64,
     name: String,
     face: String, // ссылка на аватарку
-    channel: Option<u64>,
-    time: f64,
+    channel: u64,
+    parent: Option<u64>,
+    created: Instant,
+    checked: Instant,
     lang: Lang,
 }
 
@@ -35,8 +41,6 @@ pub struct Miniapp {
     ctx: serenity::Context,
     client_secret: String,
     sessions: Mutex<HashMap<String, Session>>,
-    /// (сервер, участник) → (имя, ссылка на аватарку) — чтобы не спрашивать Discord при каждом обновлении
-    members: Mutex<HashMap<(u64, u64), (String, String)>>,
 }
 
 type App = Arc<Miniapp>;
@@ -56,46 +60,66 @@ fn failed(error: impl std::fmt::Display) -> Response {
     json_error("Что-то пошло не так. Ошибка записана в логи.", StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+fn authorization_error() -> Response {
+    json_error("Discord не подтвердил доступ к этому каналу. Открой игру заново в доступном канале.", StatusCode::FORBIDDEN)
+}
+
+fn discord_id(value: &str) -> Option<u64> {
+    value.parse().ok().filter(|id| *id != 0)
+}
+
 impl Miniapp {
     /// Кто делает запрос: ищем пропуск из заголовка Authorization: Bearer <пропуск>.
     fn session(&self, headers: &HeaderMap) -> Result<(String, Session), Response> {
         let token = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .map(|value| value.strip_prefix("Bearer ").unwrap_or(value).trim().to_string())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string)
             .unwrap_or_default();
         match locked(&self.sessions).get(&token) {
-            Some(session) if db::now() - session.time <= SESSION_HOURS * 3600.0 => Ok((token, session.clone())),
+            Some(session) if session.created.elapsed() < SESSION_LIFETIME => Ok((token, session.clone())),
             _ => Err(json_error("Сессия устарела — открой игру заново.", StatusCode::UNAUTHORIZED)),
         }
     }
 
+    async fn authorized(&self, headers: &HeaderMap, command: Option<&str>, fresh: bool) -> Result<(String, Session), Response> {
+        let (pass, mut session) = self.session(headers)?;
+        if fresh || session.checked.elapsed() >= AUTH_TTL {
+            let (member, parent) = authorize_channel(&self.ctx, session.guild, session.user, session.channel).await?;
+            session.name = member.display_name().to_string();
+            session.face = member.face();
+            session.parent = parent;
+            session.checked = Instant::now();
+            let mut sessions = locked(&self.sessions);
+            let stored = sessions.get_mut(&pass).ok_or_else(authorization_error)?;
+            stored.checked = session.checked;
+            stored.parent = parent;
+            stored.name.clone_from(&session.name);
+            stored.face.clone_from(&session.face);
+            session.lang = stored.lang;
+        }
+        if let Some(command) = command {
+            check_game_channel(&self.data, &session, command)?;
+        }
+        Ok((pass, session))
+    }
+
     fn state_of(&self, session: &Session, game: &words::Game) -> Result<Value, Response> {
-        let start = self.data.economy.start_balance;
-        let (balance, _) = self.data.db.wallet(session.guild, session.user, &session.name, start).map_err(failed)?;
+        let balance = words::balance(&self.data, session.guild, session.user).map_err(failed)?;
         Ok(words::game_state(&self.data, game, balance))
     }
 
     /// Обновляет картинку в чате, не задерживая ответ странице.
     fn refresh_board(self: &Arc<Self>, session: &Session, lang: Lang) {
-        let Some(channel) = session.channel else { return };
         let (app, player) = (self.clone(), Player { id: session.user, name: session.name.clone(), face: session.face.clone() });
         let guild = session.guild;
+        let channel = session.channel;
         tokio::spawn(async move {
             wordboard::update(&app.ctx, &app.data, guild, serenity::ChannelId::new(channel), player, lang).await;
         });
     }
 
-    /// Имя и аватарка участника сервера: из запаса или (один раз) у Discord. None — не нашли.
-    async fn member(&self, guild: u64, user: u64) -> Option<(String, String)> {
-        if let Some(known) = locked(&self.members).get(&(guild, user)) {
-            return Some(known.clone());
-        }
-        let member = serenity::GuildId::new(guild).member(&self.ctx, serenity::UserId::new(user)).await.ok()?;
-        let found = (member.display_name().to_string(), member.face());
-        locked(&self.members).insert((guild, user), found.clone());
-        Some(found)
-    }
 }
 
 async fn index(State(app): State<App>) -> Response {
@@ -136,15 +160,42 @@ fn text_field(body: &Value, key: &str) -> String {
     }
 }
 
-// channel_id приходит со страницы: не позволяем записать канал другого сервера
-// как постоянный адрес для игровых картинок и ежедневных итогов.
-async fn session_channel(app: &Miniapp, body: &Value, guild: u64) -> Option<u64> {
-    let id = text_field(body, "channel_id").parse::<u64>().ok().filter(|id| *id != 0)?;
-    let channel = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        serenity::ChannelId::new(id).to_channel(&app.ctx),
-    ).await.ok()?.ok()?.guild()?;
-    (channel.guild_id.get() == guild).then_some(id)
+// The URL's guild/channel fields are client input. Check the authenticated
+// player's current roles and channel access before binding them to a session.
+async fn authorize_channel(ctx: &serenity::Context, guild: u64, user: u64, channel: u64) -> Result<(serenity::Member, Option<u64>), Response> {
+    async fn access(ctx: &serenity::Context, guild: u64, user: u64, channel: u64) -> Option<(serenity::Member, Option<u64>)> {
+        let guild = serenity::GuildId::new(guild);
+        let user = serenity::UserId::new(user);
+        let id = serenity::ChannelId::new(channel);
+        let (member, found) = tokio::try_join!(ctx.http.get_member(guild, user), ctx.http.get_channel(id)).ok()?;
+        let found = found.guild().filter(|channel| channel.guild_id == guild)?;
+        let thread = matches!(found.kind, serenity::ChannelType::PublicThread | serenity::ChannelType::PrivateThread | serenity::ChannelType::NewsThread);
+        let permissions_channel = if thread {
+            ctx.http.get_channel(found.parent_id?).await.ok()?.guild().filter(|channel| channel.guild_id == guild)?
+        } else {
+            found.clone()
+        };
+        let permissions = ctx.cache.guild(guild)?.user_permissions_in(&permissions_channel, &member);
+        if !permissions.view_channel() {
+            return None;
+        }
+        if found.kind == serenity::ChannelType::PrivateThread && !permissions.manage_threads() {
+            id.get_thread_member(&ctx.http, user, false).await.ok()?;
+        }
+        Some((member, found.parent_id.filter(|_| thread).map(|id| id.get())))
+    }
+    match tokio::time::timeout(DISCORD_TIMEOUT, access(ctx, guild, user, channel)).await {
+        Ok(Some(authorized)) => Ok(authorized),
+        _ => Err(authorization_error()),
+    }
+}
+
+fn check_game_channel(data: &crate::Data, session: &Session, command: &str) -> Result<(), Response> {
+    let required = data.db.games_channel(session.guild).map_err(failed)?;
+    if crate::admin::allowed_here(&data.games_commands, command, required, session.channel, session.parent) {
+        return Ok(());
+    }
+    Err(json_error("Эта игра доступна только в игровом канале сервера.", StatusCode::FORBIDDEN))
 }
 
 /// Вход: страница получила от Discord одноразовый код — меняем его на токен и узнаём, кто это.
@@ -162,7 +213,7 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         .await
         .map_err(failed)?;
     if !exchange.status().is_success() {
-        println!("Мини-приложение: Discord не принял код входа: {} {}", exchange.status(), exchange.text().await.unwrap_or_default());
+        println!("Мини-приложение: Discord не принял код входа: {}", exchange.status());
         return Err(json_error("Discord не подтвердил вход. Проверь DISCORD_CLIENT_SECRET.", StatusCode::UNAUTHORIZED));
     }
     let tokens: Value = serde_json::from_str(&exchange.text().await.map_err(failed)?).map_err(failed)?;
@@ -180,66 +231,53 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         return Err(json_error("Не получилось узнать, кто ты.", StatusCode::UNAUTHORIZED));
     }
     let who: Value = serde_json::from_str(&who.text().await.map_err(failed)?).map_err(failed)?;
-    let user: u64 = text_field(&who, "id").parse().map_err(failed)?;
+    let user = discord_id(&text_field(&who, "id")).ok_or_else(authorization_error)?;
 
-    let guild = guild_id.parse::<u64>().ok().filter(|id| *id != 0 && app.ctx.cache.guild(serenity::GuildId::new(*id)).is_some());
+    let guild = discord_id(&guild_id).filter(|id| app.ctx.cache.guild(serenity::GuildId::new(*id)).is_some());
     let Some(guild) = guild else {
         return Err(json_error("Открой игру на сервере, где есть бот (не в личке).", StatusCode::FORBIDDEN));
     };
-    let Some((name, face)) = app.member(guild, user).await else {
-        return Err(json_error("Ты не участник этого сервера.", StatusCode::FORBIDDEN));
-    };
-    let now = db::now();
+    let channel = discord_id(&text_field(&body, "channel_id")).ok_or_else(authorization_error)?;
+    let (member, parent) = authorize_channel(&app.ctx, guild, user, channel).await?;
+    let name = member.display_name().to_string();
+    let now = Instant::now();
     let lang = crate::wordsummary::preferred_lang(&app.data, guild, user);
-    let channel = session_channel(&app, &body, guild).await;
     let session = Session {
-        guild, user, name: name.clone(), face, time: now, lang,
-        channel,
+        guild, user, name: name.clone(), face: member.face(), channel, parent, created: now, checked: now, lang,
+    };
+    let wants_rocket = app.data.rocket.take_open(guild, user);
+    let (game, state) = if wants_rocket {
+        check_game_channel(&app.data, &session, "rocket")?;
+        ("rocket", Value::Null)
+    } else {
+        check_game_channel(&app.data, &session, "words")?;
+        let game = words::daily_game(&app.data, guild, user, lang).map_err(failed)?;
+        let state = app.state_of(&session, &game)?;
+        if !game.finished() {
+            app.refresh_board(&session, lang);
+        }
+        ("words", state)
     };
     let pass = Alphanumeric.sample_string(&mut rand::rng(), 32);
     {
         let mut sessions = locked(&app.sessions);
-        sessions.retain(|_, old| now - old.time <= SESSION_HOURS * 3600.0); // старые пропуска выбрасываем
-        sessions.insert(pass.clone(), session.clone());
+        sessions.retain(|_, old| old.created.elapsed() < SESSION_LIFETIME);
+        if sessions.len() >= SESSION_LIMIT {
+            if let Some(oldest) = sessions.iter().min_by_key(|(_, old)| old.created).map(|(pass, _)| pass.clone()) {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions.insert(pass.clone(), session);
     }
-    if app.data.rocket.take_open(guild, user) {
-        return Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": "rocket", "state": null })).into_response());
-    }
-    let game = words::daily_game(&app.data, guild, user, lang).map_err(failed)?;
-    if !game.finished() {
-        app.refresh_board(&session, lang);
-    }
-    let state = app.state_of(&session, &game)?;
-    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": "words", "state": state })).into_response())
+    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": game, "state": state })).into_response())
 }
 
 async fn rocket_state(State(app): State<App>, headers: HeaderMap) -> Reply {
-    let (_, session) = app.session(&headers)?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
     Ok(Json(rocket::read(&app.data, (session.guild, session.user)).map_err(failed)?).into_response())
 }
 
-async fn rocket_can_start(app: &Miniapp, session: &Session) -> Result<(), Response> {
-    let guild_id = serenity::GuildId::new(session.guild);
-    // Для платной ставки проверяем актуальное членство через Discord, без кэша аватарок.
-    let member = tokio::time::timeout(std::time::Duration::from_secs(5),
-        app.ctx.http.get_member(guild_id, serenity::UserId::new(session.user)))
-        .await.ok().and_then(Result::ok).ok_or_else(|| json_error("Discord не подтвердил участие на сервере.", StatusCode::FORBIDDEN))?;
-    let allowed = app.data.db.games_channel(session.guild).map_err(failed)?;
-    let Some(allowed) = allowed.filter(|_| app.data.games_commands.contains("rocket")) else { return Ok(()) };
-    let wrong_channel = || json_error("Ракетка доступна в игровом канале сервера. Запусти там /rocket.", StatusCode::FORBIDDEN);
-    let channel_id = session.channel.ok_or_else(wrong_channel)?;
-    let channel = tokio::time::timeout(std::time::Duration::from_secs(5), serenity::ChannelId::new(channel_id).to_channel(&app.ctx))
-        .await.ok().and_then(Result::ok).and_then(|channel| channel.guild()).ok_or_else(wrong_channel)?;
-    let guild = app.ctx.cache.guild(guild_id).ok_or_else(wrong_channel)?;
-    if channel.guild_id != guild_id || !guild.user_permissions_in(&channel, &member).view_channel()
-        || !crate::admin::allowed_here(&app.data.games_commands, "rocket", Some(allowed), channel_id, channel.parent_id.map(|id| id.get())) {
-        return Err(wrong_channel());
-    }
-    Ok(())
-}
-
 async fn rocket_start(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
-    let (_, session) = app.session(&headers)?;
     let bad = || json_error("Проверь ставку и коэффициент автовывода.", StatusCode::BAD_REQUEST);
     let bet = body.get("bet").and_then(Value::as_str).filter(|text| text.len() <= 32).ok_or_else(bad)?;
     let auto = match body.get("auto") {
@@ -252,14 +290,14 @@ async fn rocket_start(State(app): State<App>, headers: HeaderMap, Json(body): Js
         Some(Value::String(id)) => Some(id.parse::<u64>().map_err(|_| bad())?),
         _ => return Err(bad()),
     };
-    rocket_can_start(&app, &session).await?;
+    let (_, session) = app.authorized(&headers, Some("rocket"), true).await?;
     let state = rocket::start(&app.data, (session.guild, session.user), &session.name, bet, auto, expected)
         .map_err(failed)?.map_err(|error| json_error(&error, StatusCode::CONFLICT))?;
     Ok(Json(state).into_response())
 }
 
 async fn rocket_cashout(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
-    let (_, session) = app.session(&headers)?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
     let id = body.get("id").and_then(Value::as_str).and_then(|id| id.parse::<u64>().ok())
         .ok_or_else(|| json_error("Нужен номер раунда.", StatusCode::BAD_REQUEST))?;
     let state = rocket::cash_out(&app.data, (session.guild, session.user), id)
@@ -268,13 +306,13 @@ async fn rocket_cashout(State(app): State<App>, headers: HeaderMap, Json(body): 
 }
 
 async fn state(State(app): State<App>, headers: HeaderMap) -> Reply {
-    let (_, session) = app.session(&headers)?;
+    let (_, session) = app.authorized(&headers, Some("words"), false).await?;
     let game = words::daily_game(&app.data, session.guild, session.user, session.lang).map_err(failed)?;
     Ok(Json(json!({ "state": app.state_of(&session, &game)? })).into_response())
 }
 
 async fn guess(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
-    let (_, session) = app.session(&headers)?;
+    let (_, session) = app.authorized(&headers, Some("words"), true).await?;
     let word = text_field(&body, "word");
     let expected_day = text_field(&body, "day");
     let expected_day = (!expected_day.is_empty()).then_some(expected_day.as_str());
@@ -298,7 +336,7 @@ async fn guess(State(app): State<App>, headers: HeaderMap, Json(body): Json<Valu
 
 /// Открыть слово дня; с полем lang — переключиться на другую игру прямо в мини-приложении.
 async fn new_game(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
-    let (pass, mut session) = app.session(&headers)?;
+    let (pass, mut session) = app.authorized(&headers, Some("words"), true).await?;
     let switched = Lang::from_key(&text_field(&body, "lang"));
     if let Some(lang) = switched {
         session.lang = lang;
@@ -317,37 +355,48 @@ async fn new_game(State(app): State<App>, headers: HeaderMap, Json(body): Json<V
 /// Кто сегодня играет в слово дня этой игры на сервере: имя и цвета догадок (без букв) — для панели слева
 /// сверху. Страница спрашивает раз в пару секунд, так что видно, как другие подбирают слова.
 async fn players(State(app): State<App>, headers: HeaderMap) -> Reply {
-    let (_, session) = app.session(&headers)?;
+    let (_, session) = app.authorized(&headers, Some("words"), false).await?;
     let lang = session.lang;
-    locked(&app.members).insert((session.guild, session.user), (session.name.clone(), session.face.clone()));
     let day = words::today(&app.data, lang);
-    let rows = app.data.db.word_day_rows(lang.table(), session.guild, &day).map_err(failed)?;
+    let games = words::player_games(&app.data, session.guild, session.user, lang, &day).map_err(failed)?;
     let mut players = Vec::new();
-    for (user, answer, guesses) in rows {
-        let Some((name, _)) = app.member(session.guild, user).await else { continue };
-        let game = words::Game::from_row(lang, &day, answer, &guesses);
+    for (user, game) in games {
+        let me = user == session.user;
+        let name = if me {
+            session.name.clone()
+        } else {
+            crate::wordsummary::profile(&app.data.db, session.guild, user).map_err(failed)?
+                .map(|(name, _)| name).unwrap_or_else(|| "Игрок".to_string())
+        };
         let marks: Vec<Vec<&str>> = game.rows().iter().map(|row| row.iter().map(|mark| mark.as_str()).collect()).collect();
-        players.push((user != session.user, json!({
-            "id": user.to_string(), "name": name, "me": user == session.user, "marks": marks,
-            "won": game.won(), "finished": game.won() || game.guesses.len() >= MAX_GUESSES,
-        })));
+        players.push(json!({
+            "id": user.to_string(), "name": name, "me": me, "marks": marks,
+            "won": game.won(), "finished": game.finished(),
+        }));
     }
-    players.sort_by_key(|(other, _)| *other); // сам игрок — первым
-    let players: Vec<Value> = players.into_iter().take(12).map(|(_, player)| player).collect();
     Ok(Json(json!({ "players": players, "guild": session.guild.to_string(), "day": day, "lang": lang.key() })).into_response())
 }
 
 /// Аватарка участника из Discord (картинки с чужих сайтов внутри Discord-приложения не грузятся,
 /// поэтому отдаём их со своего сервера). Адрес: /api/avatar/<сервер>/<участник>.png
-async fn avatar(State(app): State<App>, Path((guild, file)): Path<(u64, String)>) -> Response {
-    let Some(user) = file.strip_suffix(".png").and_then(|id| id.parse::<u64>().ok()) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Some((_, face)) = app.member(guild, user).await else { return StatusCode::NOT_FOUND.into_response() };
-    match wordboard::cached_avatar(&app.data, user, &face).await {
-        Some(bytes) => ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "max-age=3600")], bytes).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+async fn avatar(State(app): State<App>, Path((guild, file)): Path<(u64, String)>, headers: HeaderMap) -> Reply {
+    let missing = || StatusCode::NOT_FOUND.into_response();
+    let user = file.strip_suffix(".png").and_then(discord_id).ok_or_else(missing)?;
+    let (_, session) = app.authorized(&headers, Some("words"), false).await?;
+    if guild != session.guild {
+        return Err(missing());
     }
+    let day = words::today(&app.data, session.lang);
+    if app.data.db.word_row(session.lang.table(), guild, user, &day).map_err(failed)?.is_none() {
+        return Err(missing());
+    }
+    let face = if user == session.user {
+        session.face
+    } else {
+        crate::wordsummary::profile(&app.data.db, guild, user).map_err(failed)?.ok_or_else(missing)?.1
+    };
+    let bytes = wordboard::cached_avatar(&app.data, &face).await.ok_or_else(missing)?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response())
 }
 
 pub fn router(app: App) -> axum::Router {
@@ -368,17 +417,15 @@ pub fn router(app: App) -> axum::Router {
 }
 
 /// Запускает веб-сервер мини-приложения в фоне.
-pub fn start(ctx: serenity::Context, data: Shared, client_secret: String, host: String, port: u16) {
-    let app = Arc::new(Miniapp { data, ctx, client_secret, sessions: Default::default(), members: Default::default() });
+pub fn start(ctx: serenity::Context, data: Shared, client_secret: String, listener: tokio::net::TcpListener) {
+    let app = Arc::new(Miniapp { data: data.clone(), ctx, client_secret, sessions: Default::default() });
     tokio::spawn(async move {
-        match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-            Ok(listener) => {
-                println!("Мини-приложение работает на http://{host}:{port} — пробрось его туннелем (см. README)");
-                if let Err(error) = axum::serve(listener, router(app)).await {
-                    println!("Мини-приложение остановилось: {error}");
-                }
-            }
-            Err(error) => println!("Мини-приложение не запустилось: порт {port} занят или недоступен ({error})"),
+        if let Ok(address) = listener.local_addr() {
+            println!("Мини-приложение работает на http://{address} — пробрось его туннелем (см. README)");
         }
+        if let Err(error) = axum::serve(listener, router(app)).await {
+            println!("Мини-приложение остановилось: {error}");
+        }
+        data.miniapp_ready.store(false, std::sync::atomic::Ordering::Relaxed);
     });
 }

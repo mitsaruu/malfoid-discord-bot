@@ -74,6 +74,22 @@ impl State {
     }
 }
 
+pub fn start_cleanup(data: Shared) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(30 * 60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let now = Instant::now();
+            data.rocket.flights().retain(|_, flight| {
+                flight.finished.is_none_or(|(finished, _)| now - finished <= RESULT_WINDOW)
+            });
+            data.rocket.opening.lock().unwrap_or_else(|error| error.into_inner())
+                .retain(|_, expires| *expires > now);
+        }
+    });
+}
+
 fn crash_point(random: u32) -> u32 {
     (97_000_000 / random).clamp(100, MAX)
 }
@@ -320,7 +336,7 @@ pub fn cash_out(data: &Data, player: Player, id: u64) -> rusqlite::Result<Result
 /// Открыть ракетку в мини-приложении Discord
 #[poise::command(slash_command, guild_only)]
 pub async fn rocket(ctx: Context<'_>) -> Result<(), Error> {
-    if !ctx.data().miniapp_ready {
+    if !ctx.data().miniapp_ready() {
         return whisper(ctx, "Мини-приложение ещё не настроено.").await;
     }
     let poise::Context::Application(app) = ctx else {

@@ -1,5 +1,5 @@
 //! Public queue views; only their opener may operate their controls.
-use crate::{db, music_qol::Item, Context, Error, Shared};
+use crate::{db, Context, Error, Shared};
 use poise::serenity_prelude as s;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
@@ -28,7 +28,24 @@ pub fn prepare(db: &db::Database) -> rusqlite::Result<()> {
             page INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0,
             expires REAL NOT NULL, snapshot TEXT NOT NULL DEFAULT '[]', selected INTEGER,
             claimed INTEGER NOT NULL DEFAULT 0, spent_revision INTEGER NOT NULL DEFAULT -1
-         ); CREATE INDEX IF NOT EXISTS music_queue_views_expiry ON music_queue_views(expires);",
+         );
+         CREATE INDEX IF NOT EXISTS music_queue_views_expiry ON music_queue_views(expires);
+         CREATE INDEX IF NOT EXISTS queue_guild_order ON queue(guild_id,COALESCE(sort_order,id),id);
+         CREATE TABLE IF NOT EXISTS music_queue_revision(guild_id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+         CREATE TRIGGER IF NOT EXISTS music_queue_insert AFTER INSERT ON queue BEGIN
+            INSERT INTO music_queue_revision VALUES(NEW.guild_id,1)
+                ON CONFLICT(guild_id) DO UPDATE SET revision=revision+1;
+         END;
+         CREATE TRIGGER IF NOT EXISTS music_queue_delete AFTER DELETE ON queue BEGIN
+            INSERT INTO music_queue_revision VALUES(OLD.guild_id,1)
+                ON CONFLICT(guild_id) DO UPDATE SET revision=revision+1;
+         END;
+         CREATE TRIGGER IF NOT EXISTS music_queue_update AFTER UPDATE ON queue BEGIN
+            INSERT INTO music_queue_revision VALUES(OLD.guild_id,1)
+                ON CONFLICT(guild_id) DO UPDATE SET revision=revision+1;
+            INSERT INTO music_queue_revision SELECT NEW.guild_id,1 WHERE NEW.guild_id<>OLD.guild_id
+                ON CONFLICT(guild_id) DO UPDATE SET revision=revision+1;
+         END;",
     )
 }
 
@@ -102,37 +119,34 @@ fn claim_view(db: &db::Database, view: &View, now: f64) -> rusqlite::Result<Opti
     }))
 }
 
-/// Raw SQLite values preserve NULL, metadata bytes, request identity and sort keys.
-/// Include every row in order, not just the displayed page or selected track.
-fn queue_snapshot(
-    conn: &rusqlite::Connection,
-    guild: u64,
-) -> rusqlite::Result<(String, Vec<Item>)> {
-    let mut st = conn.prepare("SELECT id,url,title,details,sort_order FROM queue WHERE guild_id=?1 ORDER BY COALESCE(sort_order,id),id")?;
-    let rows = st.query_map([guild as i64], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<String>>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, Option<i64>>(4)?,
-        ))
-    })?;
-    let mut raw = Vec::new();
-    let mut items = Vec::new();
-    for row in rows {
-        let (id, url, title, details, order) = row?;
-        raw.push(json!([id, url, title, details, order]));
-        items.push(Item {
-            id,
-            url,
-            title: title.unwrap_or_default(),
-            details: details
-                .and_then(|d| serde_json::from_str(&d).ok())
-                .unwrap_or(Value::Null),
-        });
+fn queue_revision(conn: &rusqlite::Connection, guild: u64) -> rusqlite::Result<i64> {
+    Ok(conn.query_row(
+        "SELECT revision FROM music_queue_revision WHERE guild_id=?1",
+        [guild as i64],
+        |r| r.get(0),
+    ).optional()?.unwrap_or(0))
+}
+
+fn snapshot_revision(snapshot: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(snapshot).ok()?["revision"].as_i64()
+}
+
+pub(crate) fn order_ids(conn: &rusqlite::Connection, guild: u64) -> rusqlite::Result<Vec<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT id FROM queue WHERE guild_id=?1 ORDER BY COALESCE(sort_order,id),id",
+    )?;
+    let rows = statement.query_map([guild as i64], |r| r.get(0))?;
+    rows.collect()
+}
+
+pub(crate) fn set_order(tx: &rusqlite::Transaction<'_>, guild: u64, ids: &[i64]) -> rusqlite::Result<()> {
+    let mut update = tx.prepare("UPDATE queue SET sort_order=?1 WHERE guild_id=?2 AND id=?3")?;
+    for (index, id) in ids.iter().enumerate() {
+        if update.execute(params![index as i64 + 1, guild as i64, id])? != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
     }
-    Ok((json!(raw).to_string(), items))
+    Ok(())
 }
 
 fn short(text: &str, limit: usize) -> String {
@@ -160,29 +174,49 @@ fn render(
     view: &mut View,
     current: Option<&str>,
 ) -> rusqlite::Result<(String, Vec<s::CreateActionRow>)> {
-    let conn = db.lock();
-    let (snapshot, items) = queue_snapshot(&conn, view.guild)?;
-    if view.snapshot != snapshot {
-        view.selected = None;
-    }
-    view.snapshot = snapshot;
-    view.page = view.page.min(items.len().saturating_sub(1) / PAGE_SIZE);
-    view.selected = view.selected.filter(|id| items.iter().any(|i| i.id == *id));
-    conn.execute("UPDATE music_queue_views SET page=?2,snapshot=?3,selected=?4,claimed=0
-        WHERE id=?1 AND revision=?5 AND guild_id=?6 AND user_id=?7 AND channel_id=?8 AND message_id=?9",
-        params![view.id, view.page as i64, view.snapshot, view.selected, view.revision,
-            view.guild as i64, view.user as i64, view.channel as i64, view.message as i64])?;
+    let (total, page) = {
+        let conn = db.lock();
+        let revision = queue_revision(&conn, view.guild)?;
+        let total: usize = conn.query_row(
+            "SELECT COUNT(*) FROM queue WHERE guild_id=?1", [view.guild as i64],
+            |row| row.get::<_, i64>(0).map(|count| count as usize),
+        )?;
+        view.page = view.page.min(total.saturating_sub(1) / PAGE_SIZE);
+        let page = {
+            let mut statement = conn.prepare(
+                "SELECT id,url,title,details FROM queue WHERE guild_id=?1
+                 ORDER BY COALESCE(sort_order,id),id LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = statement.query_map(
+                params![view.guild as i64, PAGE_SIZE as i64, (view.page * PAGE_SIZE) as i64],
+                crate::music_runtime::row_item,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if snapshot_revision(&view.snapshot) != Some(revision) {
+            view.selected = None;
+        }
+        view.selected = view.selected.filter(|id| page.iter().any(|i| i.id == *id));
+        view.snapshot = json!({
+            "revision":revision,
+            "ids":page.iter().map(|i| i.id).collect::<Vec<_>>(),
+        }).to_string();
+        conn.execute("UPDATE music_queue_views SET page=?2,snapshot=?3,selected=?4,claimed=0
+            WHERE id=?1 AND revision=?5 AND guild_id=?6 AND user_id=?7 AND channel_id=?8 AND message_id=?9",
+            params![view.id, view.page as i64, view.snapshot, view.selected, view.revision,
+                view.guild as i64, view.user as i64, view.channel as i64, view.message as i64])?;
+        (total, page)
+    };
     let mut text = format!(
         "🎶 Очередь · {} треков · страница {}/{}\n",
-        items.len(),
+        total,
         view.page + 1,
-        items.len().saturating_sub(1) / PAGE_SIZE + 1
+        total.saturating_sub(1) / PAGE_SIZE + 1
     );
     if let Some(current) = current {
         text.push_str(&format!("Сейчас: {}\n", short(current, 150)));
     }
     let start = view.page * PAGE_SIZE;
-    let page = &items[start..items.len().min(start + PAGE_SIZE)];
     for (offset, item) in page.iter().enumerate() {
         let requester = item.details["requester"]
             .as_u64()
@@ -202,7 +236,7 @@ fn render(
             requester
         ));
     }
-    if items.is_empty() {
+    if total == 0 {
         text.push_str("\nОчередь пуста.");
     }
     let prefix = format!("queue:{}:{}", view.id, view.revision);
@@ -239,10 +273,10 @@ fn render(
             .disabled(view.page == 0),
         s::CreateButton::new(format!("{prefix}:next"))
             .label("→")
-            .disabled(start + PAGE_SIZE >= items.len()),
+            .disabled(start + PAGE_SIZE >= total),
         s::CreateButton::new(format!("{prefix}:refresh")).label("Обновить"),
     ]));
-    if !items.is_empty() {
+    if total != 0 {
         rows.push(s::CreateActionRow::Buttons(
             [
                 ("remove", "Удалить"),
@@ -309,17 +343,21 @@ fn edit(
     let Some((saved, selected)) = live else {
         return Ok("stale");
     };
-    let (snapshot, mut items) = queue_snapshot(&tx, view.guild)?;
-    if snapshot != saved || saved != view.snapshot || selected != view.selected {
+    if snapshot_revision(&saved) != Some(queue_revision(&tx, view.guild)?)
+        || saved != view.snapshot || selected != view.selected
+    {
         return Ok("stale");
     }
-    let Some(index) = items.iter().position(|i| Some(i.id) == selected) else {
-        return Ok("stale");
-    };
+    let Some(id) = selected else { return Ok("stale") };
+    let item = tx.query_row(
+        "SELECT id,url,title,details FROM queue WHERE guild_id=?1 AND id=?2",
+        params![view.guild as i64, id], crate::music_runtime::row_item,
+    ).optional()?;
+    let Some(item) = item else { return Ok("stale") };
     if !same_voice {
         return Ok("voice");
     }
-    if !moderator && items[index].details["requester"].as_u64() != Some(view.user) {
+    if !moderator && item.details["requester"].as_u64() != Some(view.user) {
         return Ok("permission");
     }
     if !matches!(action, "remove" | "up" | "down" | "first" | "last") {
@@ -328,26 +366,23 @@ fn edit(
     // Spending the revision and changing the exact snapshot commit together.
     if tx.execute("UPDATE music_queue_views SET spent_revision=revision WHERE id=?1 AND revision=?2 AND claimed=1 AND spent_revision<>revision",
         params![view.id, view.revision])? != 1 { return Ok("stale") }
-    let item = items.remove(index);
     if action == "remove" {
         tx.execute(
             "DELETE FROM queue WHERE guild_id=?1 AND id=?2",
             params![view.guild as i64, item.id],
         )?;
     } else {
+        let mut ids = order_ids(&tx, view.guild)?;
+        let Some(index) = ids.iter().position(|id| *id == item.id) else { return Ok("stale") };
+        ids.remove(index);
         let target = match action {
             "up" => index.saturating_sub(1),
-            "down" => (index + 1).min(items.len()),
+            "down" => (index + 1).min(ids.len()),
             "first" => 0,
-            _ => items.len(),
+            _ => ids.len(),
         };
-        items.insert(target, item);
-        for (position, item) in items.iter().enumerate() {
-            tx.execute(
-                "UPDATE queue SET sort_order=?1 WHERE guild_id=?2 AND id=?3",
-                params![position as i64 + 1, view.guild as i64, item.id],
-            )?;
-        }
+        ids.insert(target, item.id);
+        set_order(&tx, view.guild, &ids)?;
     }
     tx.commit()?;
     Ok("changed")
@@ -498,13 +533,11 @@ async fn handle_press(
         "refresh" => {}
         "select" => {
             if let s::ComponentInteractionDataKind::StringSelect { values } = &press.data.kind {
-                let id = values[0].parse::<i64>()?;
-                let rows: Vec<Value> = serde_json::from_str(&view.snapshot)?;
-                let valid = rows
-                    .iter()
-                    .skip(view.page.saturating_mul(PAGE_SIZE))
-                    .take(PAGE_SIZE)
-                    .any(|row| row[0].as_i64() == Some(id));
+                let Some(id) = values.first().and_then(|v| v.parse::<i64>().ok()) else { return Ok(()) };
+                let snapshot: Value = serde_json::from_str(&view.snapshot)?;
+                let valid = snapshot["ids"].as_array().is_some_and(|ids| {
+                    ids.iter().any(|value| value.as_i64() == Some(id))
+                });
                 if valid {
                     view.selected = Some(id);
                 } else {
@@ -514,21 +547,13 @@ async fn handle_press(
         }
         _ => {
             let guild = s::GuildId::new(view.guild);
-            let same_voice = ctx.cache.guild(guild).is_some_and(|g| {
-                let user = g
-                    .voice_states
-                    .get(&press.user.id)
-                    .and_then(|v| v.channel_id);
-                let bot = g
-                    .voice_states
-                    .get(&ctx.cache.current_user().id)
-                    .and_then(|v| v.channel_id);
-                user.is_some() && user == bot
-            });
+            let same_voice = crate::music_qol::user_in_bot_voice(ctx, guild, press.user.id);
             let moderator = press.member.as_ref().is_some_and(|member| {
                 crate::moderation::permissions(ctx, guild, member).manage_guild()
             });
-            notice = match edit(&data.db, view, action, moderator, same_voice, db::now())? {
+            notice = if !crate::music_channels::press_allowed(data, press)? {
+                "Музыкальный канал изменился.\n"
+            } else { match edit(&data.db, view, action, moderator, same_voice, db::now())? {
                 "changed" => {
                     crate::music_runtime::queue_changed(data, view.guild);
                     "✅ Очередь обновлена.\n"
@@ -538,7 +563,7 @@ async fn handle_press(
                     "Можно менять свои заявки; чужие — с правом «Управлять сервером».\n"
                 }
                 _ => "Очередь изменилась. Выбери трек снова.\n",
-            };
+            }};
         }
     }
     let current = data.music.with(view.guild, |st| {

@@ -2,6 +2,8 @@
 
 use crate::admin::report_error;
 use crate::ai::{self, Turn};
+use crate::ai_math;
+use crate::moderation::{self, Requester};
 use crate::reply::{display_name, whisper};
 use crate::text::money_text;
 use crate::{db, Context, Error};
@@ -37,57 +39,87 @@ pub async fn ask(
                 "Это не подходит: нужна картинка PNG, JPEG или WEBP не больше {} МБ.", ai::MAX_IMAGE_MB)).await;
         }
     }
-    ctx.defer().await?; // ИИ отвечает несколько секунд — показываем «бот думает…»
-    let delivery = ai::DeliveryReceipt::default();
-    let mut images = Vec::new();
-    if let Some(image) = &image {
-        match image.download().await {
-            Ok(bytes) => images.push((bytes, ai::image_type(image.content_type.as_deref()))),
-            Err(error) => report_error(ctx.http(), data, ctx.guild_id(), "Скачивание картинки для ИИ", &error.to_string()).await,
-        }
+    if let Some(refusal) = data.ai.limit_check(ctx.author().id.get()) {
+        return whisper(ctx, refusal).await;
     }
-    let name = display_name(ctx).await;
-    // На сервере модератор может попросить через /ask выдать варн или тайм-аут
-    let member = ctx.author_member().await.map(|member| member.into_owned());
-    let mut extras = ai::Extras::default();
-    extras.options = ai::RequestOptions { model: model.unwrap_or_default(), thinking, user: Some(ctx.author().id.get()), delivery: Some(&delivery) };
-    if let (Some(guild), Some(member)) = (ctx.guild_id(), &member) {
-        let note = crate::moderation::context_note(ctx.serenity_context(), guild, member, &question, &[]).await;
-        extras.moderation = Some((crate::moderation::Requester { ctx: ctx.serenity_context(), guild, member }, note));
-    }
-    let answer = match ai::ask(data, &question, &name, ctx.channel_id().get(), images, extras).await {
-        Ok(answer) => answer,
-        Err(error) => {
-            report_error(ctx.http(), data, ctx.guild_id(), "ИИ /ask", &error.to_string()).await;
-            Some(ai::error_text(&error).to_string())
-        }
+    let Ok(_slot) = data.ai.ask_slots.try_acquire() else {
+        return whisper(ctx, ai::error_text(&ai::AiError::Busy)).await;
     };
-    let Some(answer) = answer else {
-        // ИИ решил, что вопрос грубый, — убираем «бот думает…» и молчим
+    ctx.defer().await?;
+    if ai::directed_insult(data, &question).await {
         vanish(ctx).await;
         ai::punish_rudeness(ctx.serenity_context(), data, ctx.guild_id(), ctx.author(), ctx.channel_id()).await;
         return Ok(());
+    }
+    let bot = ctx.framework().bot_id().get();
+    let moderation = match (ctx.guild_id(), moderation::requested_action(&question, None, bot)) {
+        (Some(guild), Some(Ok(action))) => Some((Requester { ctx: ctx.serenity_context(), guild, user: ctx.author().id }, action)),
+        (Some(_), Some(Err(message))) => return whisper(ctx, message).await,
+        _ => None,
+    };
+
+    let delivery = ai::DeliveryReceipt::default();
+    let mut images = Vec::new();
+    if moderation.is_none() {
+        if let Some(image) = &image {
+            match ai::download_image(data, image).await {
+                Ok(bytes) => images.push((bytes, ai::image_type(image.content_type.as_deref()))),
+                Err(error) => report_error(ctx.http(), data, ctx.guild_id(), "Скачивание картинки для ИИ", &error.to_string()).await,
+            }
+        }
+    }
+    let name = display_name(ctx).await;
+    let extras = ai::Extras {
+        moderation,
+        options: ai::RequestOptions { model: model.unwrap_or_default(), thinking, user: Some(ctx.author().id.get()), delivery: Some(&delivery) },
+        ..Default::default()
+    };
+    let mut answer = match ai::ask(data, &question, &name, ctx.channel_id().get(), images, extras).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            report_error(ctx.http(), data, ctx.guild_id(), "ИИ /ask", &error.to_string()).await;
+            ai::error_text(&error).to_string()
+        }
     };
     if let Some(guild) = ctx.guild_id() {
-        data.db.reset_rude_strikes(guild.get(), ctx.author().id.get())?; // нормальный вопрос — счётчик грубостей с нуля
+        let _ = data.db.reset_rude_strikes(guild.get(), ctx.author().id.get());
     }
     let no_pings = serenity::CreateAllowedMentions::new(); // иначе ИИ мог бы случайно написать @everyone
-    for (index, part) in ai::split_message(&format!("❓ {question}\n\n{answer}"), 1900).into_iter().enumerate() {
+    if let Some(math) = ai_math::render_for_discord(&answer).await {
+        let mut reply = poise::CreateReply::default()
+            .content(ai_math::FILE_MESSAGE)
+            .attachment(math.attachment())
+            .allowed_mentions(no_pings.clone());
+        if let Some(image) = &image {
+            reply = reply.embed(serenity::CreateEmbed::new().color(0x8B5CF6).image(&image.url));
+        }
+        match ctx.send(reply).await {
+            Ok(_) => { delivery.delivered(); return Ok(()); }
+            Err(error) if ai_math::attachment_denied(&error) => answer = math.discord,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let question_preview: String = question.chars().take(300).collect();
+    let question_preview = if question.chars().count() > 300 { format!("{question_preview}…") } else { question_preview };
+    let parts = ai::split_message(&answer, 1300);
+    for (index, part) in parts.into_iter().enumerate() {
+        let part = if index == 0 { format!("❓ {question_preview}\n\n{part}") } else { part };
         let mut reply = poise::CreateReply::default().content(part).allowed_mentions(no_pings.clone());
         if let (0, Some(image)) = (index, &image) {
             // показываем картинку, о которой спрашивали, в «карточке» под первым сообщением
             reply = reply.embed(serenity::CreateEmbed::new().color(0x8B5CF6).image(&image.url));
         }
         ctx.send(reply).await?;
+        // После первого доставленного фрагмента повторы доставки не освобождают резерв.
+        delivery.delivered();
     }
-    delivery.delivered();
     Ok(())
 }
 
 /// Стереть память разговора с ботом в этом канале
 #[poise::command(slash_command)]
 pub async fn forget(ctx: Context<'_>) -> Result<(), Error> {
-    let removed = ctx.data().db.clear_ai_history(ctx.channel_id().get())?;
+    let removed = ai::forget_history(ctx.data(), ctx.channel_id().get())?;
     ctx.say(format!("💬 Память разговора в этом канале стёрта (сообщений: {removed}).")).await?;
     Ok(())
 }
@@ -106,9 +138,8 @@ pub async fn ai_limits(ctx: Context<'_>) -> Result<(), Error> {
     let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1)).and_hms_opt(0, 0, 0).unwrap();
     let personal_reset = tomorrow.and_local_timezone(chrono::Local).earliest().map_or(0, |time| time.timestamp());
     let wait = settings.cooldown as f64 - (db::now() - last);
-    let hydrogen_used = data.db.ai_model_usage(ctx.author().id.get(), &ai::moscow_day(), ai::HYDROGEN_MODEL)?;
-    // Общий лимит ключа Google
-    let used = data.db.ai_requests(&ai::google_day())?;
+    let (hydrogen_used, hydrogen_reserved) = ai::hydrogen_usage(data, ctx.author().id.get(), &ai::moscow_day())?;
+    let provider_usage = ai::provider_usage(data, &ai::google_day())?;
     let google_reset = ai::google_reset_time();
     // <t:ЧИСЛО:t> и <t:ЧИСЛО:R> — формат Discord: каждый увидит время в своём часовом поясе
     let mut lines = vec![
@@ -117,19 +148,23 @@ pub async fn ai_limits(ctx: Context<'_>) -> Result<(), Error> {
         "**Твой личный лимит** (ограничение бота):".to_string(),
         format!("• Осталось вопросов сегодня: **{left}** из {}", settings.daily_limit),
         format!("• Обновится: <t:{personal_reset}:t> (<t:{personal_reset}:R>)"),
-        format!("• Hydrogen: **{}** из {} ответов осталось; сброс в 00:00 МСК (<t:{}:R>)",
-                (ai::HYDROGEN_DAILY_LIMIT - hydrogen_used).max(0), ai::HYDROGEN_DAILY_LIMIT, ai::moscow_reset_time()),
+        format!("• Hydrogen: **{}** из {} ответов доступно, зарезервировано {hydrogen_reserved}. Сброс в 00:00 МСК (<t:{}:R>)",
+                (ai::HYDROGEN_DAILY_LIMIT - hydrogen_used - hydrogen_reserved).max(0), ai::HYDROGEN_DAILY_LIMIT, ai::moscow_reset_time()),
     ];
     if wait > 0.0 {
         lines.push(format!("• Следующий вопрос можно задать через {} сек", wait as i64 + 1));
     }
     lines.extend([
         String::new(),
-        format!("**Общий лимит Google** (на весь сервер, модель `{}`):", settings.model),
-        format!("• Запросов сегодня: **{used}** из ~{} (осталось ~{})", settings.google_daily_limit, (settings.google_daily_limit - used).max(0)),
-        format!("• За последнюю минуту: {} из ~{}", data.ai.requests_last_minute(), settings.google_minute_limit),
+        "**Запросы к Gemini**".to_string(),
+        format!("• Попыток за последнюю минуту: {}", data.ai.requests_last_minute()),
+        format!("• Ориентиры из настроек: до {} в сутки и {} в минуту на модель", settings.google_daily_limit, settings.google_minute_limit),
         format!("• Обновится: <t:{google_reset}:t> (<t:{google_reset}:R>)"),
     ]);
+    for row in provider_usage.into_iter().take(8) {
+        let model: String = row.model.chars().take(80).collect();
+        lines.push(format!("• `{model}`: {} попыток, {} ответов Gemini", row.attempts, row.succeeded));
+    }
     let quota_error = data.ai.last_quota_error();
     if db::now() - quota_error < 24.0 * 3600.0 {
         lines.push(format!("⚠️ Google последний раз отказал из-за лимита <t:{}:R>", quota_error as i64));
@@ -149,6 +184,13 @@ pub fn summary_task(hours: i64, chat: &str) -> String {
          Не выдумывай того, чего в сообщениях нет. Если сообщений почти нет — так и скажи одной фразой.\n\n{chat}")
 }
 
+fn may_read_summary(ctx: Context<'_>) -> bool {
+    let poise::Context::Application(app) = ctx else { return false; };
+    app.interaction.member.as_ref().and_then(|member| member.permissions).is_some_and(|permissions| {
+        permissions.administrator() || (permissions.view_channel() && permissions.read_message_history())
+    })
+}
+
 /// ИИ кратко перескажет, о чём говорили в этом канале
 #[poise::command(slash_command, guild_only)]
 pub async fn summary(
@@ -162,6 +204,9 @@ pub async fn summary(
     if !data.ai.ready() {
         return whisper(ctx, "ИИ не настроен: нет ключа Gemini.").await;
     }
+    if !may_read_summary(ctx) {
+        return whisper(ctx, "Для пересказа нужно право «Читать историю сообщений» в этом канале.").await;
+    }
     if let Some(refusal) = data.ai.limit_check(ctx.author().id.get()) {
         return whisper(ctx, refusal).await;
     }
@@ -169,7 +214,8 @@ pub async fn summary(
     let after = db::now() as i64 - hours * 3600;
     // Discord отдаёт историю порциями по 100 сообщений, от новых к старым
     let (mut lines, mut before, mut done) = (Vec::new(), None::<serenity::MessageId>, false);
-    while !done && lines.len() < SUMMARY_MAX_MESSAGES {
+    for _ in 0..SUMMARY_MAX_MESSAGES.div_ceil(100) {
+        if done || lines.len() >= SUMMARY_MAX_MESSAGES { break; }
         let mut request = serenity::GetMessages::new().limit(100);
         if let Some(before) = before {
             request = request.before(before);
@@ -210,9 +256,9 @@ pub async fn summary(
     let text = ai::strip_tags(&answer.text, &ai::MOD_TAGS);
     let text = if text.is_empty() { "🤔 ИИ не дал ответа.".to_string() } else { text };
     for part in ai::split_message(&format!("📝 **О чём говорили за {hours} ч** ({} сообщений):\n{text}", lines.len()), 1900) {
-        ctx.send(poise::CreateReply::default().content(part).allowed_mentions(serenity::CreateAllowedMentions::new())).await?;
+        ctx.send(poise::CreateReply::default().content(part).ephemeral(true).allowed_mentions(serenity::CreateAllowedMentions::new())).await?;
+        if !text.is_empty() { delivery.delivered(); }
     }
-    delivery.delivered();
     Ok(())
 }
 
@@ -326,8 +372,8 @@ pub async fn quiz(
                 "🧠 **Викторина:** {question}\nНа ответ {seconds} сек., у каждого одна попытка. Приз — {}.", money_text(reward)))
             .components(quiz_buttons(&options, None)))
         .await?;
-    let message_id = reply.message().await?.id;
     delivery.delivered();
+    let message_id = reply.message().await?.id;
     let result = |ending: String| format!("🧠 **Викторина:** {question}\n✅ Правильный ответ: **{}**\n{ending}", options[correct]);
     let (deadline, mut tried) = (tokio::time::Instant::now() + Duration::from_secs(seconds), HashSet::new());
     loop {

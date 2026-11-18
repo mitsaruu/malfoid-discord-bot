@@ -1,8 +1,8 @@
-//! Мелкие функции для текста: числа, склонения, время. Ведут себя так же, как одноимённые в bot.py.
+//! Числа, склонения и время для сообщений бота.
 
 /// Выбирает форму слова по числу: plural(1, "монета", "монеты", "монет") → "монета".
 pub fn plural<'a>(n: i64, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
-    let n = n.abs();
+    let n = n.unsigned_abs();
     if n % 10 == 1 && n % 100 != 11 {
         one
     } else if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) {
@@ -14,7 +14,7 @@ pub fn plural<'a>(n: i64, one: &'a str, few: &'a str, many: &'a str) -> &'a str 
 
 /// Число с пробелами между тысячами: 15430 → "15 430".
 pub fn number(value: i64) -> String {
-    let digits = value.abs().to_string();
+    let digits = value.unsigned_abs().to_string();
     let mut result = String::new();
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index) % 3 == 0 {
@@ -69,6 +69,7 @@ mod tests {
         assert_eq!(number(15430), "15 430");
         assert_eq!(number(1234567), "1 234 567");
         assert_eq!(number(-2500), "-2 500");
+        assert_eq!(money_text(i64::MIN), "-9 223 372 036 854 775 808 монет");
         assert_eq!(money_text(1), "1 монета");
         assert_eq!(money_text(15430), "15 430 монет");
     }

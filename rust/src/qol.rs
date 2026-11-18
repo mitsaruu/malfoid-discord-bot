@@ -10,7 +10,7 @@ pub async fn confirm(ctx: Context<'_>, text: impl Into<String>) -> Result<bool, 
     )
     .await?;
     if let Some(press) = accepted {
-        crate::reply::finish_challenge(ctx, &press, "✅ Подтверждено.".into()).await?;
+        crate::reply::finish_challenge(ctx, &press, "⏳ Выполняю…".into()).await?;
         Ok(true)
     } else {
         Ok(false)
@@ -173,6 +173,7 @@ pub async fn help_pressed(
     slash_command,
     guild_only,
     ephemeral,
+    required_permissions = "MANAGE_GUILD",
     default_member_permissions = "MANAGE_GUILD"
 )]
 pub async fn server_settings(
@@ -184,15 +185,25 @@ pub async fn server_settings(
 ) -> Result<(), Error> {
     let guild = ctx.guild_id().unwrap();
     let data = ctx.data();
+    #[cfg(feature = "voice")]
     if let Some(minutes) = empty_minutes {
         data.db.lock().execute("INSERT INTO music_preferences(guild_id,empty_seconds) VALUES(?1,?2) ON CONFLICT(guild_id) DO UPDATE SET empty_seconds=excluded.empty_seconds",rusqlite::params![guild.get() as i64,minutes*60])?;
     }
+    #[cfg(not(feature = "voice"))]
+    if empty_minutes.is_some() {
+        return crate::reply::whisper(ctx, "Настройка автовыхода доступна в сборке с музыкой.").await;
+    }
     let channel = |id: Option<u64>| id.map_or("выключен".into(), |id| format!("<#{}>", id));
-    let daily = data
-        .db
-        .daily_settings()?
-        .into_iter()
-        .find(|row| row.guild == guild.get());
+    use rusqlite::OptionalExtension;
+    let daily = data.db.lock().query_row(
+        "SELECT channel_id, morning, evening, timezone FROM daily_settings WHERE guild_id=?1",
+        [guild.get() as i64],
+        |row| Ok(format!("<#{}>, {} / {} ({})",
+            row.get::<_, Option<i64>>(0)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(3)?.unwrap_or_default())),
+    ).optional()?;
     let patch: Option<u64> = data
         .db
         .lock()
@@ -202,11 +213,10 @@ pub async fn server_settings(
             |r| r.get::<_, i64>(0).map(|id| id as u64),
         )
         .ok();
-    let settings = crate::config::Settings::load(&data.dir.join("config/settings.ini"));
     let mut text=format!("Игры: {}\nМузыка: {}\nЛоги: {}\nПатчноуты: {}\nУтро/вечер: {}\n\nИИ: {}\nМини-приложение: {}\nАнти-спам: {}",
         channel(data.db.games_channel(guild.get())?),channel(crate::music_channels::channel(&data.db,guild.get())?),channel(data.db.log_channel(guild.get())?),channel(patch),
-        daily.map_or("выключены".into(),|r|format!("<#{}>, {} / {} ({})",r.channel,r.morning,r.evening,r.timezone)),
-        data.ai.ready(),data.miniapp_ready,settings.text("antispam","enabled","on"));
+        daily.unwrap_or_else(|| "выключены".into()),
+        data.ai.ready(),data.miniapp_ready(),if data.chat.settings.antispam { "включён" } else { "выключен" });
     #[cfg(feature = "voice")]
     {
         text.push_str(&format!(

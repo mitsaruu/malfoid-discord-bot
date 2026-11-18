@@ -6,7 +6,8 @@
 use crate::{Context, Data, Error};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use poise::serenity_prelude as s;
-use rusqlite::{Connection, OpenFlags};
+#[cfg(test)]
+use rusqlite::Connection;
 use std::{
     collections::{BTreeSet, VecDeque},
     fs,
@@ -258,7 +259,7 @@ pub async fn status(ctx: Context<'_>) -> Result<(), Error> {
     let content = format_status(
         latency,
         ctx.data().started_at.elapsed(),
-        ctx.data().miniapp_ready,
+        ctx.data().miniapp_ready(),
         &music,
         backup,
         ctx.data().diagnostics.last_error(guild.get()).as_ref(),
@@ -482,20 +483,7 @@ fn last_valid_backup(root: &Path) -> Result<BackupSnapshot, Error> {
         if Instant::now() >= deadline {
             return Ok(BackupSnapshot::Unavailable);
         }
-        // Read-only connection: never open the live database or create a file.
-        let checked = (|| -> rusqlite::Result<bool> {
-            let connection = Connection::open_with_flags(
-                path.join("levels.db"),
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            connection.busy_timeout(Duration::from_millis(100))?;
-            let results = connection
-                .prepare("PRAGMA quick_check(1)")?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(results == ["ok"])
-        })();
-        if matches!(checked, Ok(true)) {
+        if matches!(crate::backups::check_database(&path), Ok(true)) {
             return Ok(BackupSnapshot::Valid(created));
         }
     }

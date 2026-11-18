@@ -2,19 +2,26 @@
 //! Текст пишет ИИ, а без него — запасной факт. Раз в минуту бот проверяет, не пора ли отправить.
 
 use crate::admin::{bot_permissions, report_error};
-use crate::db::DailySettings;
+use crate::db::{self, DailySettings, Database};
+use crate::reminders::{delivery_message, destination_gone, retry_delay};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use tokio::sync::Mutex;
 use crate::reply::whisper;
 use crate::{ai, Context, Data, Error, Shared};
 use poise::serenity_prelude as serenity;
 use rand::seq::IndexedRandom;
 
 const WINDOW_MINUTES: i64 = 30; // если бот был выключен в нужную минуту, сообщение ещё отправится в течение 30 минут
+const DELIVERY_BATCH: usize = 16;
+const DELIVERY_CONCURRENCY: usize = 4;
+static SCHEDULE_LOCKS: [Mutex<()>; 64] = [const { Mutex::const_new(()) }; 64];
 
 /// О чём рассказывать факты (тема выбирается случайно).
 const TOPICS: [&str; 8] = ["математика", "физика", "инженерия", "электроника и радиотехника", "астрономия",
                            "информатика и программирование", "химия", "история изобретений"];
 
-/// Запасные факты — если ИИ не настроен или недоступен (те же, что в bot.py).
+/// Запасные факты — если ИИ не настроен или недоступен.
 const FALLBACK_FACTS: [&str; 14] = [
     "число π иррационально: его десятичная запись бесконечна и никогда не повторяется. Это доказал Иоганн Ламберт в XVIII веке.",
     "свет от Солнца летит до Земли около 8 минут 20 секунд — мы всегда видим Солнце немного «в прошлом».",
@@ -32,7 +39,7 @@ const FALLBACK_FACTS: [&str; 14] = [
     "Томас Хейлс в 1999 году доказал, что шестиугольные соты — способ разбить плоскость на равные ячейки с наименьшей общей длиной границ.",
 ];
 
-/// Часовые пояса для /daily_setup (код пояса — как в bot.py, чтобы старые настройки из базы подходили).
+/// Часовые пояса для /daily_setup.
 #[derive(poise::ChoiceParameter, Clone, Copy)]
 pub enum Zone {
     #[name = "Израиль"]
@@ -108,21 +115,184 @@ fn scheduled(now: chrono::NaiveDateTime, at: &str) -> Option<chrono::NaiveDateTi
     now.date().and_hms_opt(hours.parse().ok()?, minutes.parse().ok()?, 0)
 }
 
-/// Пора ли отправить: нужное время уже наступило, но прошло не больше WINDOW_MINUTES минут, и сегодня ещё не отправляли.
-pub fn is_due(now: chrono::NaiveDateTime, at: &str, last: &str) -> bool {
-    if last == now.date().to_string() {
-        return false;
+/// Find the dated occurrence before midnight as well as today's. For a DST
+/// overlap use the first occurrence; a skipped wall-clock time has no slot.
+fn due_day(now: DateTime<Utc>, zone: chrono_tz::Tz, at: &str, last: &str) -> Option<NaiveDate> {
+    let time = NaiveTime::parse_from_str(at, "%H:%M").ok()?;
+    let today = now.with_timezone(&zone).date_naive();
+    [Some(today), today.pred_opt()].into_iter().flatten().find(|day| {
+        let Some(scheduled) = zone.from_local_datetime(&day.and_time(time)).earliest() else {
+            return false;
+        };
+        day.to_string().as_str() > last
+            && (0..WINDOW_MINUTES * 60).contains(&(now - scheduled.with_timezone(&Utc)).num_seconds())
+    })
+}
+
+#[cfg(test)]
+fn is_due(now: chrono::NaiveDateTime, at: &str, last: &str) -> bool {
+    due_day(now.and_utc(), chrono_tz::UTC, at, last).is_some()
+}
+
+fn schema(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS daily_schedule_revision (
+             guild_id INTEGER PRIMARY KEY, revision INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS daily_delivery (
+             guild_id INTEGER NOT NULL, kind INTEGER NOT NULL, revision INTEGER NOT NULL,
+             day TEXT NOT NULL, channel_id INTEGER NOT NULL, nonce TEXT NOT NULL,
+             text TEXT, failures INTEGER NOT NULL DEFAULT 0, retry_at REAL NOT NULL,
+             PRIMARY KEY (guild_id, kind)
+         );
+         CREATE INDEX IF NOT EXISTS daily_delivery_due ON daily_delivery (retry_at);",
+    )
+}
+
+struct Delivery {
+    guild: u64,
+    kind: Kind,
+    revision: i64,
+    day: String,
+    channel: u64,
+    nonce: String,
+    text: Option<String>,
+    failures: i64,
+}
+
+impl Kind {
+    fn code(self) -> i64 {
+        i64::from(self == Self::Evening)
     }
-    scheduled(now, at).is_some_and(|scheduled| (0..WINDOW_MINUTES * 60).contains(&(now - scheduled).num_seconds()))
+
+    fn last_column(self) -> &'static str {
+        match self {
+            Self::Morning => "last_morning",
+            Self::Evening => "last_evening",
+        }
+    }
+}
+
+fn schedule(db: &Database, now: DateTime<Utc>) -> rusqlite::Result<()> {
+    let mut connection = db.lock();
+    schema(&connection)?;
+    let transaction = connection.transaction()?;
+    let mut rows = transaction.prepare(
+        "SELECT s.guild_id, s.channel_id, s.timezone, s.morning, s.evening,
+                s.last_morning, s.last_evening, COALESCE(r.revision, 0)
+         FROM daily_settings s LEFT JOIN daily_schedule_revision r USING (guild_id)
+         WHERE s.guild_id > 0 AND s.channel_id > 0",
+    )?;
+    let mut jobs = rows.query([])?;
+    while let Some(row) = jobs.next()? {
+        let guild = row.get::<_, i64>(0)? as u64;
+        let channel = row.get::<_, i64>(1)? as u64;
+        let zone = row.get::<_, Option<String>>(2)?.as_deref()
+            .and_then(|zone| zone.parse().ok()).unwrap_or(chrono_tz::UTC);
+        let revision: i64 = row.get(7)?;
+        for (kind, at, last) in [(Kind::Morning, 3, 5), (Kind::Evening, 4, 6)] {
+            let at = row.get::<_, Option<String>>(at)?.unwrap_or_default();
+            let last = row.get::<_, Option<String>>(last)?.unwrap_or_default();
+            if let Some(day) = due_day(now, zone, &at, &last) {
+                transaction.execute(
+                    "INSERT INTO daily_delivery (guild_id, kind, revision, day, channel_id, nonce, retry_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(guild_id, kind) DO UPDATE SET revision=excluded.revision,
+                         day=excluded.day, channel_id=excluded.channel_id, nonce=excluded.nonce,
+                         text=NULL, failures=0, retry_at=excluded.retry_at
+                     WHERE daily_delivery.revision != excluded.revision OR daily_delivery.day < excluded.day",
+                    params![guild as i64, kind.code(), revision, day.to_string(), channel as i64,
+                            format!("daily-{:016x}", rand::random::<u64>()), now.timestamp() as f64],
+                )?;
+            }
+        }
+    }
+    drop(jobs);
+    drop(rows);
+    transaction.commit()
+}
+
+fn pending(db: &Database, now: f64) -> rusqlite::Result<Vec<Delivery>> {
+    let connection = db.lock();
+    let mut statement = connection.prepare(
+        "SELECT guild_id, kind, revision, day, channel_id, nonce, text, failures
+         FROM daily_delivery WHERE retry_at <= ?1 ORDER BY retry_at, guild_id, kind LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![now, DELIVERY_BATCH as i64], |row| {
+        Ok(Delivery {
+            guild: row.get::<_, i64>(0)? as u64,
+            kind: if row.get::<_, i64>(1)? == 0 { Kind::Morning } else { Kind::Evening },
+            revision: row.get(2)?,
+            day: row.get(3)?,
+            channel: row.get::<_, i64>(4)? as u64,
+            nonce: row.get(5)?,
+            text: row.get(6)?,
+            failures: row.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn save_delivery_text(db: &Database, job: &Delivery, text: &str) -> rusqlite::Result<bool> {
+    let updated = db.lock().execute(
+        "UPDATE daily_delivery SET text = ?1 WHERE guild_id = ?2 AND kind = ?3 AND nonce = ?4",
+        params![text, job.guild as i64, job.kind.code(), job.nonce],
+    )?;
+    Ok(updated == 1)
+}
+
+fn finish_delivery(db: &Database, job: &Delivery) -> rusqlite::Result<()> {
+    let mut connection = db.lock();
+    let transaction = connection.transaction()?;
+    let removed = transaction.execute(
+        "DELETE FROM daily_delivery WHERE guild_id = ?1 AND kind = ?2 AND nonce = ?3",
+        params![job.guild as i64, job.kind.code(), job.nonce],
+    )?;
+    if removed == 1 {
+        let last = job.kind.last_column();
+        transaction.execute(
+            &format!("UPDATE daily_settings SET {last} = ?1 WHERE guild_id = ?2
+             AND COALESCE((SELECT revision FROM daily_schedule_revision WHERE guild_id = ?2), 0) = ?3
+             AND COALESCE({last}, '') < ?1"),
+            params![job.day, job.guild as i64, job.revision],
+        )?;
+    }
+    transaction.commit()
+}
+
+fn change_schedule(db: &Database, guild: u64, settings: Option<&DailySettings>) -> rusqlite::Result<bool> {
+    let mut connection = db.lock();
+    schema(&connection)?;
+    let transaction = connection.transaction()?;
+    let changed = match settings {
+        Some(row) => transaction.execute(
+            "INSERT INTO daily_settings (guild_id, channel_id, timezone, morning, evening, last_morning, last_evening)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (guild_id) DO UPDATE SET channel_id = excluded.channel_id,
+                 timezone = excluded.timezone, morning = excluded.morning, evening = excluded.evening,
+                 last_morning = excluded.last_morning, last_evening = excluded.last_evening",
+            params![guild as i64, row.channel as i64, row.timezone, row.morning, row.evening, row.last_morning, row.last_evening],
+        )?,
+        None => transaction.execute("DELETE FROM daily_settings WHERE guild_id = ?1", [guild as i64])?,
+    };
+    transaction.execute(
+        "INSERT INTO daily_schedule_revision (guild_id, revision) VALUES (?1, 1)
+         ON CONFLICT(guild_id) DO UPDATE SET revision = revision + 1",
+        [guild as i64],
+    )?;
+    transaction.execute("DELETE FROM daily_delivery WHERE guild_id = ?1", [guild as i64])?;
+    transaction.commit()?;
+    Ok(changed == 1)
 }
 
 /// Текст утреннего или вечернего сообщения. Пишет ИИ, а без него — запасной вариант.
-async fn make_text(http: &serenity::Http, data: &Data, kind: Kind, guild: Option<serenity::GuildId>) -> String {
+async fn make_text(
+    http: &serenity::Http, data: &Data, kind: Kind, guild: Option<serenity::GuildId>, today: NaiveDate,
+) -> String {
     let (topic, fact) = {
         let mut random = rand::rng();
         (*TOPICS.choose(&mut random).unwrap(), *FALLBACK_FACTS.choose(&mut random).unwrap())
     };
-    let today = chrono::Local::now().date_naive();
     let task = match kind {
         Kind::Morning => format!(
             "Напиши утреннее сообщение для Discord-чата друзей. Пожелай всем доброго утра и удачи на сегодня, \
@@ -152,57 +322,100 @@ async fn make_text(http: &serenity::Http, data: &Data, kind: Kind, guild: Option
     }
 }
 
-/// Отправляет утреннее или вечернее сообщение в канал. Возвращает true, если получилось.
-async fn send(http: &serenity::Http, data: &Data, channel: serenity::ChannelId, kind: Kind, guild: Option<serenity::GuildId>) -> bool {
-    let text: String = make_text(http, data, kind, guild).await.chars().take(4000).collect();
+fn message(kind: Kind, text: String) -> serenity::CreateMessage {
+    let description: String = text.chars().take(2000).collect();
     let (title, color) = match kind {
         Kind::Morning => ("☀️ Доброе утро!", 0xF59E0B),
         Kind::Evening => ("🌙 Спокойной ночи!", 0x6366F1),
     };
-    let embed = serenity::CreateEmbed::new().title(title).description(text).color(color);
-    match channel.send_message(http, serenity::CreateMessage::new().embed(embed)).await {
-        Ok(_) => true,
-        Err(error) => {
-            report_error(http, data, guild, "Отправка ежедневного сообщения", &error.to_string()).await;
-            false
-        }
-    }
+    serenity::CreateMessage::new()
+        .embed(serenity::CreateEmbed::new().title(title).description(description).color(color))
+        .allowed_mentions(serenity::CreateAllowedMentions::new())
 }
 
-/// Раз в минуту проверяет, не пора ли отправить сообщения.
+async fn send_scheduled(http: &serenity::Http, data: &Data, job: Delivery) -> Result<(), Error> {
+    let guild = Some(serenity::GuildId::new(job.guild));
+    let text = match &job.text {
+        Some(text) => text.clone(),
+        None => make_text(http, data, job.kind, guild, job.day.parse()?).await,
+    };
+    // Settings can change while Gemini is working. Serialize only the final
+    // send against settings commands and test that this delivery still exists.
+    let _update = SCHEDULE_LOCKS[job.guild as usize % SCHEDULE_LOCKS.len()].lock().await;
+    if !save_delivery_text(&data.db, &job, &text)? {
+        return Ok(());
+    }
+    let message = delivery_message(message(job.kind, text), job.nonce.clone());
+    match serenity::ChannelId::new(job.channel).send_message(http, message).await {
+        Ok(_) => finish_delivery(&data.db, &job)?,
+        Err(error) if destination_gone(&error) => {
+            eprintln!("Ежедневное сообщение для сервера {}: канал удалён: {error}", job.guild);
+            finish_delivery(&data.db, &job)?;
+        }
+        Err(error) => {
+            let failures = job.failures.saturating_add(1).min(8);
+            data.db.lock().execute(
+                "UPDATE daily_delivery SET failures = ?1, retry_at = ?2
+                 WHERE guild_id = ?3 AND kind = ?4 AND nonce = ?5",
+                params![failures, db::now() + retry_delay(failures), job.guild as i64, job.kind.code(), job.nonce],
+            )?;
+            eprintln!("Ежедневное сообщение для сервера {}: будет повтор: {error}", job.guild);
+        }
+    }
+    Ok(())
+}
+
+/// Schedule catch-up slots independently of slow generation or Discord delivery.
 pub fn start_loop(http: std::sync::Arc<serenity::Http>, data: Shared) {
+    let state = data.clone();
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
-            let rows = match data.db.daily_settings() {
-                Ok(rows) => rows,
+            if let Err(error) = schedule(&state.db, Utc::now()) {
+                eprintln!("Ежедневные сообщения: {error}");
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let jobs = match pending(&data.db, db::now()) {
+                Ok(jobs) => jobs,
                 Err(error) => {
-                    println!("Ежедневные сообщения: {error}");
+                    eprintln!("Ежедневные сообщения: {error}");
                     continue;
                 }
             };
-            for row in rows {
-                let now = local_now(&row.timezone); // текущее время в часовом поясе сервера
-                for (kind, at, last) in [(Kind::Morning, &row.morning, &row.last_morning), (Kind::Evening, &row.evening, &row.last_evening)] {
-                    if !is_due(now, at, last) {
-                        continue;
-                    }
-                    // Сначала отмечаем, что отправили, — чтобы не отправить дважды, если ИИ будет долго думать
-                    if let Err(error) = data.db.mark_daily_sent(row.guild, kind == Kind::Morning, &now.date().to_string()) {
-                        println!("Ежедневные сообщения: {error}");
-                        continue;
-                    }
-                    let guild = Some(serenity::GuildId::new(row.guild.max(1)));
-                    send(&http, &data, serenity::ChannelId::new(row.channel.max(1)), kind, guild).await;
+            let mut workers = tokio::task::JoinSet::new();
+            for job in jobs {
+                let http = http.clone();
+                let data = data.clone();
+                workers.spawn(async move { send_scheduled(&http, &data, job).await });
+                if workers.len() == DELIVERY_CONCURRENCY {
+                    log_worker_result(workers.join_next().await);
                 }
+            }
+            while let Some(result) = workers.join_next().await {
+                log_worker_result(Some(result));
             }
         }
     });
 }
 
+fn log_worker_result(result: Option<Result<Result<(), Error>, tokio::task::JoinError>>) {
+    match result {
+        Some(Ok(Err(error))) => eprintln!("Ежедневные сообщения: {error}"),
+        Some(Err(error)) => eprintln!("Ежедневные сообщения: {error}"),
+        _ => (),
+    }
+}
+
 /// Включить утренние и вечерние сообщения
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD")]
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_GUILD", default_member_permissions = "MANAGE_GUILD")]
 pub async fn daily_setup(
     ctx: Context<'_>,
     #[description = "В какой канал писать"]
@@ -226,8 +439,9 @@ pub async fn daily_setup(
     // Если сегодня это время уже прошло — первое сообщение будет завтра (отмечаем как будто уже отправили)
     let code = timezone.code();
     let now = local_now(code);
-    let today = now.date().to_string();
-    let mark = |at: &str| if passed(now, at) { today.clone() } else { String::new() };
+    let today = now.date();
+    let yesterday = today.pred_opt().unwrap_or(today);
+    let mark = |at: &str| if passed(now, at) { today } else { yesterday }.to_string();
     let settings = DailySettings {
         guild: ctx.guild_id().unwrap().get(),
         channel: channel.id.get(),
@@ -237,7 +451,10 @@ pub async fn daily_setup(
         morning: times[0].clone(),
         evening: times[1].clone(),
     };
-    ctx.data().db.set_daily_settings(&settings)?;
+    {
+        let _update = SCHEDULE_LOCKS[settings.guild as usize % SCHEDULE_LOCKS.len()].lock().await;
+        change_schedule(&ctx.data().db, settings.guild, Some(&settings))?;
+    }
     ctx.say(format!(
         "✅ Готово! Буду писать в <#{}>: утром в **{}** и вечером в **{}** ({}).\nПроверить прямо сейчас: /daily_test",
         channel.id, settings.morning, settings.evening, poise::ChoiceParameter::name(&timezone))).await?;
@@ -245,9 +462,14 @@ pub async fn daily_setup(
 }
 
 /// Выключить утренние и вечерние сообщения
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD")]
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_GUILD", default_member_permissions = "MANAGE_GUILD")]
 pub async fn daily_off(ctx: Context<'_>) -> Result<(), Error> {
-    if ctx.data().db.delete_daily_settings(ctx.guild_id().unwrap().get())? {
+    let guild = ctx.guild_id().unwrap().get();
+    let changed = {
+        let _update = SCHEDULE_LOCKS[guild as usize % SCHEDULE_LOCKS.len()].lock().await;
+        change_schedule(&ctx.data().db, guild, None)?
+    };
+    if changed {
         ctx.say("🔕 Утренние и вечерние сообщения выключены.").await?;
         Ok(())
     } else {
@@ -256,17 +478,25 @@ pub async fn daily_off(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Прислать утреннее или вечернее сообщение прямо сейчас
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD")]
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_GUILD", default_member_permissions = "MANAGE_GUILD")]
 pub async fn daily_test(ctx: Context<'_>, #[description = "Какое сообщение прислать"] kind: Kind) -> Result<(), Error> {
     let data = ctx.data();
     let guild = ctx.guild_id().unwrap();
-    let configured = data.db.daily_settings()?.into_iter().find(|row| row.guild == guild.get()).map(|row| row.channel);
-    let channel = configured.map_or(ctx.channel_id(), serenity::ChannelId::new); // не настроено — пишем в текущий канал
-    ctx.defer_ephemeral().await?; // ИИ пишет текст несколько секунд
-    let text = if send(ctx.http(), data, channel, kind, Some(guild)).await {
-        "✅ Отправила."
-    } else {
-        "Не получилось отправить — подробности в канале логов."
+    let configured = data.db.lock().query_row(
+        "SELECT channel_id, timezone FROM daily_settings WHERE guild_id = ?1",
+        [guild.get() as i64],
+        |row| Ok((row.get::<_, Option<i64>>(0)?.map(|id| id as u64), row.get::<_, Option<String>>(1)?)),
+    ).optional()?;
+    let (channel, timezone) = configured.unwrap_or_default();
+    let channel = channel.filter(|channel| *channel > 0).map_or(ctx.channel_id(), serenity::ChannelId::new);
+    ctx.defer_ephemeral().await?;
+    let generated = make_text(ctx.http(), data, kind, Some(guild), local_now(timezone.as_deref().unwrap_or("UTC")).date()).await;
+    let text = match channel.send_message(ctx.http(), message(kind, generated)).await {
+        Ok(_) => "✅ Отправила.",
+        Err(error) => {
+            report_error(ctx.http(), data, Some(guild), "Отправка ежедневного сообщения", &error.to_string()).await;
+            "Не получилось отправить — подробности в канале логов."
+        }
     };
     whisper(ctx, text).await
 }
@@ -297,6 +527,50 @@ mod tests {
         assert!(!is_due(at(7, 59), "08:00", ""));
         assert!(!is_due(at(8, 5), "08:00", "2026-11-12")); // сегодня уже отправили
         assert!(!is_due(at(8, 5), "чушь", ""));
+    }
+
+
+    #[test]
+    fn catch_up_before_midnight_slot_expires() {
+        assert!(is_due(at(0, 5), "23:50", "2026-11-10"));
+        assert!(!is_due(at(0, 5), "23:50", "2026-11-11"));
+        assert!(!is_due(at(0, 20), "23:50", ""));
+    }
+
+    #[test]
+    fn persisted_job_cannot_mark_replaced_settings_sent() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        let mut settings = DailySettings {
+            guild: 1, channel: 2, timezone: "UTC".into(), morning: "08:00".into(),
+            evening: "23:50".into(), last_morning: String::new(), last_evening: String::new(),
+        };
+        change_schedule(&db, 1, Some(&settings)).unwrap();
+        let current = at(0, 5).and_utc();
+        super::schedule(&db, current).unwrap();
+        let old = pending(&db, current.timestamp() as f64).unwrap().pop().unwrap();
+        assert_eq!(old.day, "2026-11-11");
+        assert!(save_delivery_text(&db, &old, "text ready").unwrap());
+        assert_eq!(pending(&db, current.timestamp() as f64).unwrap()[0].text.as_deref(), Some("text ready"));
+        settings.channel = 3;
+        change_schedule(&db, 1, Some(&settings)).unwrap();
+        assert!(!save_delivery_text(&db, &old, "old text").unwrap());
+        super::schedule(&db, current).unwrap();
+        finish_delivery(&db, &old).unwrap();
+        let replacement = pending(&db, current.timestamp() as f64).unwrap().pop().unwrap();
+        assert_ne!(replacement.revision, old.revision);
+        assert_eq!(replacement.channel, 3);
+        finish_delivery(&db, &replacement).unwrap();
+        super::schedule(&db, current).unwrap();
+        assert!(pending(&db, current.timestamp() as f64).unwrap().is_empty());
+    }
+
+    #[test]
+    fn daylight_saving_uses_first_occurrence_and_ignores_nonexistent_slot() {
+        let berlin = chrono_tz::Europe::Berlin;
+        let date = |value: &str| value.parse::<DateTime<Utc>>().unwrap();
+        assert!(due_day(date("2026-03-29T01:10:00Z"), berlin, "02:00", "").is_none());
+        assert!(due_day(date("2026-10-25T00:10:00Z"), berlin, "02:00", "").is_some());
+        assert!(due_day(date("2026-10-25T01:10:00Z"), berlin, "02:00", "").is_none());
     }
 
     #[test]

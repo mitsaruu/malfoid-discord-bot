@@ -30,20 +30,10 @@ pub fn user_name(user: &serenity::User) -> String {
     user.global_name.clone().unwrap_or_else(|| user.name.clone())
 }
 
-/// Проверяет, хватает ли монет, и списывает их (ставка, цена кейса, корм — what).
-/// Ok(true) — списали. Ok(false) — не хватило, человеку уже ответили.
-pub async fn take_money(ctx: Context<'_>, amount: i64, what: &str) -> Result<bool, Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let name = display_name(ctx).await;
-    let (balance, _) = data.db.wallet(guild, user, &name, data.economy.start_balance)?;
-    if amount > balance {
-        whisper(ctx, format!(
-            "Не хватает монет: у тебя {}, а {what} — {}. Заработать можно через /work.",
-            money_text(balance), money_text(amount))).await?;
-        return Ok(false);
-    }
-    data.db.add_money(guild, user, &name, data.economy.start_balance, -amount)?;
-    Ok(true)
+pub(crate) fn insufficient_money(balance: i64, amount: i64, what: &str) -> String {
+    format!(
+        "Не хватает монет: у тебя {}, а {what} — {}. Заработать можно через /work.",
+        money_text(balance), money_text(amount))
 }
 
 /// Предложение другому участнику с кнопками «Принять» / «Отказаться» (бой питомцев, обмен).
@@ -66,10 +56,12 @@ pub async fn challenge(
         .await?;
     let message_id = reply.message().await?.id;
     let no_pings = serenity::CreateAllowedMentions::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let press = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
             .message_id(message_id)
-            .timeout(std::time::Duration::from_secs(120))
+            .filter(|press| matches!(press.data.custom_id.as_str(), "challenge:accept" | "challenge:decline"))
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;
         let Some(press) = press else {
             let expired = poise::CreateReply::default()
@@ -81,7 +73,7 @@ pub async fn challenge(
         };
         if press.user.id != target {
             let note = serenity::CreateInteractionResponseMessage::new().content("Это предложение не тебе 🙂").ephemeral(true);
-            press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await?;
+            let _ = press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await;
             continue;
         }
         if press.data.custom_id == "challenge:accept" {

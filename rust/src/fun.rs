@@ -164,14 +164,14 @@ impl GrowthSettings {
 
 /// Что написать после попытки: (новый размер, текст без упоминания игрока в начале).
 pub fn growth_result(size: i64, change: i64) -> (i64, String) {
-    let new_size = (size + change).max(0); // меньше нуля не бывает
+    let new_size = size.saturating_add(change).max(0);
     let text = if change > 0 {
         format!("твой член вырос на **{change} см**! Теперь он **{new_size} см**.")
     } else if change < 0 && new_size < size {
         format!("твой член уменьшился на **{} см**… Теперь он **{new_size} см**.", size - new_size)
     } else if change < 0 {
         // хотел уменьшиться, но уже 0
-        format!("твой член должен был уменьшиться на {} см, но меньше уже некуда. Сейчас **0 см**.", -change)
+        format!("твой член должен был уменьшиться на {} см, но меньше уже некуда. Сейчас **0 см**.", change.unsigned_abs())
     } else {
         format!("твой член без изменений: всё те же **{new_size} см**.")
     };
@@ -183,16 +183,37 @@ pub fn growth_result(size: i64, change: i64) -> (i64, String) {
 pub async fn dick_growth(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let growth = &data.growth;
-    let (size, last_growth) = data.db.dick(guild, user)?;
-    let (now, cooldown) = (db::now(), growth.cooldown as f64);
-    if now - last_growth < cooldown {
+    let name = display_name(ctx).await;
+    let change = rand::rng().random_range(growth.min..=growth.max);
+    let result = data.db.transaction(|tx| {
+        use rusqlite::{params, OptionalExtension};
+        let key = [guild as i64, user as i64];
+        let (size, last_growth) = tx.query_row(
+            "SELECT COALESCE(size,0), COALESCE(last_growth,0) FROM dick WHERE guild_id=?1 AND user_id=?2",
+            key, |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+        ).optional()?.unwrap_or_default();
+        let now = db::now();
+        let remaining = growth.cooldown as f64 - (now - last_growth);
+        if remaining > 0.0 {
+            return Ok(Err((size, remaining)));
+        }
+        let updated = growth_result(size, change);
+        tx.execute(
+            "INSERT INTO dick(guild_id,user_id,name,size,last_growth) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                 name=excluded.name, size=excluded.size, last_growth=excluded.last_growth",
+            params![key[0], key[1], name, updated.0, now],
+        )?;
+        Ok(Ok(updated))
+    })?;
+    let (new_size, text) = match result {
+        Ok(updated) => updated,
+        Err((size, remaining)) => {
         return whisper(ctx, format!(
             "⏳ Расти можно раз в {}. Следующая попытка через **{}**.\nСейчас у тебя **{size} см**.",
-            hours_text(growth.cooldown), time_left_text(cooldown - (now - last_growth)))).await;
-    }
-    let change = rand::rng().random_range(growth.min..=growth.max);
-    let (new_size, text) = growth_result(size, change);
-    data.db.set_dick(guild, user, &display_name(ctx).await, new_size, now)?;
+            hours_text(growth.cooldown), time_left_text(remaining))).await;
+        }
+    };
     let icon = if change > 0 { "📈" } else if change < 0 { "📉" } else { "😐" };
     ctx.say(format!(
         "{icon} <@{user}>, {text}\nМесто в рейтинге: **#{}**. Следующая попытка — через {}.",

@@ -19,14 +19,18 @@ pub fn error_context(ctx: Context<'_>) -> String {
         ctx.command().name, ctx.guild_id().map(|id| id.get()), ctx.channel_id(), ctx.author().id, age)
 }
 
-/// None — специальный ответ запуска Activity. Некоторые команды изначально видны только автору.
+/// None — команда сама выбирает тип или видимость своего первого ответа.
 fn defer_privately(command: &str) -> Option<bool> {
-    if matches!(command, "words" | "wort" | "slovo") {
+    if matches!(command, "words" | "wort" | "slovo" | "rocket" | "roulette"
+        | "coinflip" | "slots" | "give_money" | "blackjack" | "shop_buy"
+        | "case" | "pet_feed" | "pet_sell" | "pet_battle" | "pet_trade" | "wordduel" | "dick_growth")
+    {
         return None;
     }
     Some(matches!(command,
         "help" | "status" | "music_channel" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
         "patchnotes" | "patchnotes_channel" | "log_channel" | "shop_add" | "shop_remove" | "daily_test"
+        | "warns" | "warns_clear"
     ))
 }
 
@@ -81,6 +85,9 @@ mod tests {
     #[test]
     fn activity_and_private_commands_keep_their_response_type() {
         assert_eq!(defer_privately("words"), None);
+        assert_eq!(defer_privately("rocket"), None);
+        assert_eq!(defer_privately("roulette"), None);
+        assert_eq!(defer_privately("warns"), Some(true));
         assert_eq!(defer_privately("favorites"), Some(true));
         assert_eq!(defer_privately("history"), Some(true));
         assert_eq!(defer_privately("wort"), None);
@@ -88,7 +95,7 @@ mod tests {
         assert_eq!(defer_privately("remind"), Some(true));
         assert_eq!(defer_privately("summary"), Some(true));
         assert_eq!(defer_privately("play"), Some(false));
-        assert_eq!(defer_privately("coinflip"), Some(false));
+        assert_eq!(defer_privately("coinflip"), None);
     }
 
     #[test]

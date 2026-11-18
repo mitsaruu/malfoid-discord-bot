@@ -1,12 +1,14 @@
 //! Экономика: /balance, /work, /daily, /give_money, /coinflip. Тексты и правила — как в bot.py.
 
-use crate::reply::{display_name, say, take_money, user_name, whisper};
+use crate::db::Wallet;
+use crate::reply::{display_name, insufficient_money, say, user_name, whisper};
 use crate::text::{hours_text, money_text, time_left_text};
 use crate::{db, Context, Error};
 use chrono::{Duration, NaiveDate, TimeZone};
 use poise::serenity_prelude as serenity;
 use rand::seq::IndexedRandom;
 use rand::Rng;
+use rusqlite::{params, OptionalExtension};
 
 pub const MAX_BET: i64 = 1_000_000;
 const ALL_IN_WORDS: [&str; 7] = ["all", "все", "всё", "ва-банк", "вабанк", "allin", "all-in"];
@@ -42,9 +44,9 @@ impl EconomySettings {
         let zone = settings.text("economy", "timezone", "Europe/Moscow");
         Self {
             start_balance: settings.int("economy", "start_balance", 500),
-            work_cooldown: settings.int("economy", "work_cooldown_hours", 8) * 3600,
-            work_min: a.min(b),
-            work_max: a.max(b),
+            work_cooldown: settings.int("economy", "work_cooldown_hours", 8).max(0).saturating_mul(3600),
+            work_min: a.min(b).max(0),
+            work_max: a.max(b).max(0),
             min_bet: settings.int("economy", "min_bet", 10).max(1),
             daily_bonus: settings.int("economy", "daily_bonus", 200).max(0),
             daily_streak_bonus: settings.int("economy", "daily_streak_bonus", 50).max(0),
@@ -58,7 +60,9 @@ impl EconomySettings {
 
     /// Сколько монет даёт бонус на таком-то дне серии.
     pub fn daily_reward(&self, streak: i64) -> i64 {
-        self.daily_bonus + self.daily_streak_bonus * (streak.min(self.daily_streak_max) - 1)
+        self.daily_bonus.saturating_add(
+            self.daily_streak_bonus.saturating_mul(streak.clamp(1, self.daily_streak_max) - 1),
+        )
     }
 }
 
@@ -69,7 +73,7 @@ pub fn next_streak(last: Option<(&str, i64)>, today: NaiveDate) -> Option<i64> {
         return None;
     }
     let yesterday = (today - Duration::days(1)).to_string();
-    Some(if last_day == yesterday { streak + 1 } else { 1 }) // пропустил день — серия заново
+    Some(if last_day == yesterday { streak.max(0).saturating_add(1) } else { 1 })
 }
 
 /// Ставка из поля bet: число или all. Ok(ставка) или Err(текст, что не так).
@@ -90,6 +94,99 @@ pub fn parse_bet(text: &str, balance: i64, min_bet: i64) -> Result<i64, String> 
         return Err(format!("Ставка — от {} до {}.", money_text(min_bet), money_text(MAX_BET)));
     }
     Ok(bet)
+}
+
+fn claim_work(
+    database: &db::Database,
+    wallet: Wallet<'_>,
+    earned: i64,
+    time: f64,
+    cooldown: i64,
+) -> rusqlite::Result<Result<i64, (i64, f64)>> {
+    database.transaction(|tx| {
+        let (balance, last_work) = wallet.open(tx)?;
+        let remaining = last_work + cooldown as f64 - time;
+        if remaining > 0.0 {
+            return Ok(Err((balance, remaining)));
+        }
+        let balance = db::change_balance(tx, wallet.guild, wallet.user, earned)?;
+        tx.execute(
+            "UPDATE economy SET last_work = ?3 WHERE guild_id = ?1 AND user_id = ?2",
+            params![wallet.guild as i64, wallet.user as i64, time],
+        )?;
+        Ok(Ok(balance))
+    })
+}
+
+fn claim_daily(
+    database: &db::Database,
+    wallet: Wallet<'_>,
+    economy: &EconomySettings,
+    today: NaiveDate,
+) -> rusqlite::Result<Result<(i64, i64, i64), i64>> {
+    database.transaction(|tx| {
+        let last = tx.query_row(
+            "SELECT last_day, streak FROM daily_bonus WHERE guild_id = ?1 AND user_id = ?2",
+            params![wallet.guild as i64, wallet.user as i64],
+            |row| Ok((row.get::<_, Option<String>>(0)?.unwrap_or_default(), row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        ).optional()?;
+        let Some(streak) = next_streak(last.as_ref().map(|(day, streak)| (day.as_str(), *streak)), today) else {
+            return Ok(Err(last.map_or(0, |(_, streak)| streak)));
+        };
+        wallet.open(tx)?;
+        let reward = economy.daily_reward(streak);
+        let balance = db::change_balance(tx, wallet.guild, wallet.user, reward)?;
+        tx.execute(
+            "INSERT INTO daily_bonus (guild_id, user_id, last_day, streak) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (guild_id, user_id) DO UPDATE SET last_day = excluded.last_day, streak = excluded.streak",
+            params![wallet.guild as i64, wallet.user as i64, today.to_string(), streak],
+        )?;
+        Ok(Ok((streak, reward, balance)))
+    })
+}
+
+fn transfer_money(
+    database: &db::Database,
+    sender: Wallet<'_>,
+    recipient: Wallet<'_>,
+    amount: i64,
+) -> rusqlite::Result<Result<i64, i64>> {
+    if amount <= 0 || sender.guild != recipient.guild || sender.user == recipient.user {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    database.transaction(|tx| {
+        let (balance, _) = sender.open(tx)?;
+        if balance < amount {
+            return Ok(Err(balance));
+        }
+        recipient.open(tx)?;
+        let left = db::change_balance(tx, sender.guild, sender.user, -amount)?;
+        db::change_balance(tx, recipient.guild, recipient.user, amount)?;
+        Ok(Ok(left))
+    })
+}
+
+/// Результат мгновенной игры: множитель выплаты 0 проигрывает ставку, 1 возвращает её.
+fn settle_bet(
+    database: &db::Database,
+    wallet: Wallet<'_>,
+    input: &str,
+    minimum: i64,
+    multiplier: i64,
+) -> rusqlite::Result<Result<(i64, i64), String>> {
+    database.transaction(|tx| {
+        let (balance, _) = wallet.open(tx)?;
+        let bet = match parse_bet(input, balance, minimum) {
+            Ok(bet) => bet,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if balance < bet {
+            return Ok(Err(insufficient_money(balance, bet, "ставка")));
+        }
+        let net = (multiplier - 1) * bet; // ограниченные таблицей игры множители и MAX_BET
+        let new_balance = db::change_balance(tx, wallet.guild, wallet.user, net)?;
+        Ok(Ok((bet, new_balance)))
+    })
 }
 
 /// Посмотреть баланс монет
@@ -124,21 +221,21 @@ pub async fn balance(
 pub async fn work(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let economy = &data.economy;
-    let (balance, last_work) = data.db.wallet(guild, user, &display_name(ctx).await, economy.start_balance)?;
-    let passed = db::now() - last_work;
-    if passed < economy.work_cooldown as f64 {
-        return whisper(ctx, format!(
-            "⏳ Рано! Следующая смена через **{}**. Баланс: {}.",
-            time_left_text(economy.work_cooldown as f64 - passed), money_text(balance))).await;
-    }
+    let name = display_name(ctx).await;
     let (earned, job) = {
         let mut rng = rand::rng();
         (rng.random_range(economy.work_min..=economy.work_max), *WORK_TEXTS.choose(&mut rng).unwrap())
     };
-    data.db.record_work(guild, user, earned, db::now())?;
+    let wallet = Wallet { guild, user, name: &name, start: economy.start_balance };
+    let balance = match claim_work(&data.db, wallet, earned, db::now(), economy.work_cooldown)? {
+        Ok(balance) => balance,
+        Err((balance, remaining)) => return whisper(ctx, format!(
+            "⏳ Рано! Следующая смена через **{}**. Баланс: {}.",
+            time_left_text(remaining), money_text(balance))).await,
+    };
     say(ctx, format!(
         "💼 {job} — <@{user}> получает **+{}**.\nБаланс: **{}**. Следующая смена — через {}.",
-        money_text(earned), money_text(balance + earned), hours_text(economy.work_cooldown))).await
+        money_text(earned), money_text(balance), hours_text(economy.work_cooldown))).await
 }
 
 /// Забрать ежедневный бонус (каждый день подряд — больше)
@@ -146,19 +243,19 @@ pub async fn work(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn daily(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let economy = &data.economy;
+    let name = display_name(ctx).await;
     let today = chrono::Utc::now().with_timezone(&economy.timezone).date_naive();
-    let last = data.db.daily_bonus(guild, user)?;
-    let Some(streak) = next_streak(last.as_ref().map(|(day, streak)| (day.as_str(), *streak)), today) else {
-        let streak = last.map(|(_, streak)| streak).unwrap_or(0);
-        let midnight = (today + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap();
-        let tomorrow = economy.timezone.from_local_datetime(&midnight).earliest().map(|time| time.timestamp()).unwrap_or(0);
-        return whisper(ctx, format!(
-            "🎁 Сегодняшний бонус уже забран. Следующий — <t:{tomorrow}:R> (+{}).",
-            money_text(economy.daily_reward(streak + 1)))).await;
+    let wallet = Wallet { guild, user, name: &name, start: economy.start_balance };
+    let (streak, reward, balance) = match claim_daily(&data.db, wallet, economy, today)? {
+        Ok(grant) => grant,
+        Err(streak) => {
+            let midnight = (today + Duration::days(1)).and_hms_opt(0, 0, 0).unwrap();
+            let tomorrow = economy.timezone.from_local_datetime(&midnight).earliest().map(|time| time.timestamp()).unwrap_or(0);
+            return whisper(ctx, format!(
+                "🎁 Сегодняшний бонус уже забран. Следующий — <t:{tomorrow}:R> (+{}).",
+                money_text(economy.daily_reward(streak.saturating_add(1))))).await;
+        }
     };
-    let reward = economy.daily_reward(streak);
-    data.db.set_daily_bonus(guild, user, &today.to_string(), streak)?;
-    let balance = data.db.add_money(guild, user, &display_name(ctx).await, economy.start_balance, reward)?;
     let mut text = format!(
         "🎁 <@{user}> забирает ежедневный бонус: **+{}**. Баланс: **{}**.\n🔥 Дней подряд: **{streak}**",
         money_text(reward), money_text(balance));
@@ -188,12 +285,14 @@ pub async fn give_money(
     if member.id == ctx.author().id {
         return whisper(ctx, "Самому себе перевести нельзя.").await;
     }
-    let (balance, _) = data.db.wallet(guild, user, &display_name(ctx).await, start)?;
-    if amount > balance {
-        return whisper(ctx, format!("Не хватает монет: у тебя {}.", money_text(balance))).await;
-    }
-    let new_balance = data.db.add_money(guild, user, &display_name(ctx).await, start, -amount)?;
-    data.db.add_money(guild, member.id.get(), &user_name(&member), start, amount)?;
+    let sender_name = display_name(ctx).await;
+    let recipient_name = user_name(&member);
+    let sender = Wallet { guild, user, name: &sender_name, start };
+    let recipient = Wallet { guild, user: member.id.get(), name: &recipient_name, start };
+    let new_balance = match transfer_money(&data.db, sender, recipient, amount)? {
+        Ok(balance) => balance,
+        Err(balance) => return whisper(ctx, format!("Не хватает монет: у тебя {}.", money_text(balance))).await,
+    };
     // Получателя упоминаем с пингом — пусть узнает о переводе
     ctx.say(format!(
         "💸 <@{user}> переводит <@{}> **{}**.\nОстаток у отправителя: {}.",
@@ -218,25 +317,19 @@ pub async fn coinflip(
 ) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let (start, name) = (data.economy.start_balance, display_name(ctx).await);
-    let (balance, _) = data.db.wallet(guild, user, &name, start)?;
-    let bet = match parse_bet(&bet, balance, data.economy.min_bet) {
-        Ok(bet) => bet,
+    let result = if rand::rng().random_bool(0.5) { CoinSide::Heads } else { CoinSide::Tails };
+    let wallet = Wallet { guild, user, name: &name, start };
+    let multiplier = if result == side { 2 } else { 0 };
+    let (bet, new_balance) = match settle_bet(&data.db, wallet, &bet, data.economy.min_bet, multiplier)? {
+        Ok(result) => result,
         Err(problem) => return whisper(ctx, problem).await,
     };
-    if bet > balance {
-        return whisper(ctx, format!(
-            "Не хватает монет: у тебя {}, а ставка — {}. Заработать можно через /work.",
-            money_text(balance), money_text(bet))).await;
-    }
-    let result = if rand::rng().random_bool(0.5) { CoinSide::Heads } else { CoinSide::Tails };
     let shown = if result == CoinSide::Heads { "Выпал **орёл** 🦅" } else { "Выпала **решка** 🪙" };
-    let (text, new_balance) = if result == side {
-        let new_balance = data.db.add_money(guild, user, &name, start, bet)?;
-        (format!("{shown}\n🎉 <@{user}> угадывает и выигрывает **+{}**!", money_text(bet)), new_balance)
+    let text = if result == side {
+        format!("{shown}\n🎉 <@{user}> угадывает и выигрывает **+{}**!", money_text(bet))
     } else {
-        let new_balance = data.db.add_money(guild, user, &name, start, -bet)?;
         let chosen = if side == CoinSide::Heads { "орёл" } else { "решка" };
-        (format!("{shown}\n😔 <@{user}> ставил(а) на «{chosen}» и проигрывает {}.", money_text(bet)), new_balance)
+        format!("{shown}\n😔 <@{user}> ставил(а) на «{chosen}» и проигрывает {}.", money_text(bet))
     };
     say(ctx, format!("{text}\nБаланс: {}", money_text(new_balance))).await
 }
@@ -276,22 +369,18 @@ pub async fn slots(
 ) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let (start, name) = (data.economy.start_balance, display_name(ctx).await);
-    let (balance, _) = data.db.wallet(guild, user, &name, start)?;
-    let bet = match parse_bet(&bet, balance, data.economy.min_bet) {
-        Ok(bet) => bet,
-        Err(problem) => return whisper(ctx, problem).await,
-    };
-    if !take_money(ctx, bet, "ставка").await? {
-        return Ok(());
-    }
     let reels = {
         let total: u32 = SLOTS.iter().map(|(_, weight, _)| weight).sum();
         let mut rng = rand::rng();
         [0; 3].map(|_| slot_symbol(rng.random_range(0..total)))
     };
     let multiplier = slots_multiplier(reels);
+    let wallet = Wallet { guild, user, name: &name, start };
+    let (bet, new_balance) = match settle_bet(&data.db, wallet, &bet, data.economy.min_bet, multiplier)? {
+        Ok(result) => result,
+        Err(problem) => return whisper(ctx, problem).await,
+    };
     let payout = bet * multiplier;
-    let new_balance = data.db.add_money(guild, user, &name, start, payout)?;
     let outcome = if multiplier > 1 {
         format!("🎉 Три {}! Выигрыш ×{multiplier}: **+{}**", SLOTS[reels[0]].0, money_text(payout - bet))
     } else if multiplier == 1 {

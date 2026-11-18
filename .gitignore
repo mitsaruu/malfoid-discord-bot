@@ -7,6 +7,7 @@ levels.db
 levels.db-journal
 levels.db-wal
 levels.db-shm
+.musicbot.lock
 backups/
 logs/
 

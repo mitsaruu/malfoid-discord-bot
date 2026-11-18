@@ -1,0 +1,36 @@
+name: Checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [full, without-voice]
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.96.0 --profile minimal
+      - if: matrix.features == 'full'
+        run: cargo +1.96.0 test --locked
+      - if: matrix.features == 'without-voice'
+        run: cargo +1.96.0 test --locked --no-default-features
+
+  miniapp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --check miniapp/app.js
+      - run: node --check miniapp/rocket.js
+      - run: node --test miniapp/rocket.test.cjs rust/tests/miniapp_rollover.test.cjs
+      - run: python3 -B rust/tests/qol_sql_checks.py

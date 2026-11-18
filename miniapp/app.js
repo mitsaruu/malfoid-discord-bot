@@ -46,51 +46,85 @@ const wordsRetry = document.getElementById("words-retry");
 // ---------- Связь с Discord (минимальный Embedded App SDK) ----------
 const OP = { HANDSHAKE: 0, FRAME: 1, CLOSE: 2, HELLO: 3 };
 const discordWindow = window.parent.opener || window.parent;
-const discordOrigin = document.referrer || "*";
+// Match Discord's production Activity origins, including its opaque native bridge.
+const discordOrigins = new Set([
+  "https://discord.com", "https://discordapp.com", "https://ptb.discord.com",
+  "https://ptb.discordapp.com", "https://canary.discord.com", "https://canary.discordapp.com",
+  "https://staging.discord.co", "https://pax.discord.com", "null",
+]);
+const referrerOrigin = document.referrer ? new URL(document.referrer).origin : null;
+let discordOrigin = discordOrigins.has(referrerOrigin) ? referrerOrigin : "*";
 const pending = new Map();
 let onReady = null;
 
 window.addEventListener("message", (event) => {
-  if (event.source !== discordWindow || !Array.isArray(event.data)) return;
+  if (event.source !== discordWindow || !discordOrigins.has(event.origin) || !Array.isArray(event.data)) return;
+  if (discordOrigin !== "*" && discordOrigin !== event.origin) return;
   const [opcode, data] = event.data;
   if (opcode === OP.CLOSE) {
     const reason = "Discord закрыл соединение" + (data?.message ? ": " + data.message : ".");
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(reason));
+    }
+    pending.clear();
     if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
     else setStatus(reason, "error");
     return;
   }
   if (opcode !== OP.FRAME || !data) return;
   if (data.cmd === "DISPATCH") {
-    if (data.evt === "READY" && onReady) onReady();
+    if (data.evt === "READY" && onReady) {
+      discordOrigin = event.origin;
+      onReady();
+    }
     return;
   }
   const waiter = pending.get(data.nonce);
-  if (!waiter) return;
+  if (!waiter || (data.evt !== "ERROR" && data.cmd !== waiter.cmd)) return;
   pending.delete(data.nonce);
+  clearTimeout(waiter.timer);
   if (data.evt === "ERROR") waiter.reject(new Error((data.data && data.data.message) || "ошибка Discord"));
   else waiter.resolve(data.data);
 });
 
 function discordCommand(cmd, args) {
-  const nonce = crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2);
+  const nonce = crypto.randomUUID();
   return new Promise((resolve, reject) => {
-    pending.set(nonce, { resolve, reject });
-    discordWindow.postMessage([OP.FRAME, { cmd, args, nonce }], discordOrigin);
+    const timer = setTimeout(() => {
+      pending.delete(nonce);
+      reject(new Error("Discord не ответил на " + cmd));
+    }, 15000);
+    pending.set(nonce, { cmd, resolve, reject, timer });
+    try {
+      discordWindow.postMessage([OP.FRAME, { cmd, args, nonce }], discordOrigin === "null" ? "*" : discordOrigin);
+    } catch (error) {
+      clearTimeout(timer);
+      pending.delete(nonce);
+      reject(error);
+    }
   });
 }
 
 function connectToDiscord(clientId) {
   return new Promise((resolve, reject) => {
-    onReady = resolve;
+    const timer = setTimeout(() => {
+      onReady = null;
+      reject(new Error("Discord не ответил"));
+    }, 15000);
+    onReady = () => {
+      clearTimeout(timer);
+      onReady = null;
+      resolve();
+    };
     discordWindow.postMessage([OP.HANDSHAKE, {
       v: 1, encoding: "json", client_id: clientId, frame_id: params.get("frame_id"),
     }], discordOrigin);
-    setTimeout(() => reject(new Error("Discord не ответил")), 15000);
   });
 }
 
 // ---------- Запросы к серверу бота ----------
-async function api(path, body, { signal } = {}) {
+async function api(path, body, { signal = AbortSignal.timeout(path === "api/token" ? 40000 : 15000) } = {}) {
   const options = { cache: "no-store", signal, headers: { "Content-Type": "application/json" } };
   if (session) options.headers.Authorization = "Bearer " + session;
   if (body !== undefined) {
@@ -219,8 +253,7 @@ function showGameStatus() {
     setStatus("🎉 " + state.answer.toUpperCase() + " — угадано с " + tries + "-й попытки" +
       (state.reward ? "! +" + state.reward + " монет" : "!"), "win");
   } else if (state.finished) {
-    setStatus("😿 Попытки кончились. Было слово " + state.answer.toUpperCase() +
-      ". Новое слово — завтра.", "error");
+    setStatus("😿 Попытки кончились. Слово будет в итогах дня. Новое слово — завтра.", "error");
   } else {
     const left = state.max_guesses - state.rows.length;
     setStatus("Осталось попыток: " + left);
@@ -265,13 +298,24 @@ function renderPlayers(data) {
     const avatar = document.createElement("img");
     avatar.className = "avatar";
     avatar.alt = player.name;
-    avatar.src = "api/avatar/" + data.guild + "/" + player.id + ".png";
-    avatar.onerror = () => {  // нет аватарки — первая буква имени
+    const fallback = () => {  // нет аватарки — первая буква имени
       const letter = document.createElement("div");
       letter.className = "avatar";
       letter.textContent = (player.name[0] || "?").toUpperCase();
       avatar.replaceWith(letter);
     };
+    fetch("api/avatar/" + data.guild + "/" + player.id + ".png", {
+      headers: { Authorization: "Bearer " + session },
+      signal: AbortSignal.timeout(8000),
+    }).then(async response => {
+      if (!response.ok) throw new Error("Аватар недоступен");
+      const blob = await response.blob();
+      if (!avatar.isConnected) return;
+      const url = URL.createObjectURL(blob);
+      avatar.onload = () => URL.revokeObjectURL(url);
+      avatar.onerror = () => { URL.revokeObjectURL(url); fallback(); };
+      avatar.src = url;
+    }).catch(fallback);
     card.append(avatar, miniBoard(player.marks));
     playersEl.appendChild(card);
   }
@@ -481,13 +525,13 @@ async function start() {
     await connectToDiscord(config.client_id);
     loading("Входим через Discord…", 70);
     const { code } = await discordCommand("AUTHORIZE", {
-      client_id: config.client_id, response_type: "code", state: "", prompt: "none", scope: ["identify"],
+      client_id: config.client_id, response_type: "code", state: crypto.randomUUID(), prompt: "none", scope: ["identify"],
     });
     const login = await api("api/token", {
       code, guild_id: params.get("guild_id"), channel_id: params.get("channel_id"),
     });
     session = login.session;
-    await discordCommand("AUTHENTICATE", { access_token: login.access_token }).catch(() => {});
+    await discordCommand("AUTHENTICATE", { access_token: login.access_token });
     if (typeof createRocketView === "function") {
       rocket = createRocketView((path, body) => api(path, body, {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),

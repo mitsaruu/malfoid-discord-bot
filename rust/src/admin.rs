@@ -60,7 +60,7 @@ pub async fn games_channel_check(ctx: Context<'_>) -> Result<bool, Error> {
 }
 
 /// Канал для рангов, рейтингов и игр (пусто — работают везде)
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD", rename = "games_channel")]
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_GUILD", default_member_permissions = "MANAGE_GUILD", rename = "games_channel")]
 pub async fn set_games_channel(
     ctx: Context<'_>,
     #[description = "Канал для игр (если не выбрать — команды снова будут работать в любом канале)"]
@@ -86,7 +86,7 @@ pub async fn set_games_channel(
 }
 
 /// Канал, куда бот присылает свои ошибки (пусто — не присылать)
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD", rename = "log_channel")]
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_GUILD", default_member_permissions = "MANAGE_GUILD", rename = "log_channel")]
 pub async fn set_log_channel(
     ctx: Context<'_>,
     #[description = "Канал для логов (лучше закрытый, только для админов). Пусто — выключить"]
@@ -113,9 +113,11 @@ pub async fn report_error(http: &serenity::Http, data: &Data, guild: Option<sere
     let details = crate::interactions::sanitize_error(details);
     let Some(guild) = guild else { return };
     crate::diagnostics::record_error(data, guild.get(), place, &details);
+    eprintln!("Ошибка ({place}, сервер {guild}): {details}");
     let Ok(Some(channel)) = data.db.log_channel(guild.get()) else { return };
-    let tail: String = details.chars().rev().take(3800).collect::<Vec<_>>().into_iter().rev().collect(); // конец — самое важное
-    let embed = serenity::CreateEmbed::new().color(0xEF4444).title(format!("⚠️ Ошибка: {place}")).description(format!("```\n{tail}\n```"));
+    let embed = serenity::CreateEmbed::new().color(0xEF4444)
+        .title(format!("⚠️ Ошибка: {place}"))
+        .description("Категория и время последней ошибки доступны в /status. Технические подробности в журнале службы.");
     let message = serenity::CreateMessage::new().embed(embed).allowed_mentions(serenity::CreateAllowedMentions::new());
     if let Err(error) = serenity::ChannelId::new(channel).send_message(http, message).await {
         println!("Не получилось отправить лог в канал: {error}");
@@ -123,39 +125,58 @@ pub async fn report_error(http: &serenity::Http, data: &Data, guild: Option<sere
 }
 
 /// Варны участника (их выдаёт бот по просьбе модератора)
-#[poise::command(slash_command, guild_only, rename = "warns")]
+#[poise::command(slash_command, guild_only, ephemeral, rename = "warns")]
 pub async fn show_warns(
     ctx: Context<'_>,
     #[description = "Чьи варны посмотреть (если не выбрать — твои)"] member: Option<serenity::Member>,
 ) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
+    if member.as_ref().is_some_and(|member| member.user.id != ctx.author().id) {
+        let is_moderator = ctx.author_member().await.is_some_and(|requester| {
+            crate::moderation::is_moderator(ctx.serenity_context(), serenity::GuildId::new(guild), &requester)
+        });
+        if !is_moderator {
+            return whisper(ctx, "Чужие варны видны только модераторам.").await;
+        }
+    }
     let (user, name) = match &member {
         Some(member) => (member.user.id.get(), member.display_name().to_string()),
         None => (ctx.author().id.get(), crate::reply::display_name(ctx).await),
     };
     let (rows, total) = data.db.warns(guild, user)?;
     if rows.is_empty() {
-        return say(ctx, format!("✅ У <@{user}> нет варнов.")).await;
+        return whisper(ctx, format!("✅ У <@{user}> нет варнов.")).await;
     }
     let lines: Vec<String> = rows
         .iter()
         .map(|(moderator, reason, created)| format!("• <t:{}:d> — {reason} (выдал <@{moderator}>)", *created as i64))
         .collect();
-    let mut embed = serenity::CreateEmbed::new().color(0xF59E0B).title(format!("⚠️ Варны {name}: {total}")).description(lines.join("\n"));
+    let window = lines.join("\n");
+    let description: String = window.chars().take(2000).collect();
+    let mut embed = serenity::CreateEmbed::new().color(0xF59E0B).title(format!("⚠️ Варны {name}: {total}")).description(description);
     if total > rows.len() as i64 {
         embed = embed.footer(serenity::CreateEmbedFooter::new(format!("Показаны последние {}", rows.len())));
     }
-    ctx.send(poise::CreateReply::default().embed(embed).allowed_mentions(serenity::CreateAllowedMentions::new())).await?;
+    ctx.send(poise::CreateReply::default().ephemeral(true).embed(embed).allowed_mentions(serenity::CreateAllowedMentions::new())).await?;
     Ok(())
 }
 
 /// Снять все варны с участника
-#[poise::command(slash_command, guild_only, default_member_permissions = "MODERATE_MEMBERS")]
+#[poise::command(slash_command, guild_only, ephemeral, required_permissions = "MODERATE_MEMBERS", default_member_permissions = "MODERATE_MEMBERS")]
 pub async fn warns_clear(ctx: Context<'_>, #[description = "С кого снять варны"] member: serenity::User) -> Result<(), Error> {
-    let guild=ctx.guild_id().unwrap().get();
+    let guild_id = ctx.guild_id().unwrap();
+    let guild = guild_id.get();
     let cutoff:Option<i64>=ctx.data().db.lock().query_row("SELECT MAX(id) FROM warns WHERE guild_id=?1 AND user_id=?2",rusqlite::params![guild as i64,member.id.get() as i64],|r|r.get(0))?;
     if cutoff.is_none(){return say(ctx,"У участника нет варнов.").await}
     if !crate::qol::confirm(ctx,format!("Снять все текущие варны с <@{}>?",member.id)).await?{return Ok(())}
+    let requester = ctx.http().get_member(guild_id, ctx.author().id).await?;
+    let target = ctx.http().get_member(guild_id, member.id).await?;
+    let serenity = ctx.serenity_context();
+    if !crate::moderation::permissions(serenity, guild_id, &requester).moderate_members()
+        || !crate::moderation::outranks(serenity, guild_id, &requester, &target)
+    {
+        return whisper(ctx, "Чтобы снять варны, нужно право на модерацию и роль выше участника.").await;
+    }
     let deleted=ctx.data().db.lock().execute("DELETE FROM warns WHERE guild_id=?1 AND user_id=?2 AND id<=?3",rusqlite::params![guild as i64,member.id.get() as i64,cutoff])?;
     say(ctx, if deleted > 0 {
         format!("🧹 С <@{}> сняты варны: {deleted}.", member.id)

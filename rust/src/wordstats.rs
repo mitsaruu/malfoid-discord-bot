@@ -1,6 +1,7 @@
 //! Слова: статистика игрока (/wordstats), лучшие игроки месяца (/wordtop) и дуэли на монеты (/wordduel).
 
 use crate::cards::{Picture, Row};
+use crate::db::{self, Database, Wallet, WordDuel};
 use crate::levels::{avatar_by_id, render_table, send_png};
 use crate::reply::{challenge, display_name, finish_challenge, user_name, whisper};
 use crate::text::{money_text, number};
@@ -8,7 +9,9 @@ use crate::words::{self, Game, Lang, MAX_GUESSES};
 use crate::{Context, Data, Error};
 use chrono::NaiveDate;
 use poise::serenity_prelude as serenity;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, poise::ChoiceParameter)]
 pub enum GameChoice {
@@ -190,33 +193,125 @@ pub fn duel_outcome(name: &str, users: (u64, u64), tries: (usize, usize), bet: i
     (text, vec![(winner, bet * 2)])
 }
 
-/// Подводит итоги дуэлей, где оба доиграли слово дня (или день уже кончился).
+pub(crate) fn prepare_duels(db: &Database) -> rusqlite::Result<()> {
+    db.lock().execute_batch(
+        "CREATE INDEX IF NOT EXISTS word_duels_guild_day ON word_duels(guild_id, lang, day);
+         CREATE TABLE IF NOT EXISTS word_duel_outbox (
+            duel_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, content TEXT NOT NULL,
+            retry_after REAL NOT NULL DEFAULT 0
+         );",
+    )
+}
+
+fn place_duel(
+    data: &Data, channel: u64, lang: Lang, day: &str, [first, second]: [Wallet<'_>; 2], bet: i64,
+) -> rusqlite::Result<Result<(), String>> {
+    let mut conn = data.db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let guild = first.guild;
+    let cancel = "Дуэль отменена: кто-то уже начал слово дня, вступил в другую дуэль или наступил новый день.";
+    if words::today(data, lang) != day {
+        return Ok(Err(cancel.into()));
+    }
+    let started: bool = tx.query_row(
+        &format!("SELECT EXISTS (SELECT 1 FROM {} WHERE guild_id = ?1 AND day = ?2
+                  AND user_id IN (?3, ?4) AND COALESCE(guesses, '') != '')", lang.table()),
+        params![guild as i64, day, first.user as i64, second.user as i64],
+        |row| row.get(0),
+    )?;
+    let busy: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM word_duels WHERE guild_id = ?1 AND lang = ?2 AND day = ?3
+         AND (user1 IN (?4, ?5) OR user2 IN (?4, ?5)))",
+        params![guild as i64, lang.key(), day, first.user as i64, second.user as i64],
+        |row| row.get(0),
+    )?;
+    if started || busy {
+        return Ok(Err(cancel.into()));
+    }
+    for wallet in [first, second] {
+        if wallet.open(&tx)?.0 < bet {
+            return Ok(Err(format!("Дуэль отменена: кому-то не хватает {}.", money_text(bet))));
+        }
+        db::change_balance(&tx, guild, wallet.user, -bet)?;
+    }
+    tx.execute(
+        "INSERT INTO word_duels (guild_id, channel_id, lang, day, user1, user2, bet) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![guild as i64, channel as i64, lang.key(), day, first.user as i64, second.user as i64, bet],
+    )?;
+    tx.commit()?;
+    Ok(Ok(()))
+}
+
+fn settle_duel(data: &Data, duel: &WordDuel) -> rusqlite::Result<()> {
+    let Some(lang) = Lang::from_key(&duel.lang) else { return Err(rusqlite::Error::InvalidQuery) };
+    if duel.bet <= 0 || duel.bet.checked_mul(2).is_none() || duel.channel == 0 || duel.user1 == duel.user2 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let mut conn = data.db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let day_over = duel.day < words::today(data, lang);
+    let tries = |user: u64| -> rusqlite::Result<Option<usize>> {
+        let game = tx.query_row(
+            &format!("SELECT answer, COALESCE(guesses, '') FROM {} WHERE guild_id = ?1 AND user_id = ?2 AND day = ?3", lang.table()),
+            params![duel.guild as i64, user as i64, duel.day],
+            |row| Ok(Game::from_row(lang, &duel.day, row.get(0)?, &row.get::<_, String>(1)?)),
+        ).optional()?;
+        Ok(duel_tries(game.as_ref(), day_over))
+    };
+    let (Some(first), Some(second)) = (tries(duel.user1)?, tries(duel.user2)?) else { return Ok(()) };
+    if tx.execute("DELETE FROM word_duels WHERE id = ?1", [duel.id])? == 0 {
+        return Ok(());
+    }
+    let (text, payouts) = duel_outcome(lang.name(), (duel.user1, duel.user2), (first, second), duel.bet);
+    for (user, amount) in payouts {
+        db::change_balance(&tx, duel.guild, user, amount)?;
+    }
+    tx.execute(
+        "INSERT INTO word_duel_outbox (duel_id, channel_id, content) VALUES (?1, ?2, ?3)",
+        params![duel.id, duel.channel as i64, text],
+    )?;
+    tx.commit()
+}
+
+/// Settles each eligible duel once and retries delivering its saved result.
 pub async fn resolve_duels(http: &serenity::Http, data: &Data) -> Result<(), Error> {
+    let Ok(_delivery) = data.words.duel_delivery.try_lock() else { return Ok(()) };
     for duel in data.db.word_duels()? {
-        let Some(lang) = Lang::from_key(&duel.lang) else { continue };
-        let day_over = duel.day.as_str() < words::today(data, lang).as_str();
-        let tries = |user: u64| -> rusqlite::Result<Option<usize>> {
-            let game = data.db.word_row(lang.table(), duel.guild, user, &duel.day)?.map(|(answer, guesses)| Game::from_row(lang, &duel.day, answer, &guesses));
-            Ok(duel_tries(game.as_ref(), day_over))
-        };
-        let (Some(first), Some(second)) = (tries(duel.user1)?, tries(duel.user2)?) else { continue }; // кто-то ещё играет
-        if !data.db.delete_word_duel(duel.id)? {
-            continue; // эту дуэль уже посчитали
+        if let Err(error) = settle_duel(data, &duel) {
+            println!("Дуэль {} пока не рассчитана: {error}", duel.id);
         }
-        let (text, payouts) = duel_outcome(lang.name(), (duel.user1, duel.user2), (first, second), duel.bet);
-        for (user, amount) in payouts {
-            data.db.add_money_by_id(duel.guild, user, amount)?;
+    }
+    let notifications = {
+        let conn = data.db.lock();
+        let mut query = conn.prepare("SELECT duel_id, channel_id, content FROM word_duel_outbox
+                                      WHERE retry_after <= ? ORDER BY duel_id LIMIT 16")?;
+        let pending = query.query_map([db::now()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as u64, row.get::<_, String>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        pending
+    };
+    for (id, channel, text) in notifications {
+        let message = serenity::CreateMessage::new().content(text)
+            .allowed_mentions(serenity::CreateAllowedMentions::new())
+            .nonce(serenity::Nonce::String(format!("wd-{id:016x}"))).enforce_nonce(true);
+        match tokio::time::timeout(Duration::from_secs(8), serenity::ChannelId::new(channel).send_message(http, message)).await {
+            Ok(Ok(_)) => { data.db.lock().execute("DELETE FROM word_duel_outbox WHERE duel_id = ?", [id])?; }
+            Ok(Err(serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(error)))) if error.error.code == 10003 => {
+                println!("Канал для итогов дуэли {id} удалён, монеты уже рассчитаны.");
+                data.db.lock().execute("DELETE FROM word_duel_outbox WHERE duel_id = ?", [id])?;
+            }
+            _ => {
+                data.db.lock().execute("UPDATE word_duel_outbox SET retry_after = ?1 WHERE duel_id = ?2", params![db::now() + 60.0, id])?;
+            }
         }
-        let message = serenity::CreateMessage::new().content(text).allowed_mentions(serenity::CreateAllowedMentions::new());
-        let _ = serenity::ChannelId::new(duel.channel).send_message(http, message).await;
     }
     Ok(())
 }
 
-/// Раз в 10 минут проверяет дуэли: вдруг день кончился, а кто-то так и не доиграл.
+/// Проверяет завершившиеся партии и повторы доставки после временных отказов.
 pub fn start_duel_loop(http: std::sync::Arc<serenity::Http>, data: crate::Shared) {
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(std::time::Duration::from_secs(600));
+        let mut timer = tokio::time::interval(Duration::from_secs(60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
             if let Err(error) = resolve_duels(&http, &data).await {
@@ -254,7 +349,7 @@ pub async fn wordduel(
     if busy(user)? || busy(other)? {
         return whisper(ctx, "У кого-то из вас уже есть дуэль на сегодняшнее слово.").await;
     }
-    if bet < data.economy.min_bet || data.db.wallet(guild, user, &name, start)?.0 < bet {
+    if bet < data.economy.min_bet.max(1) || words::balance(data, guild, user)? < bet {
         return whisper(ctx, format!("Ставка — от {}, и у тебя должно хватать монет.", money_text(data.economy.min_bet))).await;
     }
     let offer = format!(
@@ -262,16 +357,10 @@ pub async fn wordduel(
          Ставка — **{}** с каждого.", lang.name(), money_text(bet));
     let Some(press) = challenge(ctx, member.id, offer).await? else { return Ok(()) };
 
-    // Пока ждали ответа, кто-то мог начать слово, потратить монеты, или наступил новый день
-    if started(user)? || started(other)? || busy(user)? || busy(other)? || words::today(data, lang) != day {
-        return finish_challenge(ctx, &press, "Дуэль отменена: кто-то уже начал слово дня.".into()).await;
+    let wallets = [Wallet { guild, user, name: &name, start }, Wallet { guild, user: other, name: &other_name, start }];
+    if let Err(error) = place_duel(data, ctx.channel_id().get(), lang, &day, wallets, bet)? {
+        return finish_challenge(ctx, &press, error).await;
     }
-    if data.db.wallet(guild, user, &name, start)?.0 < bet || data.db.wallet(guild, other, &other_name, start)?.0 < bet {
-        return finish_challenge(ctx, &press, format!("Дуэль отменена: кому-то не хватает {}.", money_text(bet))).await;
-    }
-    data.db.add_money(guild, user, &name, start, -bet)?;
-    data.db.add_money(guild, other, &other_name, start, -bet)?;
-    data.db.add_word_duel(guild, ctx.channel_id().get(), lang.key(), &day, user, other, bet)?;
     finish_challenge(ctx, &press, format!(
         "⚔️ Дуэль в {}: <@{user}> против <@{other}>, на кону **{}**. Открывайте {} и отгадывайте сегодняшнее слово — \
          победит тот, кому хватит меньше попыток. Кто не доиграет до конца дня — проиграл.",

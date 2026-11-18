@@ -171,7 +171,7 @@ mod tests {
         ]
     }
 
-    /// Картинки рисуются нужного размера и не пустые. Заодно сохраняем их в target/ — посмотреть глазами.
+    /// Картинки рисуются нужного размера и не пустые.
     #[test]
     fn renders_cards() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
@@ -179,21 +179,20 @@ mod tests {
             println!("шрифтов нет — тест пропущен");
             return;
         };
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
         let card = rank_card(fonts, "Founder of BakaSoft Solution", None, 16, 1630, 2180, 15430, Some(1), None);
         assert_eq!(card.dimensions(), (1000, 300));
         assert_eq!(card.get_pixel(0, 0)[3], 0, "углы карточки скруглены — самый угол прозрачный");
         assert_eq!(card.get_pixel(500, 150)[3], 255);
-        std::fs::write(out.join("sample_rank.png"), draw::to_png(&card)).unwrap();
+        assert!(draw::to_png(&card).starts_with(b"\x89PNG"));
 
         let photo = draw::pick_background(&dir, "rank_bg");
         let with_photo = rank_card(fonts, "Alice", None, 3, 20, 265, 495, None, photo.as_deref());
-        std::fs::write(out.join("sample_rank_photo.png"), draw::to_png(&with_photo)).unwrap();
+        assert_eq!(with_photo.dimensions(), card.dimensions());
+        assert!(draw::to_png(&with_photo).starts_with(b"\x89PNG"));
 
         let rows = sample_rows();
         let board = table(fonts, "РЕЙТИНГ СЕРВЕРА", "Сервер BakaSoft", "ТОП 4", "по опыту в чате", &rows, None);
         assert_eq!(board.dimensions(), (1000, (170 + 4 * 96 + 28) as u32));
-        std::fs::write(out.join("sample_table.png"), draw::to_png(&board)).unwrap();
         let png = draw::to_png(&board);
         assert!(png.starts_with(&[0x89, b'P', b'N', b'G']) && png.len() > 10_000);
     }

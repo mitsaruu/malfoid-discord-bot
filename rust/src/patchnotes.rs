@@ -2,11 +2,16 @@
 //! После перезапуска бот сам публикует записи, которых ещё не было, в канал из /patchnotes_channel.
 
 use crate::admin::bot_permissions;
+use crate::reminders::{clear_delivery_retry, delivery_message, delivery_schema, retry_delivery};
 use crate::reply::whisper;
-use crate::{Context, Data, Error};
+use crate::{db, Context, Data, Error, Shared};
 use poise::serenity_prelude as serenity;
+use rusqlite::{params, OptionalExtension};
+use tokio::sync::Mutex;
 
-const MAX_AT_ONCE: usize = 3; // если бот долго не перезапускали — публикуем не больше стольких записей разом
+const MAX_AT_ONCE: usize = 3;
+const PATCHNOTES_JOB: &str = "patchnotes";
+static GUILD_LOCKS: [Mutex<()>; 64] = [const { Mutex::const_new(()) }; 64];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
@@ -46,7 +51,7 @@ pub fn unpublished<'a>(notes: &'a [Note], last_note: Option<&str>) -> Vec<&'a No
         Some(position) => &notes[..position],
         None => &notes[..notes.len().min(1)],
     };
-    fresh.iter().take(MAX_AT_ONCE).rev().collect()
+    fresh.iter().rev().take(MAX_AT_ONCE).collect()
 }
 
 fn embed(note: &Note) -> serenity::CreateEmbed {
@@ -59,20 +64,82 @@ fn embed(note: &Note) -> serenity::CreateEmbed {
     if note.date.is_empty() { embed } else { embed.footer(serenity::CreateEmbedFooter::new(&note.date)) }
 }
 
-/// При запуске: на каждом сервере публикуем патчноуты, которых там ещё не было.
+fn nonce(guild: u64, channel: u64, note: &str) -> String {
+    let hash = guild.to_le_bytes().into_iter().chain(channel.to_le_bytes()).chain(note.bytes())
+        .fold(0xcbf29ce484222325_u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3));
+    format!("patch-{hash:016x}")
+}
+
+async fn publish_one(
+    http: &serenity::Http, data: &Data, guild: u64, channel: u64, previous: Option<&str>, note: &Note,
+) -> Result<bool, Error> {
+    let message = serenity::CreateMessage::new().embed(embed(note)).allowed_mentions(serenity::CreateAllowedMentions::new());
+    if let Err(error) = serenity::ChannelId::new(channel)
+        .send_message(http, delivery_message(message, nonce(guild, channel, &note.id))).await
+    {
+        eprintln!("Патчноуты: не получилось написать в канал {channel}, будет повтор: {error}");
+        retry_delivery(&data.db.lock(), PATCHNOTES_JOB, guild as i64, db::now())?;
+        return Ok(false);
+    }
+    let mut connection = data.db.lock();
+    let transaction = connection.transaction()?;
+    let changed = transaction.execute(
+        "UPDATE patchnotes_channel SET last_note = ?1 WHERE guild_id = ?2 AND channel_id = ?3 AND last_note IS ?4",
+        params![note.id, guild as i64, channel as i64, previous],
+    )?;
+    if changed == 1 {
+        clear_delivery_retry(&transaction, PATCHNOTES_JOB, guild as i64)?;
+    }
+    transaction.commit()?;
+    Ok(changed == 1)
+}
+
+/// Публикует одну ограниченную пачку на сервер и оставляет курсор при отказе.
 pub async fn post_new(http: &serenity::Http, data: &Data) -> Result<(), Error> {
     let notes = load(data);
-    for (guild, channel, last_note) in data.db.patchnotes_channels()? {
-        for note in unpublished(&notes, last_note.as_deref()) {
-            let message = serenity::CreateMessage::new().embed(embed(note));
-            if let Err(error) = serenity::ChannelId::new(channel).send_message(http, message).await {
-                println!("Патчноуты: не получилось написать в канал {channel}: {error}");
+    let guilds = {
+        let connection = data.db.lock();
+        delivery_schema(&connection)?;
+        let mut statement = connection.prepare(
+            "SELECT p.guild_id FROM patchnotes_channel p
+             LEFT JOIN delivery_retry d ON d.job = 'patchnotes' AND d.id = p.guild_id
+             WHERE p.guild_id > 0 AND p.channel_id > 0 AND COALESCE(d.retry_at, 0) <= ?1",
+        )?;
+        let rows = statement.query_map([db::now()], |row| row.get::<_, i64>(0).map(|id| id as u64))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for guild in guilds {
+        let _update = GUILD_LOCKS[guild as usize % GUILD_LOCKS.len()].lock().await;
+        let current = data.db.lock().query_row(
+            "SELECT p.channel_id, p.last_note FROM patchnotes_channel p
+             LEFT JOIN delivery_retry d ON d.job = 'patchnotes' AND d.id = p.guild_id
+             WHERE p.guild_id = ?1 AND p.channel_id > 0 AND COALESCE(d.retry_at, 0) <= ?2",
+            params![guild as i64, db::now()],
+            |row| Ok((row.get::<_, i64>(0).map(|id| id as u64)?, row.get::<_, Option<String>>(1)?)),
+        ).optional()?;
+        let Some((channel, cursor)) = current else { continue };
+        let mut previous = cursor.as_deref();
+        for note in unpublished(&notes, previous) {
+            if !publish_one(http, data, guild, channel, previous, note).await? {
                 break;
             }
-            data.db.set_last_patchnote(guild, &note.id)?;
+            previous = Some(&note.id);
         }
     }
     Ok(())
+}
+
+pub fn start_loop(http: std::sync::Arc<serenity::Http>, data: Shared) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            if let Err(error) = post_new(&http, &data).await {
+                eprintln!("Патчноуты: {error}");
+            }
+        }
+    });
 }
 
 async fn version_autocomplete(ctx: Context<'_>, partial: &str) -> serenity::CreateAutocompleteResponse {
@@ -112,7 +179,7 @@ pub async fn show(
 }
 
 /// Канал, куда бот пишет патчноуты после обновлений (пусто — не писать)
-#[poise::command(slash_command, guild_only, default_member_permissions = "MANAGE_GUILD", rename = "patchnotes_channel")]
+#[poise::command(slash_command, guild_only, required_permissions = "MANAGE_GUILD", default_member_permissions = "MANAGE_GUILD", rename = "patchnotes_channel")]
 pub async fn set_channel(
     ctx: Context<'_>,
     #[description = "Канал для патчноутов. Пусто — выключить"]
@@ -121,7 +188,10 @@ pub async fn set_channel(
 ) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
     let Some(channel) = channel else {
-        data.db.set_patchnotes_channel(guild, None)?;
+        {
+            let _update = GUILD_LOCKS[guild as usize % GUILD_LOCKS.len()].lock().await;
+            configure(&data.db, guild, None)?;
+        }
         return whisper(ctx, "✅ Больше не пишу патчноуты.").await;
     };
     let allowed = bot_permissions(ctx, &channel).is_some_and(|p| p.view_channel() && p.send_messages() && p.embed_links());
@@ -131,15 +201,34 @@ pub async fn set_channel(
             channel.id)).await;
     }
     let notes = load(data);
-    let latest = notes.first();
-    data.db.set_patchnotes_channel(guild, Some((channel.id.get(), latest.map(|note| note.id.as_str()))))?;
+    let delivered = {
+        let _update = GUILD_LOCKS[guild as usize % GUILD_LOCKS.len()].lock().await;
+        configure(&data.db, guild, Some(channel.id.get()))?;
+        match notes.first() {
+            Some(latest) => publish_one(ctx.http(), data, guild, channel.id.get(), None, latest).await?,
+            None => true,
+        }
+    };
+    let pending = if delivered { "" } else { " Последний патчноут отправится при следующей успешной попытке." };
     whisper(ctx, format!(
-        "✅ Теперь после каждого обновления пишу патчноут в <#{}>. Выключить — /patchnotes_channel без канала.", channel.id)).await?;
-    if let Some(latest) = latest {
-        // сразу показываем последний — чтобы было видно, как выглядит
-        channel.id.send_message(ctx, serenity::CreateMessage::new().embed(embed(latest))).await?;
-    }
-    Ok(())
+        "✅ Теперь после каждого обновления пишу патчноут в <#{}>. Выключить — /patchnotes_channel без канала.{pending}",
+        channel.id)).await
+}
+
+fn configure(db: &db::Database, guild: u64, channel: Option<u64>) -> rusqlite::Result<()> {
+    let mut connection = db.lock();
+    delivery_schema(&connection)?;
+    let transaction = connection.transaction()?;
+    match channel {
+        Some(channel) => transaction.execute(
+            "INSERT INTO patchnotes_channel (guild_id, channel_id, last_note) VALUES (?1, ?2, NULL)
+             ON CONFLICT (guild_id) DO UPDATE SET channel_id = excluded.channel_id, last_note = NULL",
+            params![guild as i64, channel as i64],
+        )?,
+        None => transaction.execute("DELETE FROM patchnotes_channel WHERE guild_id = ?1", [guild as i64])?,
+    };
+    clear_delivery_retry(&transaction, PATCHNOTES_JOB, guild as i64)?;
+    transaction.commit()
 }
 
 #[cfg(test)]
@@ -167,6 +256,14 @@ mod tests {
         assert_eq!(ids(Some("v0")), ["v3"]); // такой записи нет — только самая новая
         assert_eq!(ids(None), ["v3"]);
         assert!(unpublished(&[], None).is_empty());
+    }
+
+
+    #[test]
+    fn backlog_starts_with_oldest_pending_entries() {
+        let notes = parse("## v6 | date\n## v5 | date\n## v4 | date\n## v3 | date\n## v2 | date\n## v1 | date");
+        let ids: Vec<_> = unpublished(&notes, Some("v1")).into_iter().map(|note| note.id.as_str()).collect();
+        assert_eq!(ids, ["v2", "v3", "v4"]);
     }
 
     #[test]

@@ -2,10 +2,10 @@
 //! можно удвоить ставку (одна карта и стоп) и разделить пару (до 4 рук; разделённые тузы получают по одной карте).
 //! Карты сдаются из общего «башмака» сервера — 3 колоды вместе, как в казино.
 
-use crate::economy::parse_bet;
-use crate::reply::{display_name, take_money, whisper};
+use crate::db::Database;
+use crate::reply::{display_name, whisper};
 use crate::text::money_text;
-use crate::{Context, Error};
+use crate::{wagers, Context, Error};
 use poise::serenity_prelude as serenity;
 use rand::seq::SliceRandom;
 use std::time::Duration;
@@ -250,6 +250,43 @@ impl Drop for Seat<'_> {
     }
 }
 
+/// Билеты переживают перезапуск. При отмене задачи возвращаем их сразу, если база доступна.
+struct Stakes<'a> {
+    db: &'a Database,
+    round: u64,
+    tickets: Vec<u64>,
+    settled: bool,
+}
+
+impl Stakes<'_> {
+    fn settle(&mut self, guild: u64, user: u64, payout: i64) -> rusqlite::Result<i64> {
+        let payouts: Vec<_> = self.tickets.iter().enumerate()
+            .map(|(index, &ticket)| (ticket, if index == 0 { payout } else { 0 }))
+            .collect();
+        let balance = self.db.transaction(|tx| {
+            wagers::settle_on(tx, self.round, &payouts)?;
+            tx.query_row(
+                "SELECT balance FROM economy WHERE guild_id = ?1 AND user_id = ?2",
+                rusqlite::params![guild as i64, user as i64],
+                |row| row.get(0),
+            )
+        })?;
+        self.settled = true;
+        Ok(balance)
+    }
+}
+
+impl Drop for Stakes<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Err(error) = wagers::refund(self.db, Some(self.round)) {
+            eprintln!("Блэкджек: ставки раунда {} остались в журнале: {error}", self.round);
+        }
+    }
+}
+
 /// Карточка с текущим состоянием партии. result — итог с балансом, когда партия закончена.
 fn embed(game: &Game, name: &str, avatar: &str, cards_left: usize, balance: Option<i64>) -> serenity::CreateEmbed {
     let outcome = game.outcome.as_ref();
@@ -312,13 +349,13 @@ pub async fn blackjack(
         return whisper(ctx, "Сначала доиграй текущую партию 🙂").await;
     }
     let _seat = Seat { data, user };
-    let bet = match parse_bet(&bet, wallet(data)?, data.economy.min_bet) {
+    let round = ctx.id();
+    wallet(data)?;
+    let bet = match wagers::place(&data.db, round, round, guild, user, &bet, data.economy.min_bet)? {
         Ok(bet) => bet,
         Err(problem) => return whisper(ctx, problem).await,
     };
-    if !take_money(ctx, bet, "ставка").await? {
-        return Ok(());
-    }
+    let mut stakes = Stakes { db: &data.db, round, tickets: vec![round], settled: false };
     // Башмак общий на сервер; замок берём коротко, на один ход, и не держим его во время ожидания Discord
     let with_shoe = |action: &mut dyn FnMut(&mut Vec<Card>)| -> usize {
         let mut shoes = data.blackjack_shoes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -340,13 +377,13 @@ pub async fn blackjack(
     let mut game = game.unwrap();
 
     // Выплата и карточка с итогом
-    let settle = |game: &Game, cards_left: usize| -> Result<serenity::CreateEmbed, Error> {
+    let settle = |stakes: &mut Stakes<'_>, game: &Game, cards_left: usize| -> Result<serenity::CreateEmbed, Error> {
         let payout = game.outcome.as_ref().map(|outcome| outcome.payout).unwrap_or(0);
-        let balance = data.db.add_money(guild, user, &name, start, payout)?;
+        let balance = stakes.settle(guild, user, payout)?;
         Ok(embed(game, &name, &avatar, cards_left, Some(balance)))
     };
     if game.outcome.is_some() {
-        ctx.send(poise::CreateReply::default().embed(settle(&game, cards_left)?)).await?;
+        ctx.send(poise::CreateReply::default().embed(settle(&mut stakes, &game, cards_left)?)).await?;
         return Ok(());
     }
     let reply = ctx
@@ -356,15 +393,19 @@ pub async fn blackjack(
         .await?;
     let message_id = reply.message().await?.id;
 
+    let mut deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
         let press = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
             .message_id(message_id)
-            .timeout(TIMEOUT)
+            .filter(|press| matches!(press.data.custom_id.as_str(), "bj:hit" | "bj:stand" | "bj:double" | "bj:split"))
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await;
         let Some(press) = press else {
             // Никто не нажимал кнопки — бот сам говорит «Хватит» и убирает кнопки
             cards_left = with_shoe(&mut |shoe| game.stand_all(shoe));
-            let finished = poise::CreateReply::default().embed(settle(&game, cards_left)?).components(Vec::new());
+            let finished = poise::CreateReply::default()
+                .embed(settle(&mut stakes, &game, cards_left)?)
+                .components(Vec::new());
             let _ = reply.edit(ctx, finished).await;
             return Ok(());
         };
@@ -372,10 +413,11 @@ pub async fn blackjack(
             let note = serenity::CreateInteractionResponseMessage::new()
                 .content("Это не твоя партия 🙂 Начни свою: /blackjack")
                 .ephemeral(true);
-            press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await?;
+            let _ = press.create_response(ctx, serenity::CreateInteractionResponse::Message(note)).await;
             continue;
         }
         press.create_response(ctx, serenity::CreateInteractionResponse::Acknowledge).await?;
+        deadline = tokio::time::Instant::now() + TIMEOUT;
         let balance = wallet(data)?;
         let refused = match press.data.custom_id.as_str() {
             "bj:hit" => {
@@ -386,19 +428,25 @@ pub async fn blackjack(
                 cards_left = with_shoe(&mut |shoe| game.stand(shoe));
                 None
             }
-            "bj:double" if game.can_double(balance) => {
-                data.db.add_money(guild, user, &name, start, -game.bets[game.current])?; // ещё одна такая же ставка
-                cards_left = with_shoe(&mut |shoe| game.double(shoe));
-                None
+            action => {
+                let double = action == "bj:double";
+                let allowed = if double { game.can_double(balance) } else { game.can_split(balance) };
+                if !allowed {
+                    Some(if double { "Удвоить сейчас нельзя 🙂".into() } else { "Разделить сейчас нельзя 🙂".into() })
+                } else {
+                    let ticket = press.id.get();
+                    match wagers::place(&data.db, round, ticket, guild, user, &game.bets[game.current].to_string(), 1)? {
+                        Ok(_) => {
+                            stakes.tickets.push(ticket);
+                            cards_left = with_shoe(&mut |shoe| {
+                                if double { game.double(shoe) } else { game.split(shoe) }
+                            });
+                            None
+                        }
+                        Err(reason) => Some(reason),
+                    }
+                }
             }
-            "bj:split" if game.can_split(balance) => {
-                data.db.add_money(guild, user, &name, start, -game.bets[game.current])?; // ставка на вторую руку
-                cards_left = with_shoe(&mut |shoe| game.split(shoe));
-                None
-            }
-            "bj:double" => Some("Удвоить сейчас нельзя 🙂"),
-            "bj:split" => Some("Разделить сейчас нельзя 🙂"),
-            _ => Some("Не понял кнопку 🙂"),
         };
         if let Some(text) = refused {
             let note = serenity::CreateInteractionResponseFollowup::new().content(text).ephemeral(true);
@@ -406,7 +454,7 @@ pub async fn blackjack(
             continue;
         }
         let update = if game.outcome.is_some() {
-            serenity::EditInteractionResponse::new().embed(settle(&game, cards_left)?).components(Vec::new())
+            serenity::EditInteractionResponse::new().embed(settle(&mut stakes, &game, cards_left)?).components(Vec::new())
         } else {
             serenity::EditInteractionResponse::new()
                 .embed(embed(&game, &name, &avatar, cards_left, None))

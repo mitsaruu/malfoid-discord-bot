@@ -160,6 +160,7 @@ fn plain_directory(path: &Path) -> Result<(), Error> {
 }
 
 fn private_directory(path: &Path) -> Result<(), Error> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -560,6 +561,7 @@ fn snapshot_with_sync(
     );
     let temporary = auto.join(format!(".tmp-{name}"));
     // Unlike reusable parent directories, staging must be exclusively ours.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -748,6 +750,17 @@ fn owned_manifest(path: &Path) -> Option<(DateTime<Utc>, Vec<String>)> {
     .ok()
 }
 
+pub(crate) fn check_database(directory: &Path) -> rusqlite::Result<bool> {
+    let connection = Connection::open_with_flags(
+        directory.join("levels.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_millis(100))?;
+    let mut statement = connection.prepare("PRAGMA quick_check(1)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()? == ["ok"])
+}
+
 fn completed_backups(auto: &Path) -> Result<Vec<(DateTime<Utc>, PathBuf)>, Error> {
     match fs::symlink_metadata(auto) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -776,11 +789,16 @@ fn backup_due(root: &Path, now: DateTime<Utc>, settings: &BackupSettings) -> Res
     let checkpoint = preceding_checkpoint(now, settings);
     Ok(!completed_backups(&root.join("backups/auto"))?
         .iter()
-        .any(|(created, _)| *created >= checkpoint && *created <= now))
+        .any(|(created, path)| *created >= checkpoint && *created <= now
+            && matches!(check_database(path), Ok(true))))
 }
 
 fn prune(auto: &Path, keep: usize, published: &Path) -> Result<(), Error> {
-    let completed = completed_backups(auto)?;
+    if owned_manifest(published).is_none() || !matches!(check_database(published), Ok(true)) {
+        return Ok(());
+    }
+    let completed: Vec<_> = completed_backups(auto)?.into_iter()
+        .filter(|(_, path)| matches!(check_database(path), Ok(true))).collect();
     let excess = completed.len().saturating_sub(keep);
     for (_, path) in completed
         .into_iter()
@@ -851,6 +869,19 @@ mod tests {
 
     fn defaults() -> BackupSettings {
         BackupSettings::load(&Settings::default())
+    }
+
+
+    #[test]
+    fn damaged_copy_does_not_satisfy_freshness_or_displace_restore_point() {
+        let fixture = Fixture::new();
+        let db = fixture.database();
+        let before = snapshot(&db, &fixture.0, at("2026-11-15T01:01:00Z"), 7).unwrap();
+        let damaged = snapshot(&db, &fixture.0, at("2026-11-16T01:02:00Z"), 7).unwrap();
+        fs::write(damaged.join("levels.db"), "damaged after publication").unwrap();
+        assert!(backup_due(&fixture.0, at("2026-11-16T01:03:00Z"), &defaults()).unwrap());
+        prune(&fixture.auto(), 1, &damaged).unwrap();
+        assert!(before.exists());
     }
 
     // A raw copy of levels.db loses the committed WAL row; copying an open

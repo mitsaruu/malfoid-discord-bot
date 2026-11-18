@@ -8,8 +8,11 @@ use crate::{db, Data};
 use base64::Engine;
 use poise::serenity_prelude as serenity;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Mutex;
+use rusqlite::{params, OptionalExtension};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 const MAX_TOKENS: i64 = 8192; // предел длины ответа; с запасом — «обдумывание» модели тоже входит в предел
 const HYDROGEN_MAX_TOKENS: i64 = 32768; // длинные ответы + рассуждение high
@@ -147,9 +150,9 @@ impl AiSettings {
             fallback_model: (!off(&fallback) && fallback != model).then_some(fallback),
             model,
             retries: settings.int("ai", "retries", 2).max(0),
-            cooldown: settings.int("ai", "cooldown_seconds", 5),
+            cooldown: settings.int("ai", "cooldown_seconds", 5).clamp(0, 86_400),
             daily_limit: settings.int("ai", "daily_limit_per_user", 50),
-            history_limit: settings.int("ai", "history_limit", 20),
+            history_limit: settings.int("ai", "history_limit", 20).clamp(0, 100),
             google_daily_limit: settings.int("ai", "google_daily_limit", 500),
             google_minute_limit: settings.int("ai", "google_minute_limit", 15),
             one_line: !["off", "нет", "no", "0"].contains(&settings.text("ai", "one_line_answers", "on").to_lowercase().as_str()),
@@ -179,8 +182,17 @@ pub struct AiState {
     pub key: Option<String>, // ключ Gemini; None — ИИ не настроен
     /// Сколько раз кто спрашивал: участник → (дата, вопросов за эту дату, время последнего вопроса). После перезапуска — с нуля.
     usage: Mutex<HashMap<u64, (String, i64, f64)>>,
-    recent_requests: Mutex<Vec<f64>>, // время запросов к Google за последнюю минуту
-    last_quota_error: Mutex<f64>,     // когда Google последний раз отказал из-за лимита (0 — ни разу)
+    recent_requests: Mutex<VecDeque<Instant>>,
+    last_quota_error: Mutex<f64>,
+    generation_slots: Semaphore,
+    classifier_slots: Semaphore,
+    classifier_attempts: Mutex<VecDeque<Instant>>,
+    pub(crate) ask_slots: Semaphore,
+    image_slots: Semaphore,
+    prompt: ConfigCache<String>,
+    active_history: Mutex<HashMap<u64, Weak<()>>>,
+    accounting_initialized: Mutex<bool>,
+    pub(crate) timeout_locks: [tokio::sync::Mutex<()>; 64],
 }
 
 impl AiState {
@@ -192,6 +204,15 @@ impl AiState {
             usage: Default::default(),
             recent_requests: Default::default(),
             last_quota_error: Default::default(),
+            generation_slots: Semaphore::new(8),
+            classifier_slots: Semaphore::new(2),
+            classifier_attempts: Default::default(),
+            ask_slots: Semaphore::new(8),
+            image_slots: Semaphore::new(4),
+            prompt: Default::default(),
+            active_history: Default::default(),
+            accounting_initialized: Default::default(),
+            timeout_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
 
@@ -201,37 +222,97 @@ impl AiState {
 
     /// Личный счётчик человека на сегодня: (сколько вопросов задал, время последнего).
     pub fn usage_today(&self, user: u64) -> (i64, f64) {
-        match locked(&self.usage).get(&user) {
-            Some((day, count, last)) if *day == local_day() => (*count, *last),
-            Some((_, _, last)) => (0, *last), // вопросы были вчера — сегодня счётчик с нуля
-            None => (0, 0.0),
-        }
+        usage_for(&locked(&self.usage), user, &local_day())
     }
 
     /// Проверяет лимиты. Возвращает текст отказа или None, если спрашивать можно (и засчитывает вопрос).
     pub fn limit_check(&self, user: u64) -> Option<String> {
-        let (count, last) = self.usage_today(user);
+        let mut usage = locked(&self.usage);
         let now = db::now();
+        let day = local_day();
+        let (count, last) = usage_for(&usage, user, &day);
+        if usage.len() >= 1024 && !usage.contains_key(&user) {
+            usage.retain(|_, (date, _, last)| *date == day || now - *last < self.settings.cooldown as f64);
+        }
+        if usage.len() >= 20_000 && !usage.contains_key(&user) {
+            return Some(error_text(&AiError::Busy).to_string());
+        }
         if now - last < self.settings.cooldown as f64 {
             return Some(format!("Не так быстро 🙂 Подожди {} сек.", (self.settings.cooldown as f64 - (now - last)) as i64 + 1));
         }
         if count >= self.settings.daily_limit {
             return Some(format!("На сегодня лимит вопросов ({}) закончился. Завтра продолжим!", self.settings.daily_limit));
         }
-        locked(&self.usage).insert(user, (local_day(), count + 1, now));
+        usage.insert(user, (day, count + 1, now));
         None
     }
 
-    /// Сколько запросов к Google бот отправил за последние 60 секунд.
-    pub fn requests_last_minute(&self) -> usize {
-        let minute_ago = db::now() - 60.0;
+    fn prune_recent(recent: &mut VecDeque<Instant>) {
+        while recent.front().is_some_and(|time| time.elapsed() >= Duration::from_secs(60)) {
+            recent.pop_front();
+        }
+    }
+
+    fn admit_provider_attempt(&self) -> Result<(), AiError> {
         let mut recent = locked(&self.recent_requests);
-        recent.retain(|moment| *moment > minute_ago);
+        Self::prune_recent(&mut recent);
+        if recent.len() >= 600 {
+            return Err(AiError::Busy);
+        }
+        recent.push_back(Instant::now());
+        Ok(())
+    }
+
+    /// Сколько запросов к Google бот попытался отправить за последние 60 секунд.
+    pub fn requests_last_minute(&self) -> usize {
+        let mut recent = locked(&self.recent_requests);
+        Self::prune_recent(&mut recent);
         recent.len()
     }
 
     pub fn last_quota_error(&self) -> f64 {
         *locked(&self.last_quota_error)
+    }
+}
+
+fn usage_for(usage: &HashMap<u64, (String, i64, f64)>, user: u64, today: &str) -> (i64, f64) {
+    usage.get(&user).map_or((0, 0.0), |(day, count, last)| {
+        (if day == today { *count } else { 0 }, *last)
+    })
+}
+
+/// Перечитывает небольшой текстовый конфиг с задержкой до пяти секунд.
+pub(crate) struct ConfigCache<T>(Mutex<Option<(Instant, Arc<T>)>>);
+
+impl<T> Default for ConfigCache<T> {
+    fn default() -> Self { Self(Mutex::new(None)) }
+}
+
+impl<T> ConfigCache<T> {
+    pub(crate) fn read(&self, path: &std::path::Path, parse: impl FnOnce(&str) -> T) -> Arc<T> {
+        use std::io::Read;
+        const MAX_CONFIG: u64 = 128 * 1024;
+        let mut cached = locked(&self.0);
+        if let Some((at, value)) = &*cached {
+            if at.elapsed() < Duration::from_secs(5) {
+                return value.clone();
+            }
+        }
+        let mut text = String::new();
+        let loaded = std::fs::File::open(path).and_then(|file| file.take(MAX_CONFIG + 1).read_to_string(&mut text));
+        let value = if matches!(loaded, Ok(size) if size <= MAX_CONFIG as usize) {
+            Arc::new(parse(&text))
+        } else if let Some((_, previous)) = &*cached {
+            if !matches!(loaded, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound) {
+                previous.clone()
+            } else {
+                Arc::new(parse(""))
+            }
+        } else {
+            Arc::new(parse(""))
+        };
+        *cached = Some((Instant::now(), value.clone()));
+        value
     }
 }
 
@@ -261,6 +342,7 @@ pub fn google_reset_time() -> i64 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AiError {
     HydrogenLimit,
+    Busy,
     Quota,         // Google: лимит запросов исчерпан (429)
     Overloaded,    // Google перегружен или временная ошибка сервера (5xx)
     Network(String), // тайм-аут, обрыв соединения, DNS/TLS — можно повторить запрос
@@ -271,6 +353,7 @@ impl std::fmt::Display for AiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AiError::HydrogenLimit => write!(formatter, "Лимит Hydrogen: 4 ответа в сутки, сброс в 00:00 МСК. Выбери Flash-Lite."),
+            AiError::Busy => write!(formatter, "очередь запросов ИИ заполнена"),
             AiError::Quota => write!(formatter, "лимит запросов к Gemini исчерпан (429)"),
             AiError::Overloaded => write!(formatter, "Gemini перегружен (5xx)"),
             AiError::Network(details) => write!(formatter, "Сетевая ошибка Gemini: {details}"),
@@ -285,6 +368,7 @@ impl std::error::Error for AiError {}
 pub fn error_text(error: &AiError) -> &'static str {
     match error {
         AiError::HydrogenLimit => "Лимит Hydrogen на сегодня закончился: 4 ответа в сутки. Сброс в 00:00 МСК; пока можно выбрать Flash-Lite.",
+        AiError::Busy => "Сейчас слишком много запросов к ИИ. Попробуй чуть позже.",
         AiError::Quota => "😵 Лимит бесплатных запросов к ИИ на сейчас исчерпан. Попробуй позже (подробнее — /ai_limits).",
         AiError::Overloaded => "😵 ИИ у Google сейчас перегружен, попробуй через пару минут.",
         AiError::Network(_) => "😵 Не удалось дождаться ответа ИИ: проблема соединения с Google. Попробуй позже.",
@@ -406,7 +490,7 @@ fn transport_error(error: reqwest::Error) -> AiError {
 pub async fn generate(data: &Data, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
     // Ограничиваем суммарное ожидание всех моделей: один запрос не занимает все 15 минут
     // жизни Discord interaction. Отмена прекращает текущий запрос и дальнейшие повторы.
-    generate_selected(data, system, turns, RequestOptions { model: ModelChoice::FlashLite, ..Default::default() }).await
+    generate_selected(data, system, turns, RequestOptions::default()).await
 }
 
 #[cfg(test)]
@@ -415,7 +499,17 @@ async fn call_gemini(data: &Data, model: &str, system: &str, turns: &[Turn]) -> 
 }
 
 pub async fn generate_selected(data: &Data, system: &str, turns: &[Turn], options: RequestOptions<'_>) -> Result<Answer, AiError> {
-    let settings = request_settings(&data.ai.settings, options);
+    let _slot = data.ai.generation_slots.try_acquire().map_err(|_| AiError::Busy)?;
+    let mut settings = request_settings(&data.ai.settings, options);
+    if options.user.is_none() && matches!(options.model, ModelChoice::Auto) {
+        // Работа без пользователя не расходует персональный лимит Hydrogen.
+        if settings.model == HYDROGEN_MODEL {
+            settings.model = settings.fallback_model.take().unwrap_or_else(|| FLASH_LITE_MODEL.into());
+        }
+        if settings.fallback_model.as_deref() == Some(HYDROGEN_MODEL) {
+            settings.fallback_model = None;
+        }
+    }
     let settings_ref = &settings;
     generate_with_settings(data, settings_ref, options, std::time::Duration::from_secs(2), generation_budget(settings_ref), |model| async move {
         call_gemini_settings(data, settings_ref, &model, system, turns).await
@@ -463,13 +557,18 @@ where
             let deadline = tokio::time::Instant::now() + model_budget;
             let retries = settings.retries.clamp(0, 5);
             for attempt in 0..=retries {
-                let result = match tokio::time::timeout_at(deadline, call(model.clone())).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        last_error = AiError::Network(format!("модель {model} не ответила вовремя"));
-                        println!("ИИ: {last_error}; пробую запасную модель, если она задана");
-                        break;
-                    }
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                data.ai.admit_provider_attempt()?;
+                let day = google_day();
+                let mut accounting = ProviderAttempt::start(data, &day, model);
+                let result = tokio::time::timeout_at(deadline, call(model.clone())).await;
+                accounting.succeeded = matches!(&result, Ok(Ok(_)));
+                let Ok(result) = result else {
+                    last_error = AiError::Network(format!("модель {model} не ответила вовремя"));
+                    println!("ИИ: {last_error}; пробую запасную модель, если она задана");
+                    break;
                 };
                 match result {
                     Ok(answer) => {
@@ -480,9 +579,6 @@ where
                                 permit.success = true;
                             }
                         }
-                        // Google ответил — засчитываем запрос (для /ai_limits)
-                        let _ = data.db.count_ai_request(&google_day());
-                        locked(&data.ai.recent_requests).push(db::now());
                         if *model != settings.model {
                             println!("ИИ: основная модель {} не ответила ({last_error}), ответила запасная {model}", settings.model);
                         }
@@ -511,6 +607,88 @@ where
     }).await.unwrap_or_else(|_| Err(AiError::Network("превышено общее время ожидания ответа".into())))
 }
 
+fn ensure_provider_accounting(data: &Data) -> rusqlite::Result<()> {
+    let mut initialized = locked(&data.ai.accounting_initialized);
+    if !*initialized {
+        data.db.lock().execute_batch(
+            "CREATE TABLE IF NOT EXISTS ai_provider_usage (
+                day TEXT NOT NULL, model TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                succeeded INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, model)
+            )"
+        )?;
+        *initialized = true;
+    }
+    Ok(())
+}
+
+struct ProviderAttempt<'a> {
+    data: &'a Data,
+    day: &'a str,
+    model: &'a str,
+    recorded: bool,
+    succeeded: bool,
+}
+
+impl<'a> ProviderAttempt<'a> {
+    fn start(data: &'a Data, day: &'a str, model: &'a str) -> Self {
+        let result = ensure_provider_accounting(data).and_then(|()| {
+            let mut connection = data.db.lock();
+            let tx = connection.transaction()?;
+            tx.execute("DELETE FROM ai_provider_usage WHERE day < ?1", params![day])?;
+            tx.execute(
+                "INSERT INTO ai_provider_usage (day, model, attempts) VALUES (?1, ?2, 1)
+                 ON CONFLICT (day, model) DO UPDATE SET attempts = attempts + 1",
+                params![day, model],
+            )?;
+            tx.commit()
+        });
+        if let Err(error) = &result {
+            eprintln!("Не записан запрос Gemini: {error}");
+        }
+        Self { data, day, model, recorded: result.is_ok(), succeeded: false }
+    }
+}
+
+impl Drop for ProviderAttempt<'_> {
+    fn drop(&mut self) {
+        if self.recorded && self.succeeded {
+            if let Err(error) = self.data.db.lock().execute(
+                "UPDATE ai_provider_usage SET succeeded = succeeded + 1 WHERE day = ?1 AND model = ?2",
+                params![self.day, self.model],
+            ) {
+                eprintln!("Не записан ответ Gemini: {error}");
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub model: String,
+    pub attempts: i64,
+    pub succeeded: i64,
+}
+
+pub fn provider_usage(data: &Data, day: &str) -> rusqlite::Result<Vec<ModelUsage>> {
+    ensure_provider_accounting(data)?;
+    let connection = data.db.lock();
+    let mut statement = connection.prepare(
+        "SELECT model, attempts, succeeded FROM ai_provider_usage WHERE day = ?1 ORDER BY model",
+    )?;
+    let rows = statement.query_map(params![day], |row| Ok(ModelUsage {
+        model: row.get(0)?, attempts: row.get(1)?, succeeded: row.get(2)?,
+    }))?;
+    rows.collect()
+}
+
+pub fn hydrogen_usage(data: &Data, user: u64, day: &str) -> rusqlite::Result<(i64, i64)> {
+    Ok(data.db.lock().query_row(
+        "SELECT used, reserved FROM ai_model_usage WHERE user_id = ?1 AND day = ?2 AND model = ?3",
+        params![user as i64, day, HYDROGEN_MODEL],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?.unwrap_or_default())
+}
+
 /// Убирает из prompt.txt строки-пояснения (начинаются с #).
 pub fn parse_prompt(text: &str) -> String {
     text.lines().filter(|line| !line.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string()
@@ -518,8 +696,8 @@ pub fn parse_prompt(text: &str) -> String {
 
 /// Полная инструкция для ИИ: характер из config/prompt.txt + технические правила.
 pub fn system_prompt(data: &Data) -> String {
-    let own = parse_prompt(&std::fs::read_to_string(data.dir.join("config").join("prompt.txt")).unwrap_or_default());
-    let character = if own.is_empty() { DEFAULT_CHARACTER.trim().to_string() } else { own };
+    let own = data.ai.prompt.read(&data.dir.join("config").join("prompt.txt"), parse_prompt);
+    let character = if own.is_empty() { DEFAULT_CHARACTER.trim() } else { own.as_str() };
     format!("{character}\n\n{}", TECH_RULES.trim())
 }
 
@@ -582,27 +760,47 @@ fn wants_structured_answer(question: &str) -> bool {
 }
 
 fn format_answer_text(text: &str, question: &str, one_line: bool) -> String {
-    if one_line && !wants_structured_answer(question) { to_one_line(text) } else { text.to_string() }
+    if one_line && !wants_structured_answer(question) && !crate::ai_math::contains_math(text) { to_one_line(text) } else { text.to_string() }
 }
 
 /// Режет длинный текст на части (в одном сообщении Discord не больше 2000 символов).
-pub fn split_message(text: &str, limit: usize) -> Vec<String> {
+pub fn split_message(mut text: &str, limit: usize) -> Vec<String> {
+    // Discord считает символы UTF-16. Синтетические маркеры не входят в исходный текст.
+    const OPEN: &str = "```\n";
+    const CLOSE: &str = "\n```";
     let mut parts = Vec::new();
-    let mut rest: Vec<char> = text.chars().collect();
-    while rest.len() > limit {
-        // стараемся резать по переносу строки; переносов нет — режем ровно по лимиту
-        let cut = rest[..limit].iter().rposition(|c| *c == '\n').filter(|cut| *cut > 0).unwrap_or(limit);
-        let mut part: String = rest[..cut].iter().collect();
-        let mut tail: String = rest[cut..].iter().collect::<String>().trim_start_matches('\n').to_string();
-        if part.matches("```").count() % 2 == 1 {
-            part.push_str("\n```"); // разрезали внутри блока кода: закрываем его здесь…
-            tail = format!("```\n{tail}"); // …и открываем заново в следующем сообщении
+    let mut in_fence = false;
+    let limit = limit.max(2);
+    while !text.is_empty() {
+        let prefix = if in_fence { OPEN } else { "" };
+        let budget = limit - prefix.len();
+        let mut width = 0;
+        let mut end = 0;
+        let mut open = in_fence;
+        let mut line_break = None;
+        while end < text.len() {
+            let remaining = &text[end..];
+            let fence = limit >= 11 && remaining.starts_with("```");
+            let first = remaining.chars().next().unwrap();
+            let (bytes, units) = if fence { (3, 3) } else { (first.len_utf8(), first.len_utf16()) };
+            let next_open = open ^ fence;
+            let suffix_width = if next_open { CLOSE.len() } else { 0 };
+            if width + units + suffix_width > budget {
+                break;
+            }
+            // Не разрезаем сразу после открывающего ```: это была бы пустая часть.
+            if first == '\n' && end > 0 && (!open || text[..end].contains('\n')) {
+                line_break = Some((end, open));
+            }
+            width += units;
+            end += bytes;
+            open = next_open;
         }
-        parts.push(part);
-        rest = tail.chars().collect();
-    }
-    if !rest.is_empty() {
-        parts.push(rest.into_iter().collect());
+        let (end, next_open) = if end == text.len() { (end, open) } else { line_break.unwrap_or((end, open)) };
+        let suffix = if next_open { CLOSE } else { "" };
+        parts.push(format!("{prefix}{}{suffix}", &text[..end]));
+        text = text[end..].strip_prefix('\n').unwrap_or(&text[end..]);
+        in_fence = next_open;
     }
     parts
 }
@@ -618,20 +816,98 @@ pub fn is_supported_image(content_type: Option<&str>, size: u64) -> bool {
 }
 
 /// Что ещё передать ИИ вместе с вопросом.
+pub async fn download_image(data: &Data, attachment: &serenity::Attachment) -> Result<Vec<u8>, AiError> {
+    let _slot = data.ai.image_slots.try_acquire().map_err(|_| AiError::Busy)?;
+    let max = MAX_IMAGE_MB as usize * 1024 * 1024;
+    let mut response = data.web.get(&attachment.url).timeout(Duration::from_secs(12))
+        .send().await.and_then(reqwest::Response::error_for_status).map_err(transport_error)?;
+    if response.content_length().is_some_and(|length| length > max as u64) {
+        return Err(AiError::Other("вложение превышает допустимый размер".into()));
+    }
+    let mut image = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        if chunk.len() > max - image.len() {
+            return Err(AiError::Other("вложение превышает допустимый размер".into()));
+        }
+        image.extend_from_slice(&chunk);
+    }
+    Ok(image)
+}
+
+/// Маркер живёт ровно пока у канала есть незавершённые запросы к ИИ.
+struct HistorySnapshot {
+    marker: Arc<()>,
+    turns: Vec<Turn>,
+}
+
+fn history_snapshot(data: &Data, channel: u64) -> rusqlite::Result<HistorySnapshot> {
+    let mut active = locked(&data.ai.active_history);
+    active.retain(|_, marker| marker.strong_count() != 0);
+    let marker = active.get(&channel).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let marker = Arc::new(());
+        active.insert(channel, Arc::downgrade(&marker));
+        marker
+    });
+    let connection = data.db.lock();
+    let mut statement = connection.prepare_cached(
+        "SELECT role, substr(text, 1, 4000) FROM ai_history WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    let mut turns = statement.query_map(params![channel as i64, data.ai.settings.history_limit], |row| {
+        Ok(Turn { role: row.get(0)?, text: row.get(1)?, images: Vec::new() })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if turns.last().is_some_and(|turn| turn.role == "model") {
+        turns.pop();
+    }
+    turns.reverse();
+    Ok(HistorySnapshot { marker, turns })
+}
+
+pub fn forget_history(data: &Data, channel: u64) -> rusqlite::Result<usize> {
+    let mut active = locked(&data.ai.active_history);
+    let removed = data.db.clear_ai_history(channel)?;
+    active.remove(&channel);
+    Ok(removed)
+}
+
+fn remember_exchange(data: &Data, channel: u64, marker: &Arc<()>, question: &str, answer: &str) -> rusqlite::Result<()> {
+    let active = locked(&data.ai.active_history);
+    let current = active.get(&channel).is_some_and(|live| live.ptr_eq(&Arc::downgrade(marker)));
+    let limit = data.ai.settings.history_limit / 2 * 2;
+    if !current || limit == 0 {
+        return Ok(());
+    }
+    let mut connection = data.db.lock();
+    let tx = connection.transaction()?;
+    let now = db::now();
+    for (role, text) in [("user", question), ("model", answer)] {
+        tx.execute(
+            "INSERT INTO ai_history (channel_id, role, text, created) VALUES (?1, ?2, substr(?3, 1, 4000), ?4)",
+            params![channel as i64, role, text, now],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM ai_history WHERE channel_id = ?1 AND id NOT IN (
+             SELECT id FROM ai_history WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2
+         )",
+        params![channel as i64, limit],
+    )?;
+    tx.commit()
+}
+
 #[derive(Default)]
 pub struct Extras<'a> {
     pub options: RequestOptions<'a>,
     /// Последние сообщения чата (для контекста), пусто — без них
     pub chat: String,
-    /// Кто спрашивает на сервере и подсказка о его правах — чтобы выполнять варны и тайм-ауты по просьбе модератора
-    pub moderation: Option<(Requester<'a>, String)>,
+    /// Явное действие модератора, разобранное из его исходного сообщения.
+    pub moderation: Option<(Requester<'a>, crate::moderation::Action)>,
 }
 
-/// Отправляет вопрос в Gemini вместе с памятью разговора. Ok(None) — ИИ решил, что к нему обратились грубо.
-pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: Vec<(Vec<u8>, String)>, extras: Extras<'_>) -> Result<Option<String>, AiError> {
-    if directed_insult(data, question).await { return Ok(None); }
-    if let Some(user) = extras.options.user {
-        if let Some(refusal) = data.ai.limit_check(user) { return Ok(Some(refusal)); }
+/// Отправляет допущенный вопрос вместе с памятью разговора или выполняет явную команду модератора.
+pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: Vec<(Vec<u8>, String)>, extras: Extras<'_>) -> Result<String, AiError> {
+    if let Some((requester, action)) = extras.moderation {
+        let result = crate::moderation::run_action(data, &requester, action).await;
+        return Ok(result);
     }
     let mut system = format!("{}\nСегодня {}.", system_prompt(data), chrono::Local::now().format("%d.%m.%Y"));
     if wants_structured_answer(question) {
@@ -645,42 +921,27 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     if !extras.chat.is_empty() {
         prompt = format!("Последние сообщения в чате (для контекста):\n{}\n\nВопрос — {current}", extras.chat);
     }
-    if let Some((_, note)) = &extras.moderation {
-        if !note.is_empty() {
-            prompt = format!("{note}\n\n{prompt}"); // права собеседника и id упомянутых — для варнов
-        }
-    }
-    // Разговор: сначала прошлые сообщения из памяти, потом новый вопрос
-    let history = data.db.ai_history(channel, data.ai.settings.history_limit).map_err(|error| AiError::Other(error.to_string()))?;
-    let mut turns: Vec<Turn> = history.into_iter().map(|(role, text)| Turn { role, text, images: Vec::new() }).collect();
+    // Снимок памяти привязан к текущему поколению канала.
+    let HistorySnapshot { marker, mut turns } = history_snapshot(data, channel)
+        .map_err(|error| AiError::Other(error.to_string()))?;
     turns.push(Turn { role: "user".into(), text: prompt, images });
     let answer = generate_selected(data, &system, &turns, extras.options).await?;
     if answer.text.is_empty() {
-        return Ok(Some("🤔 ИИ не дал ответа. Попробуй переформулировать вопрос.".to_string()));
+        return Ok("🤔 ИИ не дал ответа. Попробуй переформулировать вопрос.".to_string());
     }
-    // Только отдельный классификатор решает о наказании. Метки ответа не запускают его.
-    let text = strip_tags(&answer.text, &["ЗАПОМНИТЬ", "ИГНОР"]);
-    // Варны и тайм-ауты по просьбе модератора: метки выполняем, а неполные (без id) просто вырезаем
-    let (text, actions) = crate::moderation::take_actions(&text);
-    let mut text = strip_tags(&text, &MOD_TAGS);
-    let punishments = match &extras.moderation {
-        Some((requester, _)) => crate::moderation::run_actions(data, requester, actions).await,
-        None => Vec::new(),
-    };
-    text = format_answer_text(&text, question, data.ai.settings.one_line);
-    if !punishments.is_empty() {
-        text = format!("{text}\n{}", punishments.join("\n")).trim().to_string();
-    }
+    let mut text = format_answer_text(&without_tags(&answer.text), question, data.ai.settings.one_line);
     if text.is_empty() {
         text = "🤔 ИИ не дал ответа. Попробуй переформулировать вопрос.".to_string();
     }
     // Запоминаем этот обмен репликами. Сами картинки в память не сохраняются — только отметка о них.
     let remembered = if image_count > 0 { format!("{current} [прислал картинок: {image_count}]") } else { current };
-    let _ = data.db.save_ai_history(channel, &remembered, &text, db::now(), data.ai.settings.history_limit);
+    if let Err(error) = remember_exchange(data, channel, &marker, &remembered, &text) {
+        eprintln!("Не удалось сохранить историю ИИ: {error}");
+    }
     if answer.cut {
         text.push_str("\n\n✂️ *Ответ обрезан — слишком длинный. Попроси объяснить короче или по частям.*");
     }
-    Ok(Some(text))
+    Ok(text)
 }
 
 // ---------- Адресная проверка оскорблений и минутный тайм-аут ----------
@@ -695,8 +956,16 @@ pub fn is_letter(c: char) -> bool {
     c.is_ascii_digit() || c.is_ascii_lowercase() || ('а'..='я').contains(&c)
 }
 
-async fn directed_insult(data: &Data, text: &str) -> bool {
+pub async fn directed_insult(data: &Data, text: &str) -> bool {
     if text.trim().is_empty() { return false; }
+    let Ok(_slot) = data.ai.classifier_slots.try_acquire() else { return false };
+    {
+        let mut attempts = locked(&data.ai.classifier_attempts);
+        AiState::prune_recent(&mut attempts);
+        let limit = data.ai.settings.google_minute_limit.clamp(1, 60) as usize;
+        if attempts.len() >= limit { return false; }
+        attempts.push_back(Instant::now());
+    }
     let system = include_str!("ai_insult_rules.txt");
     let turns = [Turn::user(json!({"message":text}).to_string())];
     let options = RequestOptions { model: ModelChoice::FlashLite, thinking: Some(ThinkingLevel::Low), ..Default::default() };
@@ -740,14 +1009,12 @@ pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option
     let Ok(count) = data.db.add_rude_strike(guild.get(), user.id.get(), db::now(), data.ai.rude.strike_reset as f64 * 60.0) else { return };
     println!("Грубость к боту: пользователь={} сервер={guild} подряд={count}", user.id);
     let minutes = 1;
-    let until = serenity::Timestamp::from_unix_timestamp(db::now() as i64 + minutes * 60).unwrap_or_else(|_| serenity::Timestamp::now());
-    // Уже действующее более долгое наказание нельзя сокращать до минуты.
-    // Без GUILD_MEMBERS кэш участника может быть устаревшим — нужен свежий HTTP-ответ.
-    let Ok(member) = ctx.http.get_member(guild, user.id).await else { return };
-    if member.communication_disabled_until.is_some_and(|existing| existing > until) { return; }
     let reason = format!("Грубость к боту ({count} раз подряд)");
-    let edit = serenity::EditMember::new().disable_communication_until_datetime(until).audit_log_reason(&reason);
-    if let Err(error) = guild.edit_member(ctx, user.id, edit).await {
+    let timeout = crate::moderation::set_timeout(
+        ctx, data, guild, user.id, crate::moderation::TimeoutChange::Extend(minutes), &reason,
+    ).await;
+    if matches!(timeout, Ok(false)) { return; }
+    if let Err(error) = timeout {
         // Нет права Moderate Members, роль бота ниже или это администратор/владелец — пишем только в логи
         println!("Не получилось дать тайм-аут {}: {error}", user.id);
         let details = format!(
@@ -757,11 +1024,11 @@ pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option
         return;
     }
     let text = format!("🔇 <@{}> отдохнёт {}. Хватит грубить.", user.id, minutes_text(minutes));
-    if data.ai.rude.announce {
+    let announced = if data.ai.rude.announce {
         let message = serenity::CreateMessage::new().content(&text).allowed_mentions(serenity::CreateAllowedMentions::new());
-        let _ = channel.send_message(ctx, message).await;
-    }
-    if data.db.log_channel(guild.get()).ok().flatten() != Some(channel.get()) {
+        channel.send_message(ctx, message).await.is_ok()
+    } else { false };
+    if !announced || data.db.log_channel(guild.get()).ok().flatten() != Some(channel.get()) {
         crate::moderation::send_log(ctx, data, guild, &format!("{text} ({count} раз подряд, в <#{channel}>)")).await;
     }
 }
@@ -911,7 +1178,10 @@ mod tests {
         }).await.unwrap();
         assert_eq!(calls, ["primary", "primary", "fallback"]);
         assert_eq!(answer.text, "ответ запасной");
-        assert_eq!(data.db.ai_requests(&google_day()).unwrap(), 1);
+        assert_eq!(provider_usage(&data, &google_day()).unwrap(), [
+            ModelUsage { model: "fallback".into(), attempts: 1, succeeded: 1 },
+            ModelUsage { model: "primary".into(), attempts: 2, succeeded: 0 },
+        ]);
     }
 
     #[tokio::test]
@@ -1025,6 +1295,21 @@ mod tests {
     }
 
     #[test]
+    fn split_long_fence_makes_progress_and_respects_utf16_limit() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let text = format!("```rust\n{}\n```", "🚀".repeat(3000));
+            tx.send(split_message(&text, 1900)).ok();
+        });
+        let parts = rx.recv_timeout(std::time::Duration::from_secs(1)).expect("splitter did not finish");
+        worker.join().unwrap();
+        assert!(parts.len() < 10);
+        assert!(parts.iter().all(|part| part.encode_utf16().count() <= 1900));
+        assert!(parts.iter().all(|part| part.matches("```").count() % 2 == 0));
+        assert_eq!(parts.iter().map(|part| part.matches("🚀").count()).sum::<usize>(), 3000);
+    }
+
+    #[test]
     fn rudeness_minutes() {
         assert_eq!([minutes_text(1), minutes_text(5), minutes_text(60), minutes_text(120), minutes_text(1440), minutes_text(90)],
                    ["1 минуту", "5 минут", "1 час", "2 часа", "1 день", "90 минут"]);
@@ -1060,7 +1345,7 @@ mod tests {
         // Потом полный путь, как у /ask: память разговора, повторы, запасная модель
         let answer = ask(&data, "Сколько будет 2+2? Ответь коротко.", "Тестер", 1, Vec::new(), Extras::default()).await;
         println!("ask: {answer:?}");
-        assert!(matches!(&answer, Ok(Some(text)) if !text.is_empty()), "{answer:?}");
+        assert!(matches!(&answer, Ok(text) if !text.is_empty()), "{answer:?}");
         assert!(main.is_ok(), "основная модель не ответила: {main:?}");
     }
 

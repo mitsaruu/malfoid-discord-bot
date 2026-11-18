@@ -20,19 +20,16 @@ fn choice_rows(buttons: Vec<s::CreateButton>) -> Vec<s::CreateActionRow> {
         .collect()
 }
 pub fn items(data: &Data, guild: u64) -> Result<Vec<Item>, Error> {
+    queue_slice(data, guild, i64::MAX as usize, 0)
+}
+
+pub(crate) fn queue_slice(data: &Data, guild: u64, limit: usize, offset: usize) -> Result<Vec<Item>, Error> {
     let conn = data.db.lock();
-    let mut st=conn.prepare("SELECT id,url,title,details FROM queue WHERE guild_id=?1 ORDER BY COALESCE(sort_order,id),id")?;
-    let rows = st.query_map([guild as i64], |r| {
-        Ok(Item {
-            id: r.get(0)?,
-            url: r.get(1)?,
-            title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            details: r
-                .get::<_, Option<String>>(3)?
-                .and_then(|v| serde_json::from_str(&v).ok())
-                .unwrap_or(Value::Null),
-        })
-    })?;
+    let mut st = conn.prepare(
+        "SELECT id,url,title,details FROM queue WHERE guild_id=?1
+         ORDER BY COALESCE(sort_order,id),id LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = st.query_map(params![guild as i64, limit as i64, offset as i64], crate::music_runtime::row_item)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 pub fn enqueue(
@@ -43,30 +40,49 @@ pub fn enqueue(
     details: &Value,
     front: bool,
 ) -> Result<(), Error> {
-    let mut details = if details.is_object() {
-        details.clone()
-    } else {
-        json!({})
-    };
-    details["request_id"] = rand::random::<u64>().into();
-    let conn = data.db.lock();
-    let next: i64 = conn.query_row(
+    enqueue_batch(data, guild, [(url, title, details.clone())], front)?;
+    Ok(())
+}
+
+pub(crate) fn enqueue_batch<U: AsRef<str>, T: AsRef<str>>(
+    data: &Data,
+    guild: u64,
+    rows: impl IntoIterator<Item = (U, T, Value)>,
+    front: bool,
+) -> Result<usize, Error> {
+    let mut conn = data.db.lock();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let edge: i64 = tx.query_row(
         if front {
-            "SELECT COALESCE(MIN(COALESCE(sort_order,id)),0)-1 FROM queue WHERE guild_id=?1"
+            "SELECT COALESCE(MIN(COALESCE(sort_order,id)),0) FROM queue WHERE guild_id=?1"
         } else {
-            "SELECT COALESCE(MAX(COALESCE(sort_order,id)),0)+1 FROM queue WHERE guild_id=?1"
+            "SELECT COALESCE(MAX(COALESCE(sort_order,id)),0) FROM queue WHERE guild_id=?1"
         },
         [guild as i64],
         |r| r.get(0),
     )?;
-    conn.execute(
-        "INSERT INTO queue(guild_id,url,title,sort_order,details) VALUES(?1,?2,?3,?4,?5)",
-        params![guild as i64, url, title, next, details.to_string()],
-    )?;
-    Ok(())
+    let mut count = 0;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO queue(guild_id,url,title,sort_order,details) VALUES(?1,?2,?3,?4,?5)",
+        )?;
+        for (url, title, mut details) in rows {
+            if !details.is_object() {
+                details = json!({});
+            }
+            details["request_id"] = rand::random::<u64>().into();
+            count += 1;
+            let order = edge.checked_add(if front { -count } else { count })
+                .ok_or("Переполнение номера в очереди")?;
+            insert.execute(params![guild as i64, url.as_ref(), title.as_ref(), order, details.to_string()])?;
+        }
+    }
+    tx.commit()?;
+    Ok(count as usize)
 }
+
+#[cfg(test)]
 pub fn pop(data: &Data, guild: u64) -> Result<Option<Item>, Error> {
-    // Вызывается под замком плеера; SQL-удаление проверяет, что строка не изменилась.
     for item in items(data, guild)? {
         if remove_snapshot(data, guild, std::slice::from_ref(&item))? > 0 {
             return Ok(Some(item));
@@ -74,12 +90,20 @@ pub fn pop(data: &Data, guild: u64) -> Result<Option<Item>, Error> {
     }
     Ok(None)
 }
+
 pub fn remove_snapshot(data: &Data, guild: u64, rows: &[Item]) -> Result<usize, Error> {
     let mut conn = data.db.lock();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut count = 0;
     for row in rows {
-        count+=tx.execute("DELETE FROM queue WHERE guild_id=?1 AND id=?2 AND url=?3 AND COALESCE(title,'')=?4 AND COALESCE(details,'null')=?5",params![guild as i64,row.id,row.url,row.title,row.details.to_string()])?;
+        let live = tx.query_row(
+            "SELECT id,url,title,details FROM queue WHERE guild_id=?1 AND id=?2",
+            params![guild as i64, row.id],
+            crate::music_runtime::row_item,
+        ).optional()?;
+        if live.is_some_and(|i| i.url == row.url && i.title == row.title && i.details == row.details) {
+            count += tx.execute("DELETE FROM queue WHERE guild_id=?1 AND id=?2", params![guild as i64,row.id])?;
+        }
     }
     tx.commit()?;
     Ok(count)
@@ -98,17 +122,19 @@ pub fn empty_seconds(data: &Data, guild: u64) -> i64 {
         .unwrap_or(180)
         .clamp(0, 3600)
 }
+pub(crate) fn user_in_bot_voice(ctx: &s::Context, guild: s::GuildId, user: s::UserId) -> bool {
+    let Some(guild) = ctx.cache.guild(guild) else { return false };
+    let voice = |user| guild.voice_states.get(&user).and_then(|state| state.channel_id);
+    let user = voice(user);
+    user.is_some() && user == voice(ctx.cache.current_user().id)
+}
+
 pub(crate) fn same_voice(ctx: Context<'_>) -> bool {
-    let Some(guild) = ctx.guild() else {
-        return false;
-    };
-    let bot = ctx.framework().bot_id();
-    let a = guild
-        .voice_states
-        .get(&ctx.author().id)
-        .and_then(|v| v.channel_id);
-    let b = guild.voice_states.get(&bot).and_then(|v| v.channel_id);
-    a.is_some() && a == b
+    ctx.guild_id().is_some_and(|guild| user_in_bot_voice(ctx.serenity_context(), guild, ctx.author().id))
+}
+
+pub(crate) fn mutation_allowed(ctx: Context<'_>) -> rusqlite::Result<bool> {
+    Ok(same_voice(ctx) && crate::music_channels::ctx_allowed(ctx)?)
 }
 /// Удалить отдельный трек из очереди (номер из /queue)
 #[poise::command(slash_command, guild_only)]
@@ -118,29 +144,23 @@ pub async fn queue_remove(
     #[min = 1]
     position: i64,
 ) -> Result<(), Error> {
-    if !same_voice(ctx) {
-        return crate::reply::whisper(ctx, "Зайди в голосовой канал бота.").await;
-    }
     let guild = ctx.guild_id().unwrap().get();
-    let rows = items(ctx.data(), guild)?;
-    let Some(item) = rows.get((position - 1) as usize) else {
-        return crate::reply::whisper(ctx, "Такого номера в очереди нет.").await;
-    };
-    let moderator = ctx.author_member().await.is_some_and(|m| {
-        crate::moderation::permissions(ctx.serenity_context(), ctx.guild_id().unwrap(), &m)
-            .manage_guild()
+    let moderator = ctx.author_member().await.is_some_and(|member| {
+        crate::moderation::permissions(ctx.serenity_context(), ctx.guild_id().unwrap(), &member).manage_guild()
     });
-    if item.details["requester"].as_u64() != Some(ctx.author().id.get()) && !moderator {
-        return crate::reply::whisper(
-            ctx,
-            "Удалить чужую или старую заявку может участник с правом «Управлять сервером».",
-        )
-        .await;
+    if !mutation_allowed(ctx)? {
+        return crate::reply::whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
     }
-    remove_snapshot(ctx.data(), guild, std::slice::from_ref(item))?;
+    let result = edit_positions(ctx.data(), guild, ctx.author().id.get(), moderator, position, None)?;
+    let result = match result {
+        QueueEdit::Changed(item) => format!("🗑️ Удалён трек: {item}"),
+        QueueEdit::Missing => return crate::reply::whisper(ctx, "Такого номера в очереди нет.").await,
+        QueueEdit::Denied => return crate::reply::whisper(ctx, "Удалить чужую или старую заявку может участник с правом «Управлять сервером».").await,
+    };
     crate::music_runtime::queue_changed(ctx.data(), guild);
-    crate::reply::say(ctx, format!("🗑️ Удалён трек: {}", item.title)).await
+    crate::reply::say(ctx, result).await
 }
+
 /// Переместить трек в очереди
 #[poise::command(slash_command, guild_only)]
 pub async fn queue_move(
@@ -152,45 +172,69 @@ pub async fn queue_move(
     #[min = 1]
     to: i64,
 ) -> Result<(), Error> {
-    if !same_voice(ctx) {
-        return crate::reply::whisper(ctx, "Зайди в голосовой канал бота.").await;
-    }
     let guild = ctx.guild_id().unwrap().get();
-    let moderator = ctx.author_member().await.is_some_and(|m| {
-        crate::moderation::permissions(ctx.serenity_context(), ctx.guild_id().unwrap(), &m)
-            .manage_guild()
+    let moderator = ctx.author_member().await.is_some_and(|member| {
+        crate::moderation::permissions(ctx.serenity_context(), ctx.guild_id().unwrap(), &member).manage_guild()
     });
-    let mut rows = items(ctx.data(), guild)?;
-    if from as usize > rows.len() || to as usize > rows.len() {
-        return crate::reply::whisper(ctx, "Проверь номера в /queue.").await;
+    if !mutation_allowed(ctx)? {
+        return crate::reply::whisper(ctx, "Зайди в голосовой канал бота и используй музыкальный канал.").await;
     }
-    let row = rows.remove(from as usize - 1);
-    if row.details["requester"].as_u64() != Some(ctx.author().id.get()) && !moderator {
-        return crate::reply::whisper(
-            ctx,
-            "Переместить чужую заявку может участник с правом «Управлять сервером».",
-        )
-        .await;
-    }
-    rows.insert(to as usize - 1, row);
-    {
-        let mut conn = ctx.data().db.lock();
-        let tx = conn.transaction()?;
-        for (i, row) in rows.iter().enumerate() {
-            tx.execute(
-                "UPDATE queue SET sort_order=?1 WHERE guild_id=?2 AND id=?3",
-                params![i as i64 + 1, guild as i64, row.id],
-            )?;
-        }
-        tx.commit()?;
+    match edit_positions(ctx.data(), guild, ctx.author().id.get(), moderator, from, Some(to))? {
+        QueueEdit::Changed(_) => {}
+        QueueEdit::Missing => return crate::reply::whisper(ctx, "Проверь номера в /queue.").await,
+        QueueEdit::Denied => return crate::reply::whisper(ctx, "Переместить чужую заявку может участник с правом «Управлять сервером».").await,
     }
     crate::music_runtime::queue_changed(ctx.data(), guild);
     crate::reply::say(ctx, format!("↕️ Трек перемещён: {from} → {to}.")).await
 }
+
+enum QueueEdit {
+    Changed(String),
+    Missing,
+    Denied,
+}
+
+fn edit_positions(
+    data: &Data,
+    guild: u64,
+    user: u64,
+    moderator: bool,
+    from: i64,
+    to: Option<i64>,
+) -> rusqlite::Result<QueueEdit> {
+    let mut conn = data.db.lock();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some(offset) = from.checked_sub(1).filter(|offset| *offset >= 0) else {
+        return Ok(QueueEdit::Missing);
+    };
+    let item = tx.query_row(
+        "SELECT id,url,title,details FROM queue WHERE guild_id=?1
+         ORDER BY COALESCE(sort_order,id),id LIMIT 1 OFFSET ?2",
+        params![guild as i64, offset],
+        crate::music_runtime::row_item,
+    ).optional()?;
+    let Some(item) = item else { return Ok(QueueEdit::Missing) };
+    if item.details["requester"].as_u64() != Some(user) && !moderator {
+        return Ok(QueueEdit::Denied);
+    }
+    if let Some(to) = to {
+        let mut ids = crate::music_queue::order_ids(&tx, guild)?;
+        if to < 1 || to as u64 > ids.len() as u64 {
+            return Ok(QueueEdit::Missing);
+        }
+        ids.remove(offset as usize);
+        ids.insert(to as usize - 1, item.id);
+        crate::music_queue::set_order(&tx, guild, &ids)?;
+    } else {
+        tx.execute("DELETE FROM queue WHERE guild_id=?1 AND id=?2", params![guild as i64, item.id])?;
+    }
+    tx.commit()?;
+    Ok(QueueEdit::Changed(item.title))
+}
 /// Удалить из очереди только свои заявки
 #[poise::command(slash_command, guild_only)]
 pub async fn queue_clear_mine(ctx: Context<'_>) -> Result<(), Error> {
-    if !same_voice(ctx) {
+    if !mutation_allowed(ctx)? {
         return crate::reply::whisper(ctx, "Зайди в голосовой канал бота.").await;
     }
     let guild = ctx.guild_id().unwrap().get();
@@ -254,24 +298,16 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
     let guild = ctx.guild_id().unwrap().get();
     let current = ctx.data().music.with(guild, |st| {
         st.now_playing.as_ref().map(|(_, title)| {
-            (
-                title.clone(),
-                st.playing_url.clone().unwrap_or_default(),
-                st.details.clone(),
-            )
+            (title.clone(), st.playing_url.clone().unwrap_or_default(), st.details.clone(), st.snapshot_id)
         })
     });
-    let Some((title, url, details)) = current else {
+    let Some((title, url, details, snapshot)) = current else {
         return crate::reply::whisper(ctx, "Сейчас ничего не играет.").await;
     };
     let mut buttons = crate::music::music_buttons();
-    buttons.push(crate::music_library::favorite_button_for(
-        &ctx.data().db,
-        guild,
-        &url,
-        &title,
-        &details,
-    )?);
+    if let Some(snapshot) = snapshot {
+        buttons.push(crate::music_library::favorite_button(guild, snapshot));
+    }
     if let Some(link) = original_button(&details) {
         buttons.push(s::CreateActionRow::Buttons(vec![link]));
     }
@@ -300,27 +336,16 @@ pub async fn uncached_candidates(
     query: &str,
     count: usize,
 ) -> Result<Vec<Value>, Error> {
-    let target = if query.starts_with("http") {
-        query.to_owned()
-    } else {
-        format!(
-            "ytsearch{count}:{}",
-            query.strip_prefix("ytsearch1:").unwrap_or(query)
-        )
-    };
-    let output = tokio::time::timeout(
-        Duration::from_secs(60),
-        crate::music::ytdlp_command(data)
-            .args([
-                "--no-playlist",
-                "--no-warnings",
-                "--skip-download",
-                "--dump-single-json",
-            ])
-            .arg(target)
-            .output(),
-    )
-    .await??;
+    let target = crate::music::ytdlp_target(query, count)?;
+    let mut command = crate::music::ytdlp_command(data);
+    command.args([
+        "--no-playlist",
+        "--no-warnings",
+        "--skip-download",
+        "--dump-single-json",
+        "--",
+    ]).arg(target);
+    let output = crate::music::downloader_output(command).await?;
     if !output.status.success() {
         return Err(format!(
             "yt-dlp: {}",
@@ -374,7 +399,7 @@ pub fn score(query: &str, expected: Option<f64>, candidate: &Value) -> f64 {
     score
 }
 pub fn ranked(query: &str, expected: Option<f64>, mut list: Vec<Value>) -> Vec<Value> {
-    list.retain(|v| v["webpage_url"].as_str().is_some());
+    list.retain(|v| v["webpage_url"].as_str().and_then(crate::music::provider_url).is_some());
     list.sort_by(|a, b| score(query, expected, b).total_cmp(&score(query, expected, a)));
     list
 }
@@ -513,7 +538,11 @@ async fn version_choice(
                 .and_then(|i| payload["list"].as_array().and_then(|a| a.get(i)))
             {
                 let title = best["title"].as_str().unwrap_or("трек");
-                let url = best["webpage_url"].as_str().ok_or("нет ссылки")?;
+                let url = best["webpage_url"].as_str().and_then(crate::music::provider_url)
+                    .ok_or("У варианта нет ссылки поддерживаемого провайдера")?;
+                if !crate::music_channels::press_allowed(data, press)? {
+                    return Err("Музыкальный канал изменился.".into());
+                }
                 let mut meta = payload["details"].clone();
                 meta["duration"] = best["duration"].clone();
                 meta["thumbnail"] = best["thumbnail"].clone();
@@ -527,7 +556,7 @@ async fn version_choice(
                         params![nonce, db::now()],
                     )?;
                     if deleted > 0 {
-                        tx.execute("INSERT INTO queue(guild_id,url,title,sort_order,details) SELECT ?1,?2,?3,COALESCE(MAX(COALESCE(sort_order,id)),0)+1,?4 FROM queue WHERE guild_id=?1",params![guild.get() as i64,url,title,meta.to_string()])?;
+                        tx.execute("INSERT INTO queue(guild_id,url,title,sort_order,details) SELECT ?1,?2,?3,COALESCE(MAX(COALESCE(sort_order,id)),0)+1,?4 FROM queue WHERE guild_id=?1",params![guild.get() as i64,url.as_str(),title,meta.to_string()])?;
                     }
                     tx.commit()?;
                     deleted > 0
@@ -568,6 +597,7 @@ pub async fn resolve(
         json!({})
     };
     if details["resolved"] == true {
+        crate::music::provider_url(&item.url).ok_or("У сохранённого трека неподдерживаемая ссылка")?;
         return Ok((
             (item.url.clone(), item.title.clone()),
             item.title,
@@ -813,9 +843,11 @@ mod tests {
     use super::*;
     #[test]
     fn versions() {
-        let good = json!({"title":"Artist Song official audio","duration":200,"webpage_url":"https://example.com/a"});
-        let remix = json!({"title":"Artist Song remix","duration":201,"webpage_url":"https://example.com/b"});
-        let list = ranked("Artist Song", Some(200.), vec![remix, good.clone()]);
+        let good = json!({"title":"Artist Song official audio","duration":200,"webpage_url":"https://www.youtube.com/watch?v=abcdefghijk"});
+        let remix = json!({"title":"Artist Song remix","duration":201,"webpage_url":"https://www.youtube.com/watch?v=12345678901"});
+        let other = json!({"title":"Artist Song","duration":200,"webpage_url":"https://example.com/a"});
+        let list = ranked("Artist Song", Some(200.), vec![other, remix, good.clone()]);
+        assert_eq!(list.len(), 2);
         assert_eq!(list[0], good);
         assert!(confident("Artist Song", Some(200.), &list));
         assert!(!confident("Other song", Some(500.), &list));

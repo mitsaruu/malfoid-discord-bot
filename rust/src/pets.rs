@@ -1,12 +1,13 @@
 //! Питомцы и кейсы: /case, /cases, /pets, /pets_collect, /pet_feed, /pet_sell. Правила — как в bot.py.
 //! Питомец сам приносит монеты в час; корм поднимает уровень (+25% к доходу за уровень).
 
-use crate::db::{self, Pet};
-use crate::reply::{challenge, display_name, finish_challenge, say, take_money, user_name, whisper};
+use crate::db::{self, Database, Pet, Wallet};
+use crate::reply::{challenge, display_name, finish_challenge, insufficient_money, say, user_name, whisper};
 use crate::text::{hours_text, money_text, number};
 use crate::{Context, Error};
 use poise::serenity_prelude as serenity;
 use rand::Rng;
+use rusqlite::params;
 
 /// Настройки из settings.ini, раздел [pets].
 pub struct PetSettings {
@@ -128,12 +129,12 @@ pub fn stage(level: i64) -> &'static str {
 
 /// Монет в час у питомца этого вида и уровня (округление — как round() в Python: половинки к чётному).
 pub fn income(species: &Species, level: i64) -> i64 {
-    (species.income as f64 * (1.0 + 0.25 * (level - 1) as f64)).round_ties_even() as i64
+    (species.income as f64 * (1.0 + 0.25 * (level.max(1) - 1) as f64)).round_ties_even() as i64
 }
 
 /// Сколько стоит покормить питомца, чтобы он вырос с level до level + 1.
 pub fn feed_cost(species: &Species, level: i64) -> i64 {
-    species.income * 20 * level
+    (species.income * 20).saturating_mul(level.max(1))
 }
 
 /// «🐱 котик (ур. 3, малыш)»
@@ -171,6 +172,102 @@ fn sorted_pets(pets: Vec<Pet>) -> Vec<(Pet, &'static Species)> {
     pets
 }
 
+fn buy_pet(
+    database: &Database,
+    wallet: Wallet<'_>,
+    species: &Species,
+    price: i64,
+    max_pets: i64,
+) -> rusqlite::Result<Result<(), String>> {
+    database.transaction(|tx| {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pets WHERE guild_id = ?1 AND user_id = ?2",
+            params![wallet.guild as i64, wallet.user as i64],
+            |row| row.get(0),
+        )?;
+        if count >= max_pets {
+            return Ok(Err(format!(
+                "🏠 У тебя уже {max_pets} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell")));
+        }
+        let (balance, _) = wallet.open(tx)?;
+        if balance < price {
+            return Ok(Err(insufficient_money(balance, price, "цена кейса")));
+        }
+        db::change_balance(tx, wallet.guild, wallet.user, -price)?;
+        tx.execute(
+            "INSERT INTO pets (guild_id, user_id, species, level, last_collect, spent) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+            params![wallet.guild as i64, wallet.user as i64, species.key, db::now(), price],
+        )?;
+        Ok(Ok(()))
+    })
+}
+
+fn collect_pets(
+    database: &Database,
+    wallet: Wallet<'_>,
+    cap_hours: i64,
+    now: f64,
+) -> rusqlite::Result<Result<(i64, i64), &'static str>> {
+    database.transaction(|tx| {
+        let pets = sorted_pets(Database::pets_on(tx, wallet.guild, wallet.user)?);
+        if pets.is_empty() {
+            return Ok(Err("🐾 Питомцев пока нет. Открой кейс: /case"));
+        }
+        let total = pets.iter().try_fold(0_i64, |total, (pet, species)| {
+            total.checked_add(pending(species, pet.level, pet.last_collect, now, cap_hours))
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, total))
+        })?;
+        if total <= 0 {
+            return Ok(Err("⏳ Питомцы ещё ничего не накопили — загляни попозже."));
+        }
+        wallet.open(tx)?;
+        let balance = db::change_balance(tx, wallet.guild, wallet.user, total)?;
+        for (pet, _) in &pets {
+            tx.execute(
+                "UPDATE pets SET last_collect = ?2 WHERE id = ?1 AND COALESCE(last_collect, 0) < ?2",
+                params![pet.id, now],
+            )?;
+        }
+        Ok(Ok((total, balance)))
+    })
+}
+
+type Feeding = (Pet, &'static Species, i64);
+
+fn feed_owned_pet(
+    database: &Database,
+    wallet: Wallet<'_>,
+    id: i64,
+    settings: &PetSettings,
+) -> rusqlite::Result<Result<Feeding, String>> {
+    database.transaction(|tx| {
+        let found = Database::own_pet_on(tx, id, wallet.guild, wallet.user)?
+            .and_then(|pet| find_species(&pet.species).map(|species| (pet, species)));
+        let Some((pet, species)) = found else {
+            return Ok(Err("Такого питомца у тебя нет — выбери из списка.".into()));
+        };
+        if pet.level >= settings.max_level {
+            return Ok(Err(format!("{} уже вырос до максимума!", title(species, pet.level))));
+        }
+        let cost = feed_cost(species, pet.level);
+        let (balance, _) = wallet.open(tx)?;
+        if balance < cost {
+            return Ok(Err(insufficient_money(balance, cost, "корм")));
+        }
+        let spent = pet.spent.checked_add(cost).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, pet.spent))?;
+        let now = db::now();
+        let saved = pending(species, pet.level, pet.last_collect, now, settings.collect_cap_hours);
+        let new_level = pet.level.max(1) + 1;
+        let last_collect = now - saved as f64 / income(species, new_level) as f64 * 3600.0;
+        db::change_balance(tx, wallet.guild, wallet.user, -cost)?;
+        tx.execute(
+            "UPDATE pets SET level = ?2, spent = ?3, last_collect = ?4 WHERE id = ?1",
+            params![pet.id, new_level, spent, last_collect],
+        )?;
+        Ok(Ok((pet, species, cost)))
+    })
+}
+
 /// Подсказки в поле «питомец»: список своих питомцев.
 async fn pet_autocomplete(ctx: Context<'_>, partial: &str) -> serenity::CreateAutocompleteResponse {
     let response = serenity::CreateAutocompleteResponse::new();
@@ -193,19 +290,16 @@ async fn pet_autocomplete(ctx: Context<'_>, partial: &str) -> serenity::CreateAu
 pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс открыть"] kind: Case) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let price = data.pets.case_prices[kind as usize];
-    if sorted_pets(data.db.user_pets(guild, user)?).len() as i64 >= data.pets.max_pets {
-        return whisper(ctx, format!(
-            "🏠 У тебя уже {} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell", data.pets.max_pets)).await;
-    }
-    if !take_money(ctx, price, "цена кейса").await? {
-        return Ok(());
-    }
     let (roll, pick) = {
         let mut rng = rand::rng();
         (rng.random_range(0.0..100.0), rng.random_range(0..usize::MAX))
     };
     let species = roll_pet(kind, roll, pick);
-    data.db.add_pet(guild, user, species.key, db::now(), price)?;
+    let name = display_name(ctx).await;
+    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
+    if let Err(reason) = buy_pet(&data.db, wallet, species, price, data.pets.max_pets)? {
+        return whisper(ctx, reason).await;
+    }
 
     let no_pings = serenity::CreateAllowedMentions::new();
     let message = ctx
@@ -221,7 +315,7 @@ pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс о
         .title(format!("{} {}", species.emoji, species.name))
         .description(format!(
             "**{}** питомец{ending}\nПриносит **{} в час**.", rarity.name, money_text(income(species, 1))))
-        .author(serenity::CreateEmbedAuthor::new(display_name(ctx).await).icon_url(ctx.author().face()))
+        .author(serenity::CreateEmbedAuthor::new(name).icon_url(ctx.author().face()))
         .footer(serenity::CreateEmbedFooter::new("Забрать доход — /pets_collect · вырастить — /pet_feed"));
     message.edit(ctx, poise::CreateReply::default().content("").embed(embed).allowed_mentions(no_pings)).await?;
     Ok(())
@@ -313,20 +407,12 @@ pub async fn show_pets(
 #[poise::command(slash_command, guild_only)]
 pub async fn pets_collect(ctx: Context<'_>) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let pets = sorted_pets(data.db.user_pets(guild, user)?);
-    if pets.is_empty() {
-        return whisper(ctx, "🐾 Питомцев пока нет. Открой кейс: /case").await;
-    }
-    let now = db::now();
-    let total: i64 = pets
-        .iter()
-        .map(|(pet, species)| pending(species, pet.level, pet.last_collect, now, data.pets.collect_cap_hours))
-        .sum();
-    if total <= 0 {
-        return whisper(ctx, "⏳ Питомцы ещё ничего не накопили — загляни попозже.").await;
-    }
-    data.db.mark_pets_collected(guild, user, now)?;
-    let balance = data.db.add_money(guild, user, &display_name(ctx).await, data.economy.start_balance, total)?;
+    let name = display_name(ctx).await;
+    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
+    let (total, balance) = match collect_pets(&data.db, wallet, data.pets.collect_cap_hours, db::now())? {
+        Ok(result) => result,
+        Err(reason) => return whisper(ctx, reason).await,
+    };
     say(ctx, format!(
         "🐾 Питомцы <@{user}> принесли **+{}**. Баланс: **{}**.", money_text(total), money_text(balance))).await
 }
@@ -340,24 +426,15 @@ pub async fn pet_feed(
     pet: i64,
 ) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let found = data.db.own_pet(pet, guild, user)?.and_then(|pet| find_species(&pet.species).map(|species| (pet, species)));
-    let Some((pet, species)) = found else {
-        return whisper(ctx, "Такого питомца у тебя нет — выбери из списка.").await;
+    let name = display_name(ctx).await;
+    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
+    let (pet, species, cost) = match feed_owned_pet(&data.db, wallet, pet, &data.pets)? {
+        Ok(result) => result,
+        Err(reason) => return whisper(ctx, reason).await,
     };
     let max_level = data.pets.max_level;
-    if pet.level >= max_level {
-        return whisper(ctx, format!("{} уже вырос до максимума!", title(species, pet.level))).await;
-    }
-    let cost = feed_cost(species, pet.level);
-    if !take_money(ctx, cost, "корм").await? {
-        return Ok(());
-    }
-    // Что накопилось по старому доходу, не теряется: сдвигаем начало отсчёта так, чтобы сумма осталась прежней
-    let now = db::now();
-    let saved = pending(species, pet.level, pet.last_collect, now, data.pets.collect_cap_hours);
-    let new_income = income(species, pet.level + 1);
-    data.db.feed_pet(pet.id, cost, now - saved as f64 / new_income as f64 * 3600.0)?;
-    let new_level = pet.level + 1;
+    let new_level = pet.level.max(1) + 1;
+    let new_income = income(species, new_level);
     let grown = if stage(new_level) != stage(pet.level) {
         format!(" и теперь он **{}**!", stage(new_level))
     } else {
@@ -389,21 +466,24 @@ pub async fn pet_sell(
     if needs_sale_confirmation(species) {
         if !crate::qol::confirm(ctx,format!("Продать {}? Вернуть питомца после продажи нельзя.",title(species,pet.level))).await?{return Ok(())}
     }
-    let Some(current)=data.db.own_pet(pet.id,guild,user)? else{return whisper(ctx,"Питомец уже продан или передан.").await};
-    if current!=pet{return whisper(ctx,"Питомец изменился, пока ждали подтверждение. Повтори /pet_sell.").await}
-    // Возвращается часть вложенного и всё, что питомец успел накопить
-    let price = pet.spent * data.pets.sell_percent / 100
-        + pending(species, pet.level, pet.last_collect, db::now(), data.pets.collect_cap_hours);
-    data.db.wallet(guild,user,&display_name(ctx).await,data.economy.start_balance)?;
-    let paid={
-        let mut connection=data.db.lock();let tx=connection.transaction()?;
-        let deleted=tx.execute("DELETE FROM pets WHERE id=?1 AND guild_id=?2 AND user_id=?3 AND level=?4 AND spent=?5 AND last_collect=?6",
-            rusqlite::params![pet.id,guild as i64,user as i64,pet.level,pet.spent,pet.last_collect])?;
-        if deleted==1{tx.execute("UPDATE economy SET balance=balance+?1 WHERE guild_id=?2 AND user_id=?3",rusqlite::params![price,guild as i64,user as i64])?;}
-        tx.commit()?;deleted==1
+    let name = display_name(ctx).await;
+    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
+    let sold = data.db.transaction(|tx| {
+        if Database::own_pet_on(tx, pet.id, guild, user)?.as_ref() != Some(&pet) {
+            return Ok(None);
+        }
+        // Возвращаем долю вложенного и накопившийся доход.
+        let investment = (i128::from(pet.spent.max(0)) * i128::from(data.pets.sell_percent) / 100) as i64;
+        let earned = pending(species, pet.level, pet.last_collect, db::now(), data.pets.collect_cap_hours);
+        let price = investment.checked_add(earned).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, investment))?;
+        wallet.open(tx)?;
+        tx.execute("DELETE FROM pets WHERE id = ?1", [pet.id])?;
+        let balance = db::change_balance(tx, guild, user, price)?;
+        Ok(Some((price, balance)))
+    })?;
+    let Some((price, balance)) = sold else {
+        return whisper(ctx, "Питомец уже продан, передан или изменился. Повтори команду.").await;
     };
-    if !paid{return whisper(ctx,"Питомец уже продан, передан или изменился. Повтори команду.").await}
-    let balance=data.db.wallet(guild,user,&display_name(ctx).await,data.economy.start_balance)?.0;
     say(ctx, format!(
         "💸 <@{user}> продаёт питомца {} за **{}**. Баланс: **{}**.",
         title(species, pet.level), money_text(price), money_text(balance))).await
@@ -413,7 +493,7 @@ const BATTLE_MIN_CHANCE: i64 = 10; // шанс победить в бою не �
 
 /// Шанс победить в процентах: доля своей силы (дохода в час) в общей, но не меньше 10% и не больше 90%.
 pub fn battle_chance(power: i64, enemy_power: i64) -> i64 {
-    let chance = (100.0 * power as f64 / (power + enemy_power) as f64).round_ties_even() as i64;
+    let chance = (100.0 * power as f64 / (power as f64 + enemy_power as f64)).round_ties_even() as i64;
     chance.clamp(BATTLE_MIN_CHANCE, 100 - BATTLE_MIN_CHANCE)
 }
 
@@ -453,24 +533,29 @@ pub async fn pet_battle(
     let Some(press) = challenge(ctx, member.id, offer).await? else { return Ok(()) };
 
     // Пока ждали ответа, питомца могли продать, а монеты — потратить: проверяем заново
-    let still_mine = data.db.own_pet(mine.id, guild, user)?;
-    let enemy_pets = sorted_pets(data.db.user_pets(guild, enemy)?);
-    let (Some(my_pet), Some((enemy_pet, enemy_species))) = (still_mine, enemy_pets.first()) else {
-        return finish_challenge(ctx, &press, "Бой отменён: у кого-то больше нет питомца.".into()).await;
-    };
-    if data.db.wallet(guild, user, &name, start)?.0 < bet || data.db.wallet(guild, enemy, &enemy_name, start)?.0 < bet {
-        return finish_challenge(ctx, &press, format!("Бой отменён: кому-то не хватает {} на ставку.", money_text(bet))).await;
-    }
-    let chance = battle_chance(income(my_species, my_pet.level), income(enemy_species, enemy_pet.level));
-    let won = rand::rng().random_range(0.0..100.0) < chance as f64;
-    let (winner, winner_name, loser, loser_name) =
-        if won { (user, &name, enemy, &enemy_name) } else { (enemy, &enemy_name, user, &name) };
-    data.db.add_money(guild, loser, loser_name, start, -bet)?;
-    let balance = data.db.add_money(guild, winner, winner_name, start, bet)?;
-    finish_challenge(ctx, &press, format!(
-        "⚔️ {} (<@{user}>, шанс {chance}%) против {} (<@{enemy}>, шанс {}%)\n🏆 Побеждает <@{winner}> и забирает **{}**! Баланс: **{}**.",
-        title(my_species, my_pet.level), title(enemy_species, enemy_pet.level), 100 - chance, money_text(bet),
-        money_text(balance))).await
+    let result = data.db.transaction(|tx| {
+        let still_mine = Database::own_pet_on(tx, mine.id, guild, user)?
+            .filter(|pet| pet.species == my_species.key);
+        let enemy_pets = sorted_pets(Database::pets_on(tx, guild, enemy)?);
+        let (Some(my_pet), Some((enemy_pet, enemy_species))) = (still_mine, enemy_pets.first()) else {
+            return Ok("Бой отменён: у кого-то больше нет питомца.".into());
+        };
+        let first = Wallet { guild, user, name: &name, start };
+        let second = Wallet { guild, user: enemy, name: &enemy_name, start };
+        if first.open(tx)?.0 < bet || second.open(tx)?.0 < bet {
+            return Ok(format!("Бой отменён: кому-то не хватает {} на ставку.", money_text(bet)));
+        }
+        let chance = battle_chance(income(my_species, my_pet.level), income(enemy_species, enemy_pet.level));
+        let won = rand::rng().random_range(0.0..100.0) < chance as f64;
+        let (winner, loser) = if won { (user, enemy) } else { (enemy, user) };
+        db::change_balance(tx, guild, loser, -bet)?;
+        let balance = db::change_balance(tx, guild, winner, bet)?;
+        Ok(format!(
+            "⚔️ {} (<@{user}>, шанс {chance}%) против {} (<@{enemy}>, шанс {}%)\n🏆 Побеждает <@{winner}> и забирает **{}**! Баланс: **{}**.",
+            title(my_species, my_pet.level), title(enemy_species, enemy_pet.level), 100 - chance, money_text(bet),
+            money_text(balance)))
+    })?;
+    finish_challenge(ctx, &press, result).await
 }
 
 /// Подсказки в поле «питомец соперника»: питомцы того, кого выбрали в поле member.

@@ -1,7 +1,7 @@
 //! Scheduled, restart-safe summaries of the last closed Moscow day, for both languages.
 //! The job and its pages are immutable snapshots; only delivery checkpoints change.
 
-use crate::db::Database;
+use crate::db::{self, Database};
 use crate::draw::{self, Anchor, Fonts};
 use crate::wordboard;
 use crate::words::{self, Game, Lang, MAX_GUESSES};
@@ -35,6 +35,7 @@ pub fn prepare(db: &Database) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS word_summary_pages (
             job_id INTEGER NOT NULL, page INTEGER NOT NULL, total INTEGER NOT NULL,
             content TEXT NOT NULL, players TEXT NOT NULL, first_attempt INTEGER, message_id INTEGER, scan_before INTEGER,
+            retry_after REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (job_id, page));
          CREATE TABLE IF NOT EXISTS word_summary_legacy (
             guild_id INTEGER NOT NULL, lang TEXT NOT NULL, day TEXT NOT NULL,
@@ -49,6 +50,16 @@ pub fn prepare(db: &Database) -> rusqlite::Result<()> {
     if !has_cursor {
         transaction.execute("ALTER TABLE word_summary_pages ADD COLUMN scan_before INTEGER", [])?;
     }
+    let has_retry: bool = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('word_summary_pages') WHERE name = 'retry_after')",
+        [], |row| row.get(0),
+    )?;
+    if !has_retry {
+        transaction.execute("ALTER TABLE word_summary_pages ADD COLUMN retry_after REAL NOT NULL DEFAULT 0", [])?;
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS word_summary_pending ON word_summary_pages(retry_after) WHERE message_id IS NULL;",
+    )?;
     if transaction.execute("INSERT OR IGNORE INTO word_summary_migrations (version) VALUES (1)", [])? != 0 {
         // Old code marked the PUBLICATION day before POST. Those ambiguous legacy markers
         // must be trusted to avoid duplicating already emitted summaries. Never write new ones.
@@ -112,7 +123,7 @@ pub fn set_lang(data: &Data, guild: u64, user: u64, lang: Lang) -> rusqlite::Res
     Ok(())
 }
 
-fn profile(db: &Database, guild: u64, user: u64) -> rusqlite::Result<Option<(String, String)>> {
+pub(crate) fn profile(db: &Database, guild: u64, user: u64) -> rusqlite::Result<Option<(String, String)>> {
     db.lock()
         .query_row(
             "SELECT name, face FROM word_profiles WHERE guild_id = ?1 AND user_id = ?2",
@@ -371,10 +382,11 @@ fn pending_pages(db: &Database) -> rusqlite::Result<Vec<Page>> {
     let mut statement = connection.prepare(
         "SELECT j.id, j.guild_id, j.lang, j.day, j.channel_id, p.page, p.total, p.content, p.players, p.first_attempt, p.scan_before
          FROM word_summary_jobs j JOIN word_summary_pages p ON p.job_id = j.id
-         WHERE p.message_id IS NULL ORDER BY j.day DESC, j.guild_id, j.lang, p.page",
+         WHERE p.message_id IS NULL AND p.retry_after <= ?1
+         ORDER BY j.day DESC, j.guild_id, j.lang, p.page LIMIT 64",
     )?;
     let pages = statement
-        .query_map([], |row| {
+        .query_map([db::now()], |row| {
             let key: String = row.get(2)?;
             let lang = Lang::from_key(&key).ok_or(rusqlite::Error::InvalidQuery)?;
             Ok(Page {
@@ -406,7 +418,8 @@ fn begin_attempt(db: &Database, page: &Page, now_ms: i64) -> rusqlite::Result<bo
 
 fn record_receipt(db: &Database, page: &Page, message: u64) -> rusqlite::Result<()> {
     db.lock().execute(
-        "UPDATE word_summary_pages SET message_id = ?1, scan_before = NULL WHERE job_id = ?2 AND page = ?3 AND message_id IS NULL",
+        "UPDATE word_summary_pages SET message_id = ?1, scan_before = NULL, content = '', players = '[]'
+         WHERE job_id = ?2 AND page = ?3 AND message_id IS NULL",
         params![message as i64, page.job, page.number],
     )?;
     Ok(())
@@ -478,18 +491,7 @@ async fn avatar_card(
                 face = found.face();
             }
         }
-        // Use cached_avatar's cache, but release its mutex before the network request.
-        // cached_avatar itself holds that mutex during download, serializing all players.
-        let cached = { data.boards.avatars.lock().await.get(&user).cloned() };
-        if let Some(known) = cached {
-            return known;
-        }
-        if face.is_empty() {
-            return None;
-        }
-        let avatar = crate::levels::fetch_avatar(&data, &face).await;
-        data.boards.avatars.lock().await.insert(user, avatar.clone());
-        avatar
+        wordboard::cached_avatar(&data, &face).await
     })
     .await
     .ok()
@@ -644,6 +646,38 @@ fn report(operation: &str, error: &dyn std::fmt::Display) {
     );
 }
 
+fn refresh_target(db: &Database, page: &mut Page) -> rusqlite::Result<()> {
+    let selected = target_channel(db, page.guild, page.lang)?;
+    db.transaction(|tx| {
+        if let Some(selected) = selected.filter(|id| *id != 0) {
+            tx.execute(
+                "UPDATE word_summary_jobs SET channel_id=?2 WHERE id=?1 AND channel_id!=?2
+                 AND NOT EXISTS (
+                    SELECT 1 FROM word_summary_pages WHERE job_id=?1 AND (first_attempt IS NOT NULL OR message_id IS NOT NULL)
+                 )",
+                params![page.job, selected as i64],
+            )?;
+        }
+        page.channel = tx.query_row("SELECT channel_id FROM word_summary_jobs WHERE id=?1",
+            [page.job], |row| row.get::<_, i64>(0).map(|id| id as u64))?;
+        Ok(())
+    })
+}
+
+fn defer_failed_page(db: &Database, page: &Page, error: &Error) -> rusqlite::Result<()> {
+    let unavailable_channel = matches!(
+        error.downcast_ref::<serenity::Error>(),
+        Some(serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)))
+            if matches!(response.status_code.as_u16(), 403 | 404)
+    );
+    let delay = if unavailable_channel { 10.0 * 60.0 } else { RETRY_INTERVAL.as_secs_f64() };
+    db.lock().execute(
+        "UPDATE word_summary_pages SET retry_after=?3 WHERE job_id=?1 AND page=?2 AND message_id IS NULL",
+        params![page.job, page.number, db::now() + delay],
+    )?;
+    Ok(())
+}
+
 /// Start exactly once from framework setup (not from Ready or a player interaction).
 /// Wakes at the absolute Moscow boundary; retries pending work every 60 seconds.
 pub fn start_loop(ctx: serenity::Context, data: Shared) {
@@ -661,7 +695,7 @@ pub fn start_loop(ctx: serenity::Context, data: Shared) {
                 let boundary = next_moscow_midnight(Utc::now());
                 match pending_pages(&delivery_data.db) {
                     Ok(pages) => {
-                        for page in pages {
+                        for mut page in pages {
                             if Utc::now() >= boundary {
                                 break;
                             }
@@ -672,8 +706,15 @@ pub fn start_loop(ctx: serenity::Context, data: Shared) {
                             if page.day.parse::<NaiveDate>().is_err() || page.day > closed {
                                 continue;
                             }
+                            if let Err(error) = refresh_target(&delivery_data.db, &mut page) {
+                                report("target", &error);
+                                continue;
+                            }
                             if let Err(error) = deliver(&ctx, &delivery_data, &page).await {
                                 report("delivery", &error);
+                                if let Err(error) = defer_failed_page(&delivery_data.db, &page, &error) {
+                                    report("schedule retry", &error);
+                                }
                             }
                         }
                     }

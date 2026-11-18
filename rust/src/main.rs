@@ -1,11 +1,9 @@
-//! Discord-бот на Rust — переписан с bot.py: те же команды, те же config/ и levels.db.
-//! Работает с теми же файлами, что и bot.py: config/settings.ini и levels.db в папке бота.
+//! Discord-бот. Настройки и levels.db находятся в каталоге бота.
 //!
 //! Переменные окружения:
 //!   DISCORD_TOKEN   — токен бота (обязательно);
-//!   TEST_GUILD_ID   — id сервера: команды регистрируются только на нём (сразу и не трогая команды bot.py);
-//!   REGISTER_GLOBAL — 1: зарегистрировать команды глобально. ВНИМАНИЕ: это заменит список команд bot.py,
-//!                     если бот запущен с тем же токеном;
+//!   TEST_GUILD_ID   — id тестового сервера: команды регистрируются только на нём;
+//!   REGISTER_GLOBAL — 1: заменить список глобальных команд приложения;
 //!   BOT_DIR         — папка с config/ и levels.db (по умолчанию — текущая или папка выше);
 //!   YTDLP           — как запускать yt-dlp (по умолчанию «yt-dlp»; на сервере — «venv/bin/python -m yt_dlp»).
 
@@ -13,6 +11,7 @@ mod admin;
 mod backups;
 mod ai;
 mod ai_commands;
+mod ai_math;
 mod blackjack;
 mod cards;
 mod chat;
@@ -73,6 +72,7 @@ pub struct Data {
     pub rocket: rocket::State,
     pub roulette: roulette::State,
     pub pets: pets::PetSettings,
+    pub shop: shop::State,
     pub levels: levels::LevelSettings,
     pub growth: fun::GrowthSettings,
     /// ИИ: настройки, ключ Gemini и счётчики лимитов
@@ -92,8 +92,8 @@ pub struct Data {
     pub words: words::WordsState,
     /// Картинки игр в слова в чате
     pub boards: wordboard::BoardState,
-    /// Настроено ли мини-приложение (есть DISCORD_CLIENT_SECRET и порт не 0)
-    pub miniapp_ready: bool,
+    /// Доступен ли локальный HTTP-сервер мини-приложения.
+    miniapp_ready: std::sync::atomic::AtomicBool,
     /// Папка бота: config/, levels.db, фоны картинок и шрифты
     pub dir: PathBuf,
     /// Для скачивания аватарок
@@ -110,6 +110,10 @@ pub struct Data {
 }
 
 impl Data {
+    pub fn miniapp_ready(&self) -> bool {
+        self.miniapp_ready.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Собирает данные бота из базы и настроек. dir — папка бота.
     pub fn new(database: db::Database, settings: &config::Settings, dir: PathBuf, miniapp_ready: bool) -> Self {
         let ytdlp = std::env::var("YTDLP").ok().filter(|value| !value.trim().is_empty()).map_or_else(|| default_ytdlp(&dir), |value| fix_ytdlp(&value));
@@ -123,6 +127,7 @@ impl Data {
             rocket: Default::default(),
             roulette: Default::default(),
             pets: pets::PetSettings::load(settings),
+            shop: Default::default(),
             levels: levels::LevelSettings::load(settings),
             growth: fun::GrowthSettings::load(settings),
             ai: ai::AiState::new(settings, std::env::var("GEMINI_API_KEY").ok()),
@@ -134,7 +139,7 @@ impl Data {
             games_commands: admin::parse_commands(&settings.text("channels", "games_commands", admin::DEFAULT_GAMES_COMMANDS)),
             words: words::WordsState::new(words::WordSettings::load(settings)),
             boards: Default::default(),
-            miniapp_ready,
+            miniapp_ready: std::sync::atomic::AtomicBool::new(miniapp_ready),
             dir,
             web: reqwest::Client::new(),
             blackjack_players: Default::default(),
@@ -146,24 +151,36 @@ impl Data {
     }
 }
 
-/// Как запускать yt-dlp, если переменная YTDLP не задана: из venv рядом с ботом (как bot.py на сервере),
+/// Как запускать yt-dlp, если переменная YTDLP не задана: из venv рядом с ботом,
 /// а если его нет — программа yt-dlp из PATH.
 fn default_ytdlp(dir: &std::path::Path) -> String {
     for python in [dir.join("venv").join("bin").join("python"), dir.join("venv").join("Scripts").join("python.exe")] {
         let path = python.display().to_string();
-        if python.exists() && !path.contains(char::is_whitespace) {
-            return format!("{path} -m yt_dlp");
+        if python.is_file() {
+            return if path.contains(char::is_whitespace) {
+                format!("\"{path}\" -m yt_dlp")
+            } else {
+                format!("{path} -m yt_dlp")
+            };
         }
     }
     "yt-dlp".to_string()
 }
 
+fn ytdlp_parts(value: &str) -> (&str, &str) {
+    let value = value.trim();
+    if let Some((program, args)) = value.strip_prefix('"').and_then(|rest| rest.split_once('"')) {
+        return (program, args.trim_start());
+    }
+    value.split_once(char::is_whitespace).unwrap_or((value, ""))
+}
+
 /// YTDLP указывает просто на python (например, systemd отрезал «-m yt_dlp» после пробела) — дописываем модуль.
 fn fix_ytdlp(value: &str) -> String {
     let value = value.trim();
-    let program = value.split_whitespace().next().unwrap_or("");
+    let (program, args) = ytdlp_parts(value);
     let name = std::path::Path::new(program).file_name().and_then(|name| name.to_str()).unwrap_or("");
-    if name.starts_with("python") && !value.split_whitespace().any(|part| part == "-m") {
+    if name.starts_with("python") && !args.split_whitespace().any(|part| part == "-m") {
         format!("{value} -m yt_dlp")
     } else {
         value.to_string()
@@ -201,9 +218,9 @@ async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
             }
             admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
         }
-        poise::FrameworkError::ArgumentParse { error, input, ctx, .. } => {
+        poise::FrameworkError::ArgumentParse { ctx, .. } => {
             // Например, Discord прислал параметры в другом виде (команды зарегистрированы другой версией бота)
-            let details = interactions::sanitize_error(&format!("{}: {error} (ввод: {input:?})", interactions::error_context(ctx)));
+            let details = format!("{}: параметры не соответствуют схеме команды", interactions::error_context(ctx));
             println!("Не разобрала параметры /{}: {details}", ctx.command().name);
             let place = format!("параметры команды /{}", ctx.command().name);
             let text = "😵 Не поняла параметры команды. Если команды только что обновились — перезапусти Discord (Ctrl+R).";
@@ -229,10 +246,10 @@ async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
 
 /// Регистрирует команды глобально. Если в Developer Portal включены Activities, у приложения есть
 /// команда-«точка входа» (Entry Point, тип 4) — Discord не даёт удалить её при массовом обновлении,
-/// поэтому отправляем её вместе с нашими командами (так же делает bot.py). Возвращает, сколько наших команд.
+/// поэтому отправляем её вместе с нашими командами. Возвращает, сколько наших команд.
 async fn register_globally(token: &str, app_id: u64, commands: &[poise::Command<Shared, Error>]) -> Result<usize, Error> {
     let url = format!("https://discord.com/api/v10/applications/{app_id}/commands");
-    let web = reqwest::Client::new();
+    let web = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build()?;
     let auth = format!("Bot {token}");
     let response = web.get(&url).header("Authorization", &auth).send().await?;
     let status = response.status();
@@ -255,13 +272,22 @@ async fn register_globally(token: &str, app_id: u64, commands: &[poise::Command<
 
 /// Раз в 20 секунд: напоминания, у которых пришло время, и опросы, которые пора закрыть.
 fn start_fast_loop(http: std::sync::Arc<serenity::Http>, data: Shared) {
+    let (reminder_http, reminder_data) = (http.clone(), data.clone());
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(20));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
-            if let Err(error) = reminders::send_due(&http, &data).await {
+            if let Err(error) = reminders::send_due(&reminder_http, &reminder_data).await {
                 println!("Напоминания: {error}");
             }
+        }
+    });
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(20));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
             if let Err(error) = polls::close_finished(&http, &data).await {
                 println!("Опросы: {error}");
             }
@@ -374,14 +400,50 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
     ]
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Registration {
+    Disabled,
+    Guild(u64),
+    Global,
+}
+
+fn registration(guild: Option<&str>, global: Option<&str>) -> Result<Registration, &'static str> {
+    match (guild, global) {
+        (Some(_), Some("1")) => Err("Выбери один режим: TEST_GUILD_ID или REGISTER_GLOBAL=1."),
+        (Some(guild), _) => guild.parse::<std::num::NonZeroU64>()
+            .map(|id| Registration::Guild(id.get()))
+            .map_err(|_| "TEST_GUILD_ID должен быть ненулевым числовым ID сервера."),
+        (None, Some("1")) => Ok(Registration::Global),
+        (None, _) => Ok(Registration::Disabled),
+    }
+}
+
+fn lock_instance(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new().read(true).write(true)
+        .create(true).truncate(false).open(dir.join(".musicbot.lock"))?;
+    lock.try_lock().map_err(std::io::Error::from)?;
+    Ok(lock)
+}
+
 #[tokio::main]
 async fn main() {
-    let Ok(token) = std::env::var("DISCORD_TOKEN") else {
-        println!("Нет токена: задай переменную окружения DISCORD_TOKEN.");
+    if let Err(error) = run().await {
+        eprintln!("Бот остановлен: {}", interactions::sanitize_error(&error.to_string()));
         std::process::exit(1);
-    };
+    }
+}
+
+async fn run() -> Result<(), Error> {
+    let token = std::env::var("DISCORD_TOKEN").ok().filter(|token| !token.trim().is_empty())
+        .ok_or("Нет токена: задай переменную окружения DISCORD_TOKEN.")?;
+    let registration = registration(
+        std::env::var("TEST_GUILD_ID").ok().as_deref(),
+        std::env::var("REGISTER_GLOBAL").ok().as_deref(),
+    )?;
     let dir = bot_dir();
-    let settings = config::Settings::load(&dir.join("config").join("settings.ini"));
+    let _instance = lock_instance(&dir)
+        .map_err(|error| format!("Каталог {} уже используется или недоступен: {error}", dir.display()))?;
+    let settings = config::Settings::load_checked(&dir.join("config").join("settings.ini"))?;
     let database = match db::Database::open(&dir.join("levels.db")) {
         Ok(database) => database,
         Err(error) => {
@@ -407,9 +469,18 @@ async fn main() {
     let miniapp_host = settings.text("miniapp", "host", "127.0.0.1");
     let miniapp_port = settings.int("miniapp", "port", 8080).clamp(0, 65535) as u16;
     let backup_settings = backups::BackupSettings::load(&settings);
-    let data: Shared = std::sync::Arc::new(Data::new(database, &settings, dir.clone(), client_secret.is_some() && miniapp_port > 0));
-    let test_guild = std::env::var("TEST_GUILD_ID").ok().and_then(|id| id.parse::<u64>().ok());
-    let register_global = std::env::var("REGISTER_GLOBAL").is_ok_and(|value| value == "1");
+    let miniapp = if let Some(secret) = client_secret.filter(|_| miniapp_port > 0) {
+        match tokio::net::TcpListener::bind((miniapp_host.as_str(), miniapp_port)).await {
+            Ok(listener) => Some((secret, listener)),
+            Err(error) => {
+                eprintln!("Мини-приложение не запустилось на {miniapp_host}:{miniapp_port}: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let data: Shared = std::sync::Arc::new(Data::new(database, &settings, dir.clone(), miniapp.is_some()));
 
     let token_for_setup = token.clone();
     let framework = poise::Framework::builder()
@@ -458,12 +529,12 @@ async fn main() {
             Box::pin(async move {
                 let commands = &framework.options().commands;
                 // Не получилось зарегистрировать команды — бот всё равно работает (со списком команд, что уже в Discord)
-                if let Some(guild) = test_guild {
+                if let Registration::Guild(guild) = registration {
                     match poise::builtins::register_in_guild(ctx, commands, serenity::GuildId::new(guild)).await {
                         Ok(()) => println!("Зарегистрировано слэш-команд на сервере {guild}: {}", commands.len()),
                         Err(error) => println!("⚠️ Не получилось зарегистрировать команды на сервере {guild}: {error}"),
                     }
-                } else if register_global {
+                } else if registration == Registration::Global {
                     match register_globally(&token_for_setup, ready.application.id.get(), commands).await {
                         Ok(count) => println!("Зарегистрировано слэш-команд глобально: {count}"),
                         Err(error) => println!("⚠️ Не получилось зарегистрировать команды глобально: {error}"),
@@ -471,8 +542,9 @@ async fn main() {
                 } else {
                     println!("Команды не регистрировал: задай TEST_GUILD_ID (сервер для проверки) или REGISTER_GLOBAL=1.");
                 }
-                shop::start_expiry_loop(ctx.http.clone(), data.db.clone()); // снимать роли, срок которых вышел
+                shop::start_expiry_loop(ctx.clone(), data.clone()); // сроки ролей и сверка покупок
                 levels::start_voice_xp_loop(ctx.clone(), data.clone()); // опыт за голосовые каналы, раз в минуту
+                rocket::start_cleanup(data.clone());
                 wordstats::start_duel_loop(ctx.http.clone(), data.clone()); // итоги дуэлей в словах
                 wordsummary::start_loop(ctx.clone(), data.clone()); // итоги дня ровно в московскую полночь
                 backups::start_loop(data.clone(), backup_settings);
@@ -481,12 +553,10 @@ async fn main() {
                 start_fast_loop(ctx.http.clone(), data.clone()); // напоминания и опросы
                 daily::start_loop(ctx.http.clone(), data.clone()); // утренние и вечерние сообщения
                 chat::start_chatter_loop(ctx.clone(), data.clone()); // случайные реплики по теме чата
-                if let Err(error) = patchnotes::post_new(&ctx.http, &data).await {
-                    println!("Патчноуты: {error}");
-                }
-                match client_secret {
-                    Some(secret) if miniapp_port > 0 => miniapp::start(ctx.clone(), data.clone(), secret, miniapp_host, miniapp_port),
-                    _ => println!("Мини-приложение выключено: нет DISCORD_CLIENT_SECRET (или port = 0). /words не будет работать."),
+                patchnotes::start_loop(ctx.http.clone(), data.clone());
+                match miniapp {
+                    Some((secret, listener)) => miniapp::start(ctx.clone(), data.clone(), secret, listener),
+                    None => println!("Мини-приложение недоступно. Проверь DISCORD_CLIENT_SECRET, [miniapp] и адрес сервера."),
                 }
                 println!("yt-dlp запускается так: {}", data.ytdlp);
                 println!("Бот запущен как {}", ready.user.name);
@@ -504,19 +574,23 @@ async fn main() {
     let builder = serenity::ClientBuilder::new(token, intents).framework(framework);
     #[cfg(feature = "voice")]
     let builder = builder.register_songbird();
-    let client = builder.await;
-    match client {
-        Ok(mut client) => {
-            if let Err(error) = client.start().await {
-                println!("Бот остановился с ошибкой: {error}");
-            }
-        }
-        Err(error) => println!("Не получилось создать клиент Discord: {error}"),
-    }
+    builder.await?.start().await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_test_guild_never_falls_back_to_global_registration() {
+        use super::{registration, Registration};
+        assert_eq!(registration(None, Some("1")), Ok(Registration::Global));
+        assert_eq!(registration(Some("42"), None), Ok(Registration::Guild(42)));
+        assert_eq!(registration(None, None), Ok(Registration::Disabled));
+        assert!(registration(Some("0"), None).is_err());
+        assert!(registration(Some("broken"), Some("1")).is_err());
+        assert!(registration(Some("42"), Some("1")).is_err());
+    }
+
     #[test]
     fn registered_commands_have_one_word_game_and_new_music_library() {
         let commands = super::bot_commands();
@@ -570,5 +644,7 @@ mod tests {
         assert_eq!(super::fix_ytdlp(" python3 "), "python3 -m yt_dlp");
         assert_eq!(super::fix_ytdlp("venv/bin/python -m yt_dlp"), "venv/bin/python -m yt_dlp");
         assert_eq!(super::fix_ytdlp("/usr/local/bin/yt-dlp"), "/usr/local/bin/yt-dlp");
+        let quoted = super::fix_ytdlp(r#""some path/venv/bin/python""#);
+        assert_eq!(super::ytdlp_parts(&quoted), ("some path/venv/bin/python", "-m yt_dlp"));
     }
 }

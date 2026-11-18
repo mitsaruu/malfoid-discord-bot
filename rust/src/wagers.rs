@@ -1,6 +1,6 @@
 //! Ставка и её выплата или возврат записываются вместе с изменением баланса.
 
-use crate::{db::Database, economy::parse_bet, text::money_text};
+use crate::{db::{change_balance, Database}, economy::parse_bet, text::money_text};
 use rusqlite::{params, Transaction, TransactionBehavior};
 use std::collections::BTreeMap;
 
@@ -26,7 +26,7 @@ pub fn place(
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let balance: i64 = tx.query_row(
-        "SELECT balance FROM economy WHERE guild_id = ?1 AND user_id = ?2",
+        "SELECT COALESCE(balance, 0) FROM economy WHERE guild_id = ?1 AND user_id = ?2",
         params![guild as i64, user as i64],
         |row| row.get(0),
     )?;
@@ -45,31 +45,17 @@ pub fn place(
         "INSERT INTO game_wagers (ticket, round_id, guild_id, user_id, amount) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![ticket as i64, round as i64, guild as i64, user as i64, amount],
     )?;
-    credit(&tx, guild as i64, user as i64, -amount)?;
+    change_balance(&tx, guild, user, -amount)?;
     tx.commit()?;
     Ok(Ok(amount))
 }
 
-fn credit(tx: &Transaction<'_>, guild: i64, user: i64, amount: i64) -> rusqlite::Result<()> {
-    let balance: i64 = tx.query_row(
-        "SELECT balance FROM economy WHERE guild_id = ?1 AND user_id = ?2",
-        params![guild, user],
-        |row| row.get(0),
-    )?;
-    let balance = balance
-        .checked_add(amount)
-        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, balance))?;
-    tx.execute(
-        "UPDATE economy SET balance = ?3 WHERE guild_id = ?1 AND user_id = ?2",
-        params![guild, user, balance],
-    )?;
-    Ok(())
-}
-
 /// В списке должен быть каждый билет раунда, в том числе проигравшие с выплатой 0.
 pub fn settle(db: &Database, round: u64, payouts: &[(u64, i64)]) -> rusqlite::Result<()> {
-    let mut conn = db.lock();
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    db.transaction(|tx| settle_on(tx, round, payouts))
+}
+
+pub(crate) fn settle_on(tx: &Transaction<'_>, round: u64, payouts: &[(u64, i64)]) -> rusqlite::Result<()> {
     let total: i64 = tx.query_row(
         "SELECT COUNT(*) FROM game_wagers WHERE round_id = ?1",
         [round as i64],
@@ -83,43 +69,50 @@ pub fn settle(db: &Database, round: u64, payouts: &[(u64, i64)]) -> rusqlite::Re
         if payout < 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let (guild, user) = tx.query_row(
+        let (guild, user): (i64, i64) = tx.query_row(
             "SELECT guild_id, user_id FROM game_wagers WHERE round_id = ?1 AND ticket = ?2",
             params![round as i64, ticket as i64],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if payout > 0 {
-            credit(&tx, guild, user, payout)?;
+            change_balance(tx, guild as u64, user as u64, payout)?;
         }
     }
     tx.execute(
         "DELETE FROM game_wagers WHERE round_id = ?1",
         [round as i64],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 /// None при запуске возвращает ставки всех раундов, оставшихся от прежнего процесса.
 pub fn refund(db: &Database, round: Option<u64>) -> rusqlite::Result<usize> {
-    let mut conn = db.lock();
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let round = round.map(|id| id as i64);
-    let rows = {
-        let mut query = tx.prepare(
-            "SELECT guild_id, user_id, amount FROM game_wagers WHERE ?1 IS NULL OR round_id = ?1",
-        )?;
-        let rows = query.query_map([round], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    let Some(round) = round else {
+        let rounds = {
+            let conn = db.lock();
+            let mut query = conn.prepare("SELECT DISTINCT round_id FROM game_wagers ORDER BY round_id")?;
+            let rows = query.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut settled = 0;
+        for round in rounds {
+            match refund(db, Some(round as u64)) {
+                Ok(count) => settled += count,
+                Err(error) => eprintln!("Ставки раунда {} остались в журнале: {error}", round as u64),
+            }
+        }
+        return Ok(settled);
     };
-    for (guild, user, amount) in rows {
-        credit(&tx, guild, user, amount)?;
-    }
-    let count = tx.execute(
-        "DELETE FROM game_wagers WHERE ?1 IS NULL OR round_id = ?1",
-        [round],
-    )?;
-    tx.commit()?;
-    Ok(count)
+    db.transaction(|tx| {
+        let mut query = tx.prepare("SELECT guild_id, user_id, amount FROM game_wagers WHERE round_id = ?1")?;
+        let rows = query
+            .query_map([round as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (guild, user, amount) in rows {
+            change_balance(tx, guild as u64, user as u64, amount)?;
+        }
+        tx.execute("DELETE FROM game_wagers WHERE round_id = ?1", [round as i64])
+    })
 }
 
 #[cfg(test)]

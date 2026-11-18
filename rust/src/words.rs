@@ -5,9 +5,11 @@
 //! У каждого 6 попыток. Слово дня — одно на весь сервер, за победу дают монеты (чем быстрее, тем больше).
 //! Немецкое и русское слово дня — отдельные. Принимаются только настоящие слова: из словаря игры или из Викисловаря.
 
-use crate::Data;
+use crate::{db, Data};
 use chrono::NaiveDate;
-use std::collections::HashMap;
+use rand::seq::IndexedRandom;
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -164,9 +166,10 @@ fn fits(word: &str, lang: Lang) -> bool {
 /// Текст файла со словами → список слов из 5 букв нужного языка без повторов.
 pub fn parse_words(text: &str, lang: Lang) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
     for line in text.lines().filter(|line| !line.trim_start().starts_with('#')) {
         for word in normalize(line, lang).split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
-            if fits(word, lang) && !words.iter().any(|known| known == word) {
+            if fits(word, lang) && seen.insert(word.to_string()) {
                 words.push(word.to_string());
             }
         }
@@ -272,25 +275,16 @@ pub fn reward(rewards: &[i64], tries: usize) -> i64 {
     rewards[tries.clamp(1, rewards.len()) - 1]
 }
 
-/// Какое слово загадать: одно и то же для всех на сервере в этот день (номер считается из названия дня и сервера).
-pub fn pick_answer(words: &[String], lang: Lang, guild: u64, day: &str) -> String {
-    let seed = format!("{}:{guild}:{day}", lang.key());
-    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a: простой способ превратить строку в число
-    for byte in seed.bytes() {
-        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
-    }
-    words[(hash % words.len() as u64) as usize].clone()
-}
-
 /// Словари игр (перечитываются сами, когда файл изменили) и настройки.
 pub struct WordsState {
     pub settings: WordSettings,
+    pub(crate) duel_delivery: tokio::sync::Mutex<()>,
     lists: Mutex<HashMap<Lang, (Option<std::time::SystemTime>, Arc<Vec<String>>)>>,
 }
 
 impl WordsState {
     pub fn new(settings: WordSettings) -> Self {
-        Self { settings, lists: Default::default() }
+        Self { settings, lists: Default::default(), duel_delivery: Default::default() }
     }
 
     /// Слова игры из config/german_words.txt или russian_words.txt. Нет файла — запасной короткий список.
@@ -315,14 +309,57 @@ pub fn daily_game(data: &Data, guild: u64, user: u64, lang: Lang) -> rusqlite::R
     if let Some((answer, guesses)) = data.db.word_row(lang.table(), guild, user, &day)? {
         return Ok(Game::from_row(lang, &day, answer, &guesses));
     }
-    // Если сегодня на сервере уже кто-то играл — берём его слово (так оно точно одно на всех, даже если
-    // словарь успели поправить или партию начал bot.py), иначе выбираем сами.
-    let answer = match data.db.word_any_answer(lang.table(), guild, &day)? {
-        Some(answer) => answer,
-        None => pick_answer(&data.words.list(&data.dir, lang), lang, guild, &day),
-    };
-    data.db.word_start(lang.table(), guild, user, &day, &answer)?;
-    Ok(Game { lang, day, answer, guesses: Vec::new() })
+    let candidate = data.words.list(&data.dir, lang).choose(&mut rand::rng()).cloned()
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let mut conn = data.db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let day = today(data, lang);
+    let table = lang.table();
+    // The first saved player row is also the server's answer. An existing
+    // player's answer stays fixed even if an older release had inconsistent rows.
+    tx.execute(
+        &format!("INSERT INTO {table} (guild_id, user_id, day, answer, guesses)
+                  VALUES (?1, ?2, ?3, COALESCE((SELECT answer FROM {table}
+                    WHERE guild_id = ?1 AND day = ?3 ORDER BY rowid LIMIT 1), ?4), '')
+                  ON CONFLICT (guild_id, user_id, day) DO NOTHING"),
+        params![guild as i64, user as i64, day, candidate],
+    )?;
+    let game = game_in(&tx, guild, user, lang, &day)?;
+    tx.commit()?;
+    Ok(game)
+}
+
+fn game_in(tx: &Transaction<'_>, guild: u64, user: u64, lang: Lang, day: &str) -> rusqlite::Result<Game> {
+    tx.query_row(
+        &format!("SELECT answer, COALESCE(guesses, '') FROM {} WHERE guild_id = ?1 AND user_id = ?2 AND day = ?3", lang.table()),
+        params![guild as i64, user as i64, day],
+        |row| Ok(Game::from_row(lang, day, row.get(0)?, &row.get::<_, String>(1)?)),
+    )
+}
+
+/// The viewer comes first. SQLite stops after a bounded number of players
+/// before the caller resolves any names, marks or avatars.
+pub(crate) fn player_games(data: &Data, guild: u64, user: u64, lang: Lang, day: &str) -> rusqlite::Result<Vec<(u64, Game)>> {
+    let connection = data.db.lock();
+    let table = lang.table();
+    let mut statement = connection.prepare(&format!(
+        "SELECT user_id, answer, COALESCE(guesses, '') FROM {table}
+         WHERE guild_id = ?1 AND day = ?2 AND user_id = ?3
+         UNION ALL SELECT * FROM (SELECT user_id, answer, COALESCE(guesses, '') FROM {table}
+             WHERE guild_id = ?1 AND day = ?2 AND user_id != ?3 ORDER BY rowid LIMIT 11)"
+    ))?;
+    let games = statement.query_map(params![guild as i64, day, user as i64], |row| {
+        Ok((row.get::<_, i64>(0)? as u64, Game::from_row(lang, day, row.get(1)?, &row.get::<_, String>(2)?)))
+    })?.collect();
+    games
+}
+
+pub(crate) fn balance(data: &Data, guild: u64, user: u64) -> rusqlite::Result<i64> {
+    Ok(data.db.lock().query_row(
+        "SELECT COALESCE(balance, 0) FROM economy WHERE guild_id = ?1 AND user_id = ?2",
+        params![guild as i64, user as i64],
+        |row| row.get(0),
+    ).optional()?.unwrap_or(data.economy.start_balance.max(0)))
 }
 
 /// Какие страницы искать в Викисловаре. В русском ё пишут как е, поэтому для «щетка» ищем и «щётка».
@@ -420,10 +457,14 @@ pub async fn make_guess_for_day(data: &Data, guild: u64, user: u64, name: &str, 
     }
     let started_day = game.day.clone();
     let real = is_real_word(data, &word, lang).await;
-    let mut game = daily_game(data, guild, user, lang)?; // пока проверяли слово, партия могла измениться
-    if game.day != started_day {
-        return Ok((game, Some(DAY_CHANGED.to_string())));
+    let mut conn = data.db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if today(data, lang) != started_day {
+        drop(tx);
+        drop(conn);
+        return Ok((daily_game(data, guild, user, lang)?, Some(DAY_CHANGED.to_string())));
     }
+    let mut game = game_in(&tx, guild, user, lang, &started_day)?;
     let shown = word.to_uppercase();
     let problem = match real {
         None => Some("Не получилось проверить слово (Викисловарь не отвечает) — попробуй ещё раз.".to_string()),
@@ -439,17 +480,22 @@ pub async fn make_guess_for_day(data: &Data, guild: u64, user: u64, name: &str, 
         return Ok((game, problem));
     }
     game.guesses.push(word);
-    data.db.set_word_guesses(lang.table(), guild, user, &game.day, &game.guesses.join(","))?;
+    tx.execute(
+        &format!("UPDATE {} SET guesses = ?1 WHERE guild_id = ?2 AND user_id = ?3 AND day = ?4", lang.table()),
+        params![game.guesses.join(","), guild as i64, user as i64, game.day],
+    )?;
     if game.won() {
         let coins = reward(&data.words.settings.get(lang).rewards, game.guesses.len());
         if coins > 0 {
-            data.db.add_money(guild, user, name, data.economy.start_balance, coins)?;
+            db::Wallet { guild, user, name, start: data.economy.start_balance }.open(&tx)?;
+            db::change_balance(&tx, guild, user, coins)?;
         }
     }
+    tx.commit()?;
     Ok((game, None))
 }
 
-/// Состояние партии для мини-приложения (загаданное слово — только когда партия закончена).
+/// Состояние партии для мини-приложения. Проигравшим ответ покажут общие итоги.
 pub fn game_state(data: &Data, game: &Game, balance: i64) -> serde_json::Value {
     let rewards = &data.words.settings.get(game.lang).rewards;
     let rows: Vec<serde_json::Value> = game
@@ -468,7 +514,7 @@ pub fn game_state(data: &Data, game: &Game, balance: i64) -> serde_json::Value {
         "day": game.day,
         "finished": game.finished(),
         "won": game.won(),
-        "answer": if game.finished() { Some(&game.answer) } else { None },
+        "answer": if game.won() { Some(&game.answer) } else { None },
         "reward": if game.won() { reward(rewards, game.guesses.len()) } else { 0 },
         "rewards": rewards,
         "balance": balance,
@@ -522,6 +568,7 @@ pub fn summary_text(lang: Lang, rows: &[(u64, String, String)], streak: i64) -> 
 }
 
 /// Вчерашний день для дня вида "2026-11-08".
+#[cfg(test)]
 pub fn day_before(day: &str) -> String {
     day.parse::<NaiveDate>().map(|date| (date - chrono::Duration::days(1)).to_string()).unwrap_or_default()
 }
@@ -602,14 +649,9 @@ mod tests {
     }
 
     #[test]
-    fn rewards_and_answers() {
+    fn rewards() {
         let rewards = [500, 350, 250, 150, 100, 50];
         assert_eq!([reward(&rewards, 1), reward(&rewards, 3), reward(&rewards, 6), reward(&[100, 50], 5)], [500, 250, 50, 50]);
-        let words: Vec<String> = ["apfel", "blume", "kerze", "stern"].iter().map(|word| word.to_string()).collect();
-        let first = pick_answer(&words, Lang::De, 7, "2026-11-11");
-        assert_eq!(first, pick_answer(&words, Lang::De, 7, "2026-11-11")); // одно слово на весь сервер
-        let different = (1..40).any(|day| pick_answer(&words, Lang::De, 7, &format!("2026-12-{day:02}")) != first);
-        assert!(different, "в разные дни слова разные");
         assert_eq!(parse_numbers("500, 350 и 250"), [500, 350, 250]);
     }
 
@@ -690,8 +732,19 @@ check_words = {check}
         }
         let (game, error) = last.unwrap();
         assert_eq!((error, game.finished(), game.won()), (None, true, false));
+        assert!(game_state(&data, &game, 500)["answer"].is_null());
         assert_eq!(data.db.wallet(7, 1, "Bob", 500).unwrap().0, 500); // награды нет
         assert!(make_guess(&data, 7, 1, "Bob", "straß", Lang::De).await.unwrap().1.unwrap().starts_with("Слово дня уже"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_payout_does_not_record_a_win() {
+        let data = test_data("list");
+        let game = daily_game(&data, 7, 1, Lang::Ru).unwrap();
+        data.db.wallet(7, 1, "Alice", i64::MAX).unwrap();
+        assert!(make_guess(&data, 7, 1, "Alice", &game.answer, Lang::Ru).await.is_err());
+        assert_eq!(daily_game(&data, 7, 1, Lang::Ru).unwrap(), game);
+        assert_eq!(data.db.wallet(7, 1, "Alice", 500).unwrap().0, i64::MAX);
     }
 
     /// Настоящий запрос к Викисловарю (нужен интернет): cargo test -- --ignored

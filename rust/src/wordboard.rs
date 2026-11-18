@@ -8,6 +8,8 @@ use crate::{Context, Data, Error};
 use image::{Rgba, RgbaImage};
 use poise::serenity_prelude as serenity;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::{Duration, Instant};
 
 /// Цвета клеток — как в мини-приложении.
 fn mark_color(mark: Mark) -> draw::Rgb {
@@ -97,23 +99,45 @@ pub struct Player {
     pub face: String, // ссылка на аватарку
 }
 
-/// Что бот помнит про картинки в чате (после перезапуска — с нуля, как и в bot.py).
+type BoardKey = (u64, u64, String, Lang);
+
 #[derive(Default)]
-pub struct BoardState {
-    /// (сервер, канал, день, язык) → (сообщение с картинкой, игроки)
-    boards: tokio::sync::Mutex<HashMap<(u64, u64, String, Lang), (Option<serenity::MessageId>, Vec<Player>)>>,
-    /// участник → байты аватарки (чтобы не качать её при каждом ходе)
-    pub avatars: tokio::sync::Mutex<HashMap<u64, Option<Vec<u8>>>>,
+struct Board {
+    message: Option<serenity::MessageId>,
+    players: Vec<Player>,
+    revision: u64,
+    published: u64,
 }
 
-/// Аватарка участника (скачивается один раз за запуск бота).
-pub async fn cached_avatar(data: &Data, user: u64, face: &str) -> Option<Vec<u8>> {
-    let mut avatars = data.boards.avatars.lock().await;
-    if let Some(known) = avatars.get(&user) {
-        return known.clone();
+/// Доски текущего дня и ограниченный кэш аватаров.
+#[derive(Default)]
+pub struct BoardState {
+    boards: tokio::sync::Mutex<HashMap<BoardKey, Board>>,
+    delivery: [tokio::sync::Mutex<()>; 32],
+    avatars: tokio::sync::Mutex<HashMap<String, (Instant, Option<Vec<u8>>)>>,
+}
+
+/// Ключ включает версию и серверный вариант аватара из Discord.
+pub async fn cached_avatar(data: &Data, face: &str) -> Option<Vec<u8>> {
+    if face.is_empty() {
+        return None;
+    }
+    if let Some((expires, known)) = data.boards.avatars.lock().await.get(face) {
+        if *expires > Instant::now() {
+            return known.clone();
+        }
     }
     let avatar = fetch_avatar(data, face).await;
-    avatars.insert(user, avatar.clone());
+    let mut avatars = data.boards.avatars.lock().await;
+    let now = Instant::now();
+    avatars.retain(|_, (expires, _)| *expires > now);
+    if avatars.len() >= 128 {
+        if let Some(oldest) = avatars.iter().min_by_key(|(_, (expires, _))| *expires).map(|(key, _)| key.clone()) {
+            avatars.remove(&oldest);
+        }
+    }
+    let ttl = if avatar.is_some() { 3600 } else { 30 };
+    avatars.insert(face.to_owned(), (now + Duration::from_secs(ttl), avatar.clone()));
     avatar
 }
 
@@ -147,25 +171,50 @@ async fn update_inner(
     lang: Lang,
 ) -> Result<(), Error> {
     let day = words::today(data, lang);
-    // Замок на всё обновление: двое зашли одновременно — всё равно одно сообщение
-    let mut boards = data.boards.boards.lock().await;
     let no_pings = serenity::CreateAllowedMentions::new();
-    boards.retain(|key, _| key.3 != lang || key.2 == day); // вчерашние картинки больше не обновляем
     let key = (guild, channel.get(), day, lang);
-    let (message, mut players) = boards.get(&key).cloned().unwrap_or((None, Vec::new()));
-    if !players.iter().any(|known| known.id == player.id) {
-        players.push(player);
+    {
+        let mut boards = data.boards.boards.lock().await;
+        if words::today(data, lang) != key.2 {
+            return Ok(());
+        }
+        boards.retain(|known, _| known.3 != lang || known.2 == key.2);
+        let board = boards.entry(key.clone()).or_default();
+        if let Some(position) = board.players.iter().position(|known| known.id == player.id) {
+            board.players[position] = player;
+        } else {
+            if board.players.len() == 12 {
+                board.players.remove(0);
+            }
+            board.players.push(player);
+        }
+        board.revision += 1;
     }
+    let mut hash = DefaultHasher::new();
+    key.hash(&mut hash);
+    let delivery = &data.boards.delivery[hash.finish() as usize % data.boards.delivery.len()];
+    let _delivery = delivery.lock().await;
+    let (message, players, revision) = {
+        let boards = data.boards.boards.lock().await;
+        let Some(board) = boards.get(&key) else { return Ok(()) };
+        if board.published == board.revision {
+            return Ok(());
+        }
+        (board.message, board.players.clone(), board.revision)
+    };
     let (mut cards, mut anyone_playing) = (Vec::new(), false);
     for player in &players {
         let game = words::daily_game(data, guild, player.id, lang)?;
         anyone_playing |= !game.finished();
-        cards.push(Card { name: player.name.clone(), avatar: cached_avatar(data, player.id, &player.face).await, rows: game.rows() });
+        cards.push(Card { name: player.name.clone(), avatar: cached_avatar(data, &player.face).await, rows: game.rows() });
     }
     let dir = data.dir.clone();
     let png = tokio::task::spawn_blocking(move || draw::fonts(&dir).map(|fonts| draw::to_png(&board_image(fonts, &cards))))
         .await?
         .ok_or("нет шрифтов для картинки")?;
+    if words::today(data, lang) != key.2 {
+        return Ok(());
+    }
     let users: Vec<u64> = players.iter().map(|player| player.id).collect();
     let text = caption(lang, &users, anyone_playing);
     let filename = format!("{}.png", lang.button().split(':').next().unwrap_or("words"));
@@ -178,8 +227,12 @@ async fn update_inner(
             .attachments(serenity::EditAttachments::new().add(attachment()))
             .components(play_button(lang))
             .allowed_mentions(no_pings.clone());
-        if channel.edit_message(ctx, id, edit).await.is_err() {
-            message = None; // картинку удалили — пришлём новую
+        if let Err(error) = channel.edit_message(ctx, id, edit).await {
+            if matches!(&error, serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)) if response.status_code.as_u16() == 404) {
+                message = None;
+            } else {
+                return Err(error.into());
+            }
         }
     }
     if message.is_none() {
@@ -190,7 +243,10 @@ async fn update_inner(
             .allowed_mentions(no_pings);
         message = Some(channel.send_message(ctx, new).await?.id);
     }
-    boards.insert(key, (message, players));
+    if let Some(board) = data.boards.boards.lock().await.get_mut(&key) {
+        board.message = message;
+        board.published = revision;
+    }
     Ok(())
 }
 
@@ -222,7 +278,7 @@ where
     F: Fn(serenity::CreateInteractionResponse) -> Fut,
     Fut: std::future::Future<Output = serenity::Result<()>>,
 {
-    if !data.miniapp_ready {
+    if !data.miniapp_ready() {
         respond(ephemeral(format!(
             "🧩 Мини-приложение {} ещё не настроено. Админу: инструкция в rust/README.md, раздел «Игра в слова».", lang.name()))).await?;
         return Ok(());
@@ -290,6 +346,16 @@ pub async fn words(
 pub async fn play_pressed(ctx: &serenity::Context, data: &Data, press: &serenity::ComponentInteraction) -> bool {
     let Some(lang) = Lang::ALL.into_iter().find(|lang| lang.button() == press.data.custom_id) else { return false };
     if let Some(guild) = press.guild_id {
+        let parent = press.channel.as_ref().and_then(|channel| channel.parent_id).map(|id| id.get());
+        let allowed = data.db.games_channel(guild.get()).is_ok_and(|allowed| {
+            crate::admin::allowed_here(&data.games_commands, "words", allowed, press.channel_id.get(), parent)
+        });
+        if !allowed {
+            let _ = press.create_response(ctx, serenity::CreateInteractionResponse::Message(
+                serenity::CreateInteractionResponseMessage::new().content("Запусти /words в игровом канале сервера.").ephemeral(true),
+            )).await;
+            return true;
+        }
         let player = Player { id: press.user.id.get(), name: press.user.name.to_string(), face: press.user.face() };
         if let Err(error) = crate::wordsummary::remember_channel(data, guild.get(), press.channel_id.get(), &player, lang) {
             println!("Не получилось сохранить канал игры: {error}");
@@ -339,7 +405,6 @@ mod tests {
         assert_eq!(two.dimensions(), (524, 504));
         let seven: Vec<Card> = (0..7).map(|index| card(&format!("P{index}"), win.clone())).collect();
         assert_eq!(board_image(fonts, &seven).dimensions(), (1508, 976));
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("sample_board.png");
-        std::fs::write(out, draw::to_png(&two)).unwrap();
+        assert!(draw::to_png(&two).starts_with(b"\x89PNG"));
     }
 }

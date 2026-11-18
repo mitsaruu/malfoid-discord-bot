@@ -51,11 +51,11 @@ impl ChatSettings {
             reply_to_bots: on(&settings.text("ai", "reply_to_bots", "on")),
             bot_reply_limit: settings.int("ai", "bot_reply_limit", 3).max(0),
             chatter_chance: settings.int("chatter", "chance_percent", 5).clamp(0, 100),
-            chatter_interval: settings.int("chatter", "interval_minutes", 20).max(1) as u64,
+            chatter_interval: settings.int("chatter", "interval_minutes", 20).clamp(1, 1440) as u64,
             antispam: on(&settings.text("antispam", "enabled", "on")),
-            spam_repeats: settings.int("antispam", "same_messages", 4).max(2) as usize,
-            spam_links: settings.int("antispam", "link_messages", 4).max(2) as usize,
-            spam_window: settings.int("antispam", "window_seconds", 20).max(5) as f64,
+            spam_repeats: settings.int("antispam", "same_messages", 4).clamp(2, 64) as usize,
+            spam_links: settings.int("antispam", "link_messages", 4).clamp(2, 64) as usize,
+            spam_window: settings.int("antispam", "window_seconds", 20).clamp(5, 3600) as f64,
         }
     }
 }
@@ -64,12 +64,13 @@ impl ChatSettings {
 pub struct ChatState {
     pub settings: ChatSettings,
     /// Сервер → имена и ники тех, кто писал в чат (чтобы узнавать их в приветствиях)
-    known_names: Mutex<HashMap<u64, HashSet<String>>>,
+    known_names: Mutex<HashMap<u64, HashMap<String, f64>>>,
     /// Сервер → (канал, время): где последний раз писали люди (для случайных реплик)
     last_activity: Mutex<HashMap<u64, (u64, f64)>>,
     /// Канал → сколько раз подряд бот ответил другим ботам
     bot_reply_streak: Mutex<HashMap<u64, i64>>,
     spam: Mutex<SpamTracker>,
+    auto_replies: ai::ConfigCache<Vec<Rule>>,
 }
 
 impl ChatState {
@@ -80,6 +81,7 @@ impl ChatState {
             last_activity: Default::default(),
             bot_reply_streak: Default::default(),
             spam: Default::default(),
+            auto_replies: Default::default(),
         }
     }
 }
@@ -105,7 +107,8 @@ struct SpamEntry {
 /// Последние сообщения каждого участника и когда его последний раз наказали.
 #[derive(Default)]
 pub struct SpamTracker {
-    recent: HashMap<(u64, u64), Vec<SpamEntry>>,
+    recent: HashMap<(u64, u64, u64), Vec<SpamEntry>>,
+    last_cleanup: f64,
     punished: HashMap<(u64, u64), f64>,
 }
 
@@ -126,21 +129,28 @@ impl SpamTracker {
     /// key — (сервер, участник). Возвращает Some, если это спам.
     pub fn check(&mut self, settings: &ChatSettings, key: (u64, u64), now: f64, content: &str, message: (u64, u64)) -> Option<Spam> {
         let text = content.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
-        let recent = self.recent.entry(key).or_default();
+        if now - self.last_cleanup >= 60.0 {
+            self.recent.retain(|_, entries| entries.last().is_some_and(|entry| now - entry.time <= settings.spam_window));
+            self.punished.retain(|_, last| now - *last < 60.0);
+            self.last_cleanup = now;
+        }
+        let recent = self.recent.entry((key.0, key.1, message.0)).or_default();
         recent.retain(|entry| now - entry.time <= settings.spam_window);
         recent.push(SpamEntry { time: now, link: has_link(&text), text: text.clone(), message });
-        if recent.len() > 12 {
-            recent.drain(..recent.len() - 12);
+        let capacity = settings.spam_repeats.max(settings.spam_links);
+        if recent.len() > capacity {
+            recent.drain(..recent.len() - capacity);
         }
-        let same: Vec<(u64, u64)> = recent.iter().filter(|entry| !text.is_empty() && entry.text == text).map(|entry| entry.message).collect();
-        let links: Vec<(u64, u64)> = recent.iter().filter(|entry| entry.link).map(|entry| entry.message).collect();
-        let (messages, reason) = if same.len() >= settings.spam_repeats {
+        let same = recent.iter().rev().take_while(|entry| !text.is_empty() && entry.text == text).count();
+        let links = recent.iter().rev().take_while(|entry| entry.link).count();
+        let (length, reason) = if same >= settings.spam_repeats {
             (same, "спам одинаковыми сообщениями")
-        } else if links.len() >= settings.spam_links {
+        } else if links >= settings.spam_links {
             (links, "спам ссылками")
         } else {
             return None;
         };
+        let messages = recent[recent.len() - length..].iter().map(|entry| entry.message).collect();
         recent.clear();
         // за этот спам уже наказали — просто молча чистим
         let punish = self.punished.get(&key).is_none_or(|last| now - last >= 60.0);
@@ -153,7 +163,7 @@ impl SpamTracker {
 
 /// Проверяет сообщение на спам. true — это спам: сообщения удалены, участнику выдан варн.
 async fn check_spam(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId, message: &serenity::Message) -> bool {
-    if !data.chat.settings.antispam {
+    if !data.chat.settings.antispam || ctx.cache.guild(guild).is_none() {
         return false;
     }
     let Ok(member) = guild.member(ctx, message.author.id).await else { return false };
@@ -314,19 +324,27 @@ fn cached_name(ctx: &serenity::Context, guild: serenity::GuildId, user: serenity
 fn remember_names(data: &Data, guild: u64, message: &serenity::Message) {
     let mut names = locked(&data.chat.known_names);
     let words = names.entry(guild).or_default();
+    let now = db::now();
     for name in [Some(message.author.name.clone()), message.author.global_name.clone(), Some(message_author_name(message))].into_iter().flatten() {
-        words.extend(name_words(&name));
+        for word in name_words(&name) {
+            words.insert(word, now);
+        }
+    }
+    if words.len() > 1024 {
+        // Оставляем недавние имена и освобождаем место для будущих сообщений.
+        let mut by_age = words.iter().map(|(word, time)| (word.clone(), *time)).collect::<Vec<_>>();
+        by_age.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        for (word, _) in by_age.into_iter().take(words.len() - 896) { words.remove(&word); }
     }
 }
 
 /// Если в сообщении есть слово из config/auto_replies.txt — отвечает на него.
 async fn auto_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId, message: &serenity::Message) {
-    let file = std::fs::read_to_string(data.dir.join("config").join("auto_replies.txt")).unwrap_or_default();
-    let rules = parse_auto_replies(&file);
+    let rules = data.chat.auto_replies.read(&data.dir.join("config").join("auto_replies.txt"), parse_auto_replies);
     let text = normalize(&message.content);
     let chars: Vec<char> = text.chars().collect();
     let bot = ctx.cache.current_user().clone();
-    for rule in &rules {
+    for rule in rules.iter() {
         if !rule.matches(&chars) {
             continue;
         }
@@ -337,7 +355,8 @@ async fn auto_reply(ctx: &serenity::Context, data: &Data, guild: serenity::Guild
             if let Some(name) = cached_name(ctx, guild, bot.id) {
                 bot_words.extend(name_words(&name));
             }
-            let mut other_names = locked(&data.chat.known_names).get(&guild.get()).cloned().unwrap_or_default();
+            let mut other_names: HashSet<_> = locked(&data.chat.known_names).get(&guild.get())
+                .map(|known| known.keys().cloned().collect()).unwrap_or_default();
             if let Some(cached) = ctx.cache.guild(guild) {
                 for member in cached.members.values().filter(|member| !member.user.bot) {
                     other_names.extend(name_words(&member.user.name));
@@ -422,55 +441,80 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
         (true, true) => "(просто позвал тебя, ничего не написав)".to_string(),
     };
 
+    if let Some(refusal) = data.ai.limit_check(message.author.id.get()) {
+        if !message.author.bot {
+            let _ = message.channel_id.send_message(ctx, no_pings(&refusal).reference_message(message)).await;
+        }
+        return;
+    }
+    let Ok(_slot) = data.ai.ask_slots.try_acquire() else {
+        if !message.author.bot {
+            let error = ai::error_text(&ai::AiError::Busy);
+            let _ = message.channel_id.send_message(ctx, no_pings(error).reference_message(message)).await;
+        }
+        return;
+    };
+    if !message.author.bot && ai::directed_insult(data, &question).await {
+        ai::punish_rudeness(ctx, data, Some(guild), &message.author, message.channel_id).await;
+        return;
+    }
+    let moderation = match moderation::requested_action(&question, replied.map(|post| post.author.id.get()), bot.get()) {
+        Some(Ok(action)) => Some((Requester { ctx, guild, user: message.author.id }, action)),
+        Some(Err(error)) => {
+            let _ = message.channel_id.send_message(ctx, no_pings(error).reference_message(message)).await;
+            return;
+        }
+        None => None,
+    };
+
     let typing = message.channel_id.start_typing(&ctx.http); // «бот печатает…», пока ИИ думает
     let mut images = Vec::new();
-    for attachment in attachments {
-        match attachment.download().await {
-            Ok(bytes) => images.push((bytes, ai::image_type(attachment.content_type.as_deref()))),
-            Err(error) => report_error(&ctx.http, data, Some(guild), "Скачивание картинки для ИИ", &error.to_string()).await,
+    let chat = if moderation.is_none() {
+        for attachment in attachments {
+            match ai::download_image(data, attachment).await {
+                Ok(bytes) => images.push((bytes, ai::image_type(attachment.content_type.as_deref()))),
+                Err(error) => report_error(&ctx.http, data, Some(guild), "Скачивание картинки для ИИ", &error.to_string()).await,
+            }
         }
-    }
-    let chat = chat_context(ctx, guild, message).await;
-    // Кого могут попросить наказать: упомянутые и автор сообщения, на которое ответили («дай ему варн»)
-    let mut targets = Vec::new();
-    for user in message.mentions.iter().chain(replied.map(|replied| &replied.author)) {
-        if let Ok(member) = guild.member(ctx, user.id).await {
-            targets.push(member);
-        }
-    }
-    let author = guild.member(ctx, message.author.id).await.ok();
+        chat_context(ctx, guild, message).await
+    } else {
+        String::new()
+    };
     let delivery = ai::DeliveryReceipt::default();
-    let mut extras = ai::Extras {
+    let extras = ai::Extras {
         chat,
-        moderation: None,
+        moderation,
         options: ai::RequestOptions { user: Some(message.author.id.get()), delivery: Some(&delivery), ..Default::default() },
     };
-    if let Some(author) = &author {
-        let note = moderation::context_note(ctx, guild, author, &question, &targets).await;
-        extras.moderation = Some((Requester { ctx, guild, member: author }, note));
-    }
     let name = message_author_name(message);
-    let answer = match ai::ask(data, &question, &name, message.channel_id.get(), images, extras).await {
+    let mut answer = match ai::ask(data, &question, &name, message.channel_id.get(), images, extras).await {
         Ok(answer) => answer,
         Err(error) => {
             report_error(&ctx.http, data, Some(guild), "ИИ (ответ на сообщение)", &error.to_string()).await;
-            Some(ai::error_text(&error).to_string())
+            ai::error_text(&error).to_string()
         }
     };
     typing.stop();
-    let Some(answer) = answer else {
-        // Отдельный классификатор в ai::ask выявил прямое серьёзное оскорбление бота.
-        ai::punish_rudeness(ctx, data, Some(guild), &message.author, message.channel_id).await;
-        return;
-    };
     let _ = data.db.reset_rude_strikes(guild.get(), message.author.id.get()); // нормальное обращение — счётчик с нуля
-    for (index, part) in ai::split_message(&answer, 1900).into_iter().enumerate() {
-        let reply = if index == 0 { no_pings(&part).reference_message(message) } else { no_pings(&part) };
-        if message.channel_id.send_message(ctx, reply).await.is_err() {
-            return;
+    if let Some(math) = crate::ai_math::render_for_discord(&answer).await {
+        let reply = no_pings(crate::ai_math::FILE_MESSAGE).reference_message(message).add_file(math.attachment());
+        match message.channel_id.send_message(ctx, reply).await {
+            Ok(_) => { delivery.delivered(); return; }
+            Err(error) if crate::ai_math::attachment_denied(&error) => answer = math.discord,
+            Err(error) => {
+                report_error(&ctx.http, data, Some(guild), "Ответ ИИ с формулами", &error.to_string()).await;
+                return;
+            }
         }
     }
-    delivery.delivered();
+    for (index, part) in ai::split_message(&answer, 1900).into_iter().enumerate() {
+        let reply = if index == 0 { no_pings(&part).reference_message(message) } else { no_pings(&part) };
+        if let Err(error) = message.channel_id.send_message(ctx, reply).await {
+            report_error(&ctx.http, data, Some(guild), "Доставка ответа ИИ", &error.to_string()).await;
+            return;
+        }
+        delivery.delivered();
+    }
 }
 
 /// Сообщение от другого бота: опыт и автоответы ботам не положены, а на прямое обращение — ответ ИИ.
@@ -555,6 +599,7 @@ pub fn start_chatter_loop(ctx: serenity::Context, data: Shared) {
     tokio::spawn(async move {
         let interval = data.chat.settings.chatter_interval * 60;
         let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         timer.tick().await; // первый «тик» срабатывает сразу — пропускаем его
         loop {
             timer.tick().await;
@@ -562,27 +607,35 @@ pub fn start_chatter_loop(ctx: serenity::Context, data: Shared) {
                 continue;
             }
             let now = db::now();
-            let active: Vec<(u64, u64)> = locked(&data.chat.last_activity)
-                .iter()
-                .filter(|(_, (_, at))| now - at <= interval as f64) // за последний интервал никто не писал — чат «спит»
-                .map(|(guild, (channel, _))| (*guild, *channel))
-                .collect();
+            let active: Vec<(u64, u64)> = {
+                let mut activity = locked(&data.chat.last_activity);
+                activity.retain(|_, (_, at)| now - *at <= interval as f64);
+                activity.iter().map(|(guild, (channel, _))| (*guild, *channel)).collect()
+            };
+            let mut jobs = tokio::task::JoinSet::new();
             for (guild, channel) in active {
                 if rand::rng().random_range(0..100) >= data.chat.settings.chatter_chance {
-                    continue; // бросаем «кубик»
+                    continue;
                 }
-                let (guild, channel) = (serenity::GuildId::new(guild), serenity::ChannelId::new(channel));
-                match chatter_text(&ctx, &data, guild, channel).await {
-                    Ok(Some(text)) => {
-                        let text: String = text.chars().take(1900).collect();
-                        if channel.send_message(&ctx, no_pings(&text)).await.is_ok() {
-                            println!("Случайная реплика: сервер={guild} канал={channel}");
+                if jobs.len() >= 3 {
+                    let _ = jobs.join_next().await;
+                }
+                let (ctx, data) = (ctx.clone(), data.clone());
+                jobs.spawn(async move {
+                    let (guild, channel) = (serenity::GuildId::new(guild), serenity::ChannelId::new(channel));
+                    match chatter_text(&ctx, &data, guild, channel).await {
+                        Ok(Some(text)) => {
+                            let text: String = text.chars().take(950).collect();
+                            if channel.send_message(&ctx, no_pings(&text)).await.is_ok() {
+                                println!("Случайная реплика: сервер={guild} канал={channel}");
+                            }
                         }
+                        Ok(None) => {}
+                        Err(error) => report_error(&ctx.http, &data, Some(guild), "Случайная реплика в чат", &error.to_string()).await,
                     }
-                    Ok(None) => {}
-                    Err(error) => report_error(&ctx.http, &data, Some(guild), "Случайная реплика в чат", &error.to_string()).await,
-                }
+                });
             }
+            while jobs.join_next().await.is_some() {}
         }
     });
 }

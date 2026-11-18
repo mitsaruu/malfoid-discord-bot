@@ -2,9 +2,10 @@
 
 use crate::admin::report_error;
 use crate::reply::whisper;
-use crate::{Context, Data, Error};
+use crate::{db::Database, Context, Data, Error};
 use chrono::{Datelike, NaiveDate};
 use poise::serenity_prelude as serenity;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 
 /// Город: (название для показа, широта, долгота).
@@ -132,10 +133,88 @@ async fn fetch_weather(data: &Data, latitude: f64, longitude: f64) -> Result<Val
     get_json(data, "https://api.open-meteo.com/v1/forecast", &query).await
 }
 
+fn saved_cities(connection: &Connection, guild: u64) -> rusqlite::Result<Vec<City>> {
+    let mut statement = connection.prepare(
+        "SELECT name, latitude, longitude FROM weather_cities WHERE guild_id = ?1 ORDER BY rowid LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![guild as i64, MAX_CITIES as i64], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })?;
+    rows.collect()
+}
+
 /// Города сервера; если своих ещё не добавляли — города по умолчанию.
 fn server_cities(data: &Data, guild: u64) -> rusqlite::Result<Vec<City>> {
-    let cities = data.db.weather_cities(guild)?;
+    let cities = saved_cities(&data.db.lock(), guild)?;
     Ok(if cities.is_empty() { default_cities() } else { cities })
+}
+
+fn insert_city(connection: &Connection, guild: u64, city: &City) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO weather_cities (guild_id, name, latitude, longitude) VALUES (?1, ?2, ?3, ?4)",
+        params![guild as i64, city.0, city.1, city.2],
+    )?;
+    Ok(())
+}
+
+enum AddCity {
+    Added(usize),
+    Duplicate,
+    Full,
+}
+
+fn add_city(db: &Database, guild: u64, city: &City) -> rusqlite::Result<AddCity> {
+    let mut connection = db.lock();
+    let transaction = connection.transaction()?;
+    let mut cities = saved_cities(&transaction, guild)?;
+    let initialize = cities.is_empty();
+    if initialize {
+        cities = default_cities();
+    }
+    if cities.iter().any(|existing| existing.0 == city.0) {
+        return Ok(AddCity::Duplicate);
+    }
+    if cities.len() >= MAX_CITIES {
+        return Ok(AddCity::Full);
+    }
+    if initialize {
+        for entry in &cities {
+            insert_city(&transaction, guild, entry)?;
+        }
+    }
+    insert_city(&transaction, guild, city)?;
+    transaction.commit()?;
+    Ok(AddCity::Added(cities.len() + 1))
+}
+
+fn remove_city(db: &Database, guild: u64, search: &str) -> rusqlite::Result<Option<(String, bool)>> {
+    let mut connection = db.lock();
+    let transaction = connection.transaction()?;
+    let mut cities = saved_cities(&transaction, guild)?;
+    let initialize = cities.is_empty();
+    if initialize {
+        cities = default_cities();
+    }
+    let search = search.trim().to_lowercase();
+    let Some(position) = cities.iter().position(|(name, _, _)| name.to_lowercase().contains(&search)) else {
+        return Ok(None);
+    };
+    let (name, _, _) = cities.remove(position);
+    if initialize {
+        for entry in &cities {
+            insert_city(&transaction, guild, entry)?;
+        }
+    } else {
+        transaction.execute("DELETE FROM weather_cities WHERE guild_id = ?1 AND name = ?2",
+            params![guild as i64, name])?;
+    }
+    let no_saved_cities = !transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM weather_cities WHERE guild_id = ?1)",
+        [guild as i64],
+        |row| row.get::<_, bool>(0),
+    )?;
+    transaction.commit()?;
+    Ok(Some((name, no_saved_cities)))
 }
 
 /// Погода сейчас и на 3 дня
@@ -164,17 +243,35 @@ pub async fn weather(
         (None, Some(guild)) => server_cities(data, guild.get())?,
         (None, None) => default_cities(), // в личных сообщениях — города по умолчанию
     };
+    let data = data.clone();
+    let mut fetched: Vec<_> = (0..cities.len()).map(|_| None).collect();
+    let mut requests = tokio::task::JoinSet::new();
+    let mut cities = cities.into_iter().enumerate();
+    // Refill one slot after each result and preserve server-configured display order.
+    loop {
+        while requests.len() < 4 {
+            let Some((index, (name, latitude, longitude))) = cities.next() else { break };
+            let data = data.clone();
+            requests.spawn(async move {
+                let forecast = fetch_weather(&data, latitude, longitude).await.map(|answer| format_weather(&answer));
+                (index, name, forecast)
+            });
+        }
+        let Some(result) = requests.join_next().await else { break };
+        let (index, name, forecast) = result?;
+        fetched[index] = Some((name, forecast));
+    }
     let mut embed = serenity::CreateEmbed::new().title("Прогноз погоды").color(0x8B5CF6);
-    for (name, latitude, longitude) in cities {
-        let text = match fetch_weather(data, latitude, longitude).await.map(|answer| format_weather(&answer)) {
+    for (name, forecast) in fetched.into_iter().flatten() {
+        let text = match forecast {
             Ok(Some(text)) => text,
             failed => {
                 let details = failed.err().map_or("ответ не того вида".to_string(), |error| error.to_string());
-                report_error(ctx.http(), data, ctx.guild_id(), &format!("Погода /weather ({name})"), &details).await;
+                report_error(ctx.http(), &data, ctx.guild_id(), &format!("Погода /weather ({name})"), &details).await;
                 "Не получилось узнать погоду 😕".to_string()
             }
         };
-        embed = embed.field(name, text, false); // каждый город с новой строки
+        embed = embed.field(name, text, false);
     }
     ctx.send(poise::CreateReply::default().embed(embed.footer(serenity::CreateEmbedFooter::new("Данные: Open-Meteo")))).await?;
     Ok(())
@@ -198,8 +295,8 @@ pub async fn weather_cities(
     #[description = "Название города (для добавления и удаления)"] city: Option<String>,
 ) -> Result<(), Error> {
     let (data, guild) = (ctx.data(), ctx.guild_id().unwrap());
-    let mut cities = server_cities(data, guild.get())?;
     if action == CityAction::List {
+        let cities = server_cities(data, guild.get())?;
         let lines: Vec<String> = cities.iter().enumerate().map(|(index, (name, _, _))| format!("{}. {name}", index + 1)).collect();
         ctx.say(format!("🗺️ Города для /weather:\n{}", lines.join("\n"))).await?;
         return Ok(());
@@ -208,9 +305,6 @@ pub async fn weather_cities(
         return whisper(ctx, "Напиши название города в поле `city`.").await; // для добавления и удаления нужно название
     };
     if action == CityAction::Add {
-        if cities.len() >= MAX_CITIES {
-            return whisper(ctx, format!("Уже {MAX_CITIES} городов — сначала удали какой-нибудь.")).await;
-        }
         ctx.defer().await?; // поиск города занимает пару секунд
         let found = match find_city(data, &city).await {
             Ok(found) => found,
@@ -223,24 +317,19 @@ pub async fn weather_cities(
             ctx.say(format!("Не нашёл город «{city}» 😕 Попробуй написать по-другому.")).await?;
             return Ok(());
         };
-        if cities.iter().any(|(name, _, _)| *name == found.0) {
-            ctx.say(format!("{} уже есть в списке.", found.0)).await?;
-            return Ok(());
-        }
-        let title = found.0.clone();
-        cities.push(found);
-        data.db.save_weather_cities(guild.get(), &cities)?;
-        ctx.say(format!("✅ Добавил {title}. Теперь в /weather городов: {}.", cities.len())).await?;
+        let text = match add_city(&data.db, guild.get(), &found)? {
+            AddCity::Added(count) => format!("✅ Добавил {}. Теперь в /weather городов: {count}.", found.0),
+            AddCity::Duplicate => format!("{} уже есть в списке.", found.0),
+            AddCity::Full => format!("Уже {MAX_CITIES} городов — сначала удали какой-нибудь."),
+        };
+        ctx.say(text).await?;
         return Ok(());
     }
-    // Удаление: ищем город, в названии которого есть введённый текст (без учёта регистра)
-    let Some(position) = cities.iter().position(|(name, _, _)| name.to_lowercase().contains(&city.to_lowercase())) else {
+    let Some((removed, empty)) = remove_city(&data.db, guild.get(), &city)? else {
         return whisper(ctx, format!("Города «{city}» нет в списке. Посмотри: /weather_cities → Показать список.")).await;
     };
-    let removed = cities.remove(position);
-    data.db.save_weather_cities(guild.get(), &cities)?;
-    let mut text = format!("🗑️ Удалил {}.", removed.0);
-    if cities.is_empty() {
+    let mut text = format!("🗑️ Удалил {removed}.");
+    if empty {
         text += " Список пуст, поэтому /weather снова покажет Москву и Тель-Авив.";
     }
     ctx.say(text).await?;
@@ -250,6 +339,20 @@ pub async fn weather_cities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn city_edits_preserve_other_rows_and_respect_capacity() {
+        let db = Database::open(std::path::Path::new(":memory:")).unwrap();
+        let new_city = |n| (format!("City {n}"), 56.0, 45.0);
+        let added: Vec<_> = (0..6).map(|n| add_city(&db, 10, &new_city(n)).unwrap()).collect();
+        assert!(matches!(added.last(), Some(AddCity::Added(MAX_CITIES))));
+        assert!(matches!(add_city(&db, 10, &new_city(10)), Ok(AddCity::Full)));
+        assert_eq!(remove_city(&db, 10, "мОскВА").unwrap(), Some(("🇷🇺 Москва".into(), false)));
+        assert!(matches!(add_city(&db, 10, &new_city(10)), Ok(AddCity::Added(MAX_CITIES))));
+        assert!(matches!(add_city(&db, 10, &new_city(10)), Ok(AddCity::Duplicate)));
+        assert_eq!(saved_cities(&db.lock(), 10).unwrap().last(), Some(&new_city(10)));
+        assert!(saved_cities(&db.lock(), 11).unwrap().is_empty());
+    }
 
     #[test]
     fn temperatures() {
