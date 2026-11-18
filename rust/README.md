@@ -1,4 +1,4 @@
-# Бот на Rust
+# Malfoid Discord Bot на Rust
 
 Discord-бот на Rust. Настройки находятся в `config/settings.ini`, данные — в `levels.db`.
 

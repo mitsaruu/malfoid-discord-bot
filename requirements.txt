@@ -1,2 +1,2 @@
-# Optional Python environment for the Rust bot's audio downloader.
+# Зависимости загрузчика музыки Malfoid Discord Bot.
 yt-dlp[default]
