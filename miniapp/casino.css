@@ -1,0 +1,68 @@
+.game-switch { flex-wrap: wrap; justify-content: center; }
+
+.casino {
+  --table: #182b26;
+  --accent: #9de5bd;
+  --edge: #364d45;
+  width: min(940px, calc(100% - 24px));
+  margin: 18px auto 0;
+  padding: clamp(14px, 3vw, 26px);
+  border: 1px solid var(--edge);
+  border-radius: 20px;
+  background: radial-gradient(ellipse at 50% 0, var(--table), #151718 76%);
+  box-shadow: inset 0 1px #ffffff12, 0 14px 36px #0005;
+}
+
+#mines { --table: #1c2a3a; --accent: #a9d8fa; --edge: #344a61; }
+#slots { --table: #352a1e; --accent: #f5ce92; --edge: #604d37; }
+#blackjack { --table: #34242d; --accent: #f3bdd0; --edge: #624858; }
+
+.casino h1 { margin: 0 0 14px; font-size: clamp(22px, 4vw, 34px); letter-spacing: -.025em; }
+.casino h2 { margin: 0 0 10px; font-size: 17px; }
+.casino p { line-height: 1.45; }
+.casino-panel {
+  min-width: 0;
+  margin-block: 12px;
+  padding: 14px;
+  border: 1px solid var(--edge);
+  border-radius: 14px;
+  background: #101413a6;
+}
+.casino-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.casino label { display: inline-flex; flex-direction: column; gap: 5px; font-size: .85rem; }
+.casino input, .casino select, .casino button {
+  min-height: 38px;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: #171d1d;
+  color: #f2f5f4;
+  font: inherit;
+}
+.casino input, .casino select { max-width: 100%; padding: 7px 9px; color-scheme: dark; }
+.casino input[type="number"] { width: 9ch; }
+.casino button { padding: 7px 12px; }
+.casino button:not(:disabled):hover { border-color: var(--accent); }
+.casino button:disabled { cursor: default; opacity: .53; }
+.casino :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.casino .casino-button { background: var(--accent); color: #14211d; border-color: transparent; font-weight: 700; }
+.casino-feedback { min-height: 1.5em; color: var(--accent); }
+.casino-grid { display: grid; gap: 8px; }
+.casino-card {
+  display: inline-grid;
+  place-items: center;
+  min-width: 40px;
+  min-height: 55px;
+  padding: 4px 7px;
+  border: 1px solid #ffffff3b;
+  border-radius: 8px;
+  background: #eaedeb;
+  color: #17241d;
+  font-weight: 800;
+}
+.casino-card[data-suit="hearts"], .casino-card[data-suit="diamonds"] { color: #a42a43; }
+
+@media (max-width: 450px) {
+  .casino { padding: 12px; margin-top: 12px; width: calc(100% - 16px); }
+  .casino-panel { padding: 10px; }
+  .game-switch button { padding-inline: 8px; }
+}

@@ -1,11 +1,11 @@
-//! Мини-приложение (Discord Activity) для игр в слова. Discord показывает страницу miniapp/index.html внутри
+//! Мини-приложение для игр (Discord Activity). Discord показывает страницу miniapp/index.html внутри
 //! себя; страницу и ответы на ходы отдаёт этот веб-сервер. Снаружи до него Discord достучится через туннель
 //! (например, cloudflared) — см. README.
 
 use crate::wordboard::{self, Player};
 use crate::words::{self, Lang};
 use crate::{rocket, Shared};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -129,10 +129,10 @@ async fn index(State(app): State<App>) -> Response {
 /// Разрешённые файлы интерфейса.
 async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Response {
     match name.as_str() {
-        "style.css" => file(&app, "style.css", "text/css; charset=utf-8").await,
-        "app.js" => file(&app, "app.js", "text/javascript; charset=utf-8").await,
-        "rocket.css" => file(&app, "rocket.css", "text/css; charset=utf-8").await,
-        "rocket.js" => file(&app, "rocket.js", "text/javascript; charset=utf-8").await,
+        "style.css" | "rocket.css" | "casino.css" =>
+            file(&app, &name, "text/css; charset=utf-8").await,
+        "app.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" =>
+            file(&app, &name, "text/javascript; charset=utf-8").await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -305,6 +305,61 @@ async fn rocket_cashout(State(app): State<App>, headers: HeaderMap, Json(body): 
     Ok(Json(state).into_response())
 }
 
+async fn casino_action(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((game, action)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Reply {
+    let rule = match game.as_str() {
+        "mines" | "poker" | "slots" | "blackjack" => game.as_str(),
+        _ => return Err(StatusCode::NOT_FOUND.into_response()),
+    };
+    if action.len() > 24 || !body.is_object() {
+        return Err(json_error("Некорректное действие.", StatusCode::BAD_REQUEST));
+    }
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    // Новые игры появились после настройки части серверов, поэтому применяем
+    // игровой канал к ним и при отсутствии их имён в старом конфиге.
+    if matches!(rule, "poker" | "mines") {
+        let channel = app.data.db.games_channel(session.guild).map_err(failed)?;
+        if channel.is_some_and(|id| id != session.channel && Some(id) != session.parent) {
+            return Err(json_error("Эта игра доступна только в игровом канале сервера.", StatusCode::FORBIDDEN));
+        }
+    } else {
+        check_game_channel(&app.data, &session, rule)?;
+    }
+    let data = app.data.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let (guild, user, name) = (session.guild, session.user, session.name.as_str());
+        match game.as_str() {
+            "poker" => crate::poker::handle(&data, guild, user, name, &action, &body),
+            "blackjack" => crate::table_blackjack::handle(&data, guild, user, name, &action, &body),
+            _ => crate::casino_solo::handle(&data, guild, user, name, &game, &action, &body),
+        }
+    }).await.map_err(failed)?.map_err(failed)?;
+    let state = result.map_err(|error| json_error(&error, StatusCode::CONFLICT))?;
+    Ok(Json(state).into_response())
+}
+
+fn start_game_cleanup(data: Shared) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(1));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let data = data.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                crate::poker::sweep(&data);
+                crate::table_blackjack::sweep(&data);
+                crate::casino_solo::sweep(&data);
+            }).await {
+                eprintln!("Mini App: {error}");
+            }
+        }
+    });
+}
+
 async fn state(State(app): State<App>, headers: HeaderMap) -> Reply {
     let (_, session) = app.authorized(&headers, Some("words"), false).await?;
     let game = words::daily_game(&app.data, session.guild, session.user, session.lang).map_err(failed)?;
@@ -412,12 +467,14 @@ pub fn router(app: App) -> axum::Router {
         .route("/api/rocket/state", get(rocket_state))
         .route("/api/rocket/start", post(rocket_start))
         .route("/api/rocket/cashout", post(rocket_cashout))
+        .route("/api/games/{game}/{action}", post(casino_action).layer(DefaultBodyLimit::max(2048)))
         .route("/api/avatar/{guild}/{file}", get(avatar))
         .with_state(app)
 }
 
 /// Запускает веб-сервер мини-приложения в фоне.
 pub fn start(ctx: serenity::Context, data: Shared, client_secret: String, listener: tokio::net::TcpListener) {
+    start_game_cleanup(data.clone());
     let app = Arc::new(Miniapp { data: data.clone(), ctx, client_secret, sessions: Default::default() });
     tokio::spawn(async move {
         if let Ok(address) = listener.local_addr() {

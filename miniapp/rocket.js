@@ -2,6 +2,7 @@
 
 const ROCKET_POLL_MS = 500;
 const ROCKET_IDLE_POLL_MS = 2400;
+const ROCKET_MAX_REPEAT_ROUNDS = 10;
 const ROCKET_MAX_MULTIPLIER = 1000;
 const ROCKET_DOUBLE_MS = 6000;
 const ROCKET_MAX_DURATION = ROCKET_DOUBLE_MS * Math.log2(ROCKET_MAX_MULTIPLIER / 100);
@@ -44,7 +45,10 @@ function rocketResponse(data) {
   return data;
 }
 
-function createRocketFeed({ request, onChange, now = () => performance.now(), setTimer = setTimeout, clearTimer = clearTimeout }) {
+function createRocketFeed({
+  request, onChange, canAutoStart = () => true,
+  now = () => performance.now(), setTimer = setTimeout, clearTimer = clearTimeout,
+}) {
   let snapshot = null;
   let sampledAt = 0;
   let visible = false;
@@ -54,9 +58,35 @@ function createRocketFeed({ request, onChange, now = () => performance.now(), se
   let needsSync = true;
   let syncError = "";
   let actionError = "";
+  let repeat = null;
+  let repeatNotice = "";
 
   function report() {
-    onChange({ snapshot, sampledAt, pending, needsSync, syncing: Boolean(read), syncError, actionError });
+    onChange({
+      snapshot, sampledAt, pending, needsSync, syncing: Boolean(read), syncError, actionError,
+      repeat: repeat && { ...repeat }, repeatNotice,
+    });
+  }
+
+  function clearRepeat(notice) {
+    if (!repeat) return false;
+    repeat = null;
+    repeatNotice = notice;
+    return true;
+  }
+
+  function repeatReady() {
+    if (!repeat) return false;
+    const { flight, balance, min_bet, max_bet } = snapshot;
+    if (!canAutoStart()) clearRepeat("connection");
+    else if (flight?.id !== repeat.id || flight.stake !== repeat.stake || flight.auto !== repeat.target) {
+      clearRepeat("changed");
+    } else if (flight.status === "refunded") clearRepeat("refunded");
+    else if (!rocketActive(flight)) {
+      if (repeat.stake >= min_bet && repeat.stake <= Math.min(balance, max_bet)) return true;
+      clearRepeat("stake");
+    }
+    return false;
   }
 
   function clearPoll() {
@@ -82,6 +112,7 @@ function createRocketFeed({ request, onChange, now = () => performance.now(), se
     if (!visible || pending || read) return;
     clearPoll();
     const startedAt = now();
+    const previous = snapshot?.flight;
     const current = {};
     read = current;
     if (needsSync) report();
@@ -91,17 +122,26 @@ function createRocketFeed({ request, onChange, now = () => performance.now(), se
     } catch (error) {
       if (read !== current) return;
       needsSync = true;
+      clearRepeat("connection");
       syncError = error.name === "TimeoutError" ? "Сервер не ответил вовремя." : error.message;
     } finally {
       if (read === current) {
         read = null;
-        report();
-        schedule(startedAt);
+        const ready = repeatReady();
+        if (ready && !rocketActive(previous)) {
+          repeat.remaining--;
+          const { id, stake, target } = repeat;
+          void mutate("start", { bet: String(stake), auto: target === null ? null : String(target / 100), expected_id: id }, repeat);
+        } else {
+          report();
+          // Leave time to see the result and stop, then confirm it with a fresh poll.
+          schedule(ready ? now() : startedAt);
+        }
       }
     }
   }
 
-  async function mutate(action, body) {
+  async function mutate(action, body, run = null) {
     clearPoll();
     // A read started before this mutation can never replace its response.
     read = null;
@@ -109,9 +149,21 @@ function createRocketFeed({ request, onChange, now = () => performance.now(), se
     actionError = "";
     report();
     try {
+      if (run && (repeat !== run || !visible || !canAutoStart())) {
+        if (repeat === run) clearRepeat("connection");
+        return;
+      }
       accept(await request("api/rocket/" + action, body));
+      if (run && repeat === run) {
+        const next = snapshot.flight;
+        if (!next || next.id === run.id || next.stake !== run.stake || next.auto !== run.target) clearRepeat("changed");
+        else if (next.status === "refunded") clearRepeat("refunded");
+        else if (!run.remaining) clearRepeat("complete");
+        else run.id = next.id;
+      }
     } catch (error) {
       needsSync = true;
+      clearRepeat("connection");
       actionError = error.name === "TimeoutError" || error.name === "TypeError" ?
         "Ответ на запрос потерян. Проверьте состояние полёта после обновления." : error.message;
     } finally {
@@ -133,10 +185,25 @@ function createRocketFeed({ request, onChange, now = () => performance.now(), se
       visible = false;
       clearPoll();
       read = null;
+      if (clearRepeat("stopped")) report();
     },
     sync,
+    startRepeat(rounds) {
+      if (!visible || !canAutoStart() || pending || needsSync || repeat ||
+          !Number.isInteger(rounds) || rounds < 1 || rounds > ROCKET_MAX_REPEAT_ROUNDS) return;
+      const flight = snapshot?.flight;
+      if (!rocketActive(flight) || !Number.isSafeInteger(flight.stake) || flight.stake <= 0 ||
+          (flight.auto !== null && (!Number.isInteger(flight.auto) || flight.auto < 101 || flight.auto > 999))) return;
+      repeat = { id: flight.id, stake: flight.stake, target: flight.auto, remaining: rounds };
+      repeatNotice = "";
+      report();
+    },
+    stopRepeat(notice = "stopped") {
+      if (clearRepeat(notice)) report();
+    },
     async launch(bet, auto) {
       if (!visible || pending || needsSync || !snapshot || rocketActive(snapshot.flight)) return;
+      if (!clearRepeat("stopped")) repeatNotice = "";
       await mutate("start", { bet, auto, expected_id: snapshot.flight?.id ?? null });
     },
     async cashout() {
@@ -347,6 +414,7 @@ function createRocketView(request) {
   const balance = get("balance");
   const message = get("message");
   const retry = get("retry");
+  const form = get("form");
   const action = get("action");
   const settings = get("settings");
   const bet = get("bet");
@@ -356,7 +424,7 @@ function createRocketView(request) {
   const seconds = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
   const draw = createRocketChart(chart);
-  const feed = createRocketFeed({ request, onChange: update });
+  const feed = createRocketFeed({ request, onChange: update, canAutoStart });
   let current = { snapshot: null, sampledAt: 0, needsSync: true };
   let shown = false;
   let frame = null;
@@ -364,6 +432,46 @@ function createRocketView(request) {
   let lastTelemetry = null;
   let fieldError = "";
   let connectionError = "";
+
+  const repeatPanel = document.createElement("section");
+  repeatPanel.className = "rocket-repeat";
+  repeatPanel.setAttribute("aria-label", "Автостарт");
+  const repeatSetup = document.createElement("div");
+  repeatSetup.className = "rocket-repeat-setup";
+  repeatSetup.hidden = true;
+  const repeatLabel = document.createElement("label");
+  repeatLabel.textContent = "Доп. раунды";
+  repeatLabel.htmlFor = "rocket-repeat-rounds";
+  const repeatRounds = document.createElement("select");
+  repeatRounds.id = "rocket-repeat-rounds";
+  repeatRounds.setAttribute("aria-describedby", "rocket-repeat-status");
+  for (let count = 0; count <= ROCKET_MAX_REPEAT_ROUNDS; count++) {
+    const option = document.createElement("option");
+    option.value = count ? String(count) : "";
+    option.textContent = count ? String(count) : "Выберите";
+    repeatRounds.append(option);
+  }
+  const repeatStart = document.createElement("button");
+  repeatStart.type = "button";
+  repeatStart.className = "rocket-secondary";
+  repeatStart.textContent = "Включить автостарт";
+  repeatStart.disabled = true;
+  repeatSetup.append(repeatLabel, repeatRounds, repeatStart);
+  const repeatStop = document.createElement("button");
+  repeatStop.type = "button";
+  repeatStop.className = "rocket-secondary";
+  repeatStop.textContent = "Остановить автостарт";
+  repeatStop.hidden = true;
+  const repeatStatus = document.createElement("p");
+  repeatStatus.id = "rocket-repeat-status";
+  repeatStatus.setAttribute("role", "status");
+  repeatStatus.textContent = "Автостарт можно включить во время полёта.";
+  repeatPanel.append(repeatSetup, repeatStatus, repeatStop);
+  form.insertBefore(repeatPanel, action);
+
+  function canAutoStart() {
+    return shown && !root.hidden && !document.hidden && !connectionError && navigator.onLine !== false;
+  }
 
   function write(element, value) {
     if (element.textContent !== value) element.textContent = value;
@@ -401,6 +509,41 @@ function createRocketView(request) {
     return Math.min(data.balance, data.max_bet);
   }
 
+  function repeatTerms(stake, target, rounds) {
+    const cashout = target === null ? "ручной вывод" : "автовывод " + displayFactor(target);
+    const limit = rounds ? " Лимит ставок — " + number.format(stake * rounds) + " мон." : "";
+    return number.format(stake) + " мон. за раунд, " + cashout + "." + limit;
+  }
+
+  function renderRepeat(flight, locked) {
+    const { repeat, repeatNotice, pending } = current;
+    const active = rocketActive(flight);
+    repeatSetup.hidden = !active || Boolean(repeat);
+    repeatStop.hidden = !repeat;
+    repeatRounds.disabled = locked || !canAutoStart();
+    repeatStart.disabled = repeatRounds.disabled || !repeatRounds.value;
+
+    const notices = {
+      stopped: "Автостарт остановлен.",
+      connection: "Автостарт прерван. Для продолжения включите его заново.",
+      changed: "Автостарт остановлен: раунд изменился.",
+      refunded: "Автостарт остановлен: ставка возвращена.",
+      stake: "Автостарт остановлен: ставка недоступна.",
+      complete: "Автостарт завершён. Лимит раундов исчерпан.",
+    };
+    let status = notices[repeatNotice] || "Автостарт можно включить во время полёта.";
+    if (repeat) {
+      const progress = pending === "start" ?
+        "Запускаем раунд. После него осталось: " : "Автостарт включён. Осталось раундов: ";
+      status = progress + repeat.remaining + ". " + repeatTerms(repeat.stake, repeat.target, repeat.remaining);
+    } else if (active && repeatRounds.value) {
+      status = repeatTerms(flight.stake, flight.auto, Number(repeatRounds.value));
+    } else if (active && !repeatNotice) {
+      status = repeatTerms(flight.stake, flight.auto, 0);
+    }
+    write(repeatStatus, status);
+  }
+
   function renderControls() {
     const { snapshot, pending, needsSync, syncing, syncError, actionError } = current;
     const flight = snapshot?.flight;
@@ -423,6 +566,7 @@ function createRocketView(request) {
     write(action, actionText);
     retry.hidden = !syncError || Boolean(connectionError);
     retry.disabled = Boolean(syncing || pending);
+    renderRepeat(flight, locked);
 
     get("flight").hidden = !flight;
     if (flight) {
@@ -455,6 +599,7 @@ function createRocketView(request) {
   function update(view) {
     const previous = current.snapshot?.flight;
     const next = view.snapshot?.flight;
+    if (next?.id !== previous?.id) repeatRounds.value = "";
     if (next?.id !== previous?.id || next?.status !== previous?.status) {
       transition = shown && rocketActive(previous) && previous.id === next?.id && !rocketActive(next) ?
         performance.now() : null;
@@ -478,7 +623,7 @@ function createRocketView(request) {
     renderControls();
   }
 
-  get("form").addEventListener("submit", (event) => {
+  form.addEventListener("submit", (event) => {
     event.preventDefault();
     if (action.getAttribute("aria-disabled") === "true") return;
     const data = current.snapshot;
@@ -514,8 +659,16 @@ function createRocketView(request) {
     });
   }
   retry.addEventListener("click", feed.sync);
+  repeatRounds.addEventListener("change", renderControls);
+  repeatStart.addEventListener("click", () => {
+    const rounds = Number(repeatRounds.value);
+    repeatRounds.value = "";
+    feed.startRepeat(rounds);
+  });
+  repeatStop.addEventListener("click", () => feed.stopRepeat());
 
   function suspend() {
+    repeatRounds.value = "";
     feed.hide();
     cancelAnimationFrame(frame);
     frame = null;
@@ -523,20 +676,30 @@ function createRocketView(request) {
     transition = null;
   }
 
+  function resume() {
+    if (shown && !document.hidden && !connectionError) feed.show();
+    invalidate();
+  }
+
   document.addEventListener("visibilitychange", () => {
     if (!shown) return;
     if (document.hidden) suspend();
-    else if (!connectionError) feed.show();
-    invalidate();
+    else resume();
   });
+  window.addEventListener("pagehide", suspend);
+  window.addEventListener("pageshow", resume);
+  window.addEventListener("offline", () => {
+    feed.stopRepeat("connection");
+    renderControls();
+  });
+  window.addEventListener("online", renderControls);
   motion.addEventListener("change", invalidate);
   new ResizeObserver(invalidate).observe(chart);
 
   return {
     show() {
       shown = true;
-      if (!document.hidden && !connectionError) feed.show();
-      invalidate();
+      resume();
     },
     hide() {
       shown = false;

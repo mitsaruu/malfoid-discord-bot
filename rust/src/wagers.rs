@@ -25,6 +25,22 @@ pub fn place(
 ) -> rusqlite::Result<Result<i64, String>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = place_on(&tx, round, ticket, guild, user, bet, minimum)?;
+    if result.is_ok() {
+        tx.commit()?;
+    }
+    Ok(result)
+}
+
+pub(crate) fn place_on(
+    tx: &Transaction<'_>,
+    round: u64,
+    ticket: u64,
+    guild: u64,
+    user: u64,
+    bet: &str,
+    minimum: i64,
+) -> rusqlite::Result<Result<i64, String>> {
     let balance: i64 = tx.query_row(
         "SELECT COALESCE(balance, 0) FROM economy WHERE guild_id = ?1 AND user_id = ?2",
         params![guild as i64, user as i64],
@@ -45,8 +61,7 @@ pub fn place(
         "INSERT INTO game_wagers (ticket, round_id, guild_id, user_id, amount) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![ticket as i64, round as i64, guild as i64, user as i64, amount],
     )?;
-    change_balance(&tx, guild, user, -amount)?;
-    tx.commit()?;
+    change_balance(tx, guild, user, -amount)?;
     Ok(Ok(amount))
 }
 
@@ -118,6 +133,22 @@ pub fn refund(db: &Database, round: Option<u64>) -> rusqlite::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_table_reservation_can_roll_back_every_player() {
+        let db = Database::in_memory().unwrap();
+        db.wallet(1, 2, "first", 500).unwrap();
+        db.wallet(1, 3, "second", 50).unwrap();
+        {
+            let mut connection = db.lock();
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+            assert_eq!(place_on(&tx, 7, 10, 1, 2, "100", 10).unwrap(), Ok(100));
+            assert!(place_on(&tx, 7, 11, 1, 3, "100", 10).unwrap().is_err());
+        }
+        assert_eq!(db.wallet(1, 2, "first", 500).unwrap().0, 500);
+        assert_eq!(db.wallet(1, 3, "second", 50).unwrap().0, 50);
+        assert_eq!(refund(&db, Some(7)).unwrap(), 0);
+    }
 
     #[test]
     fn incomplete_or_duplicate_settlement_cannot_pay_and_refund_only_applies_once() {

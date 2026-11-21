@@ -128,6 +128,33 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
 .rocket-secondary { padding: 5px 8px; font-size: 11px; font-weight: 650; }
 .rocket-secondary:hover:not(:disabled) { background: #382b4b; }
 .rocket-form fieldset:disabled { opacity: .67; }
+.rocket-repeat {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rocket-line);
+}
+.rocket-repeat-setup {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+}
+.rocket-repeat-setup label { font-size: 13px; font-weight: 680; }
+.rocket-repeat-setup button { grid-column: 1 / -1; }
+.rocket-repeat-setup select {
+  min-height: 39px;
+  padding: 5px;
+  border: 1px solid #494059;
+  border-radius: 7px;
+  color: inherit;
+  color-scheme: dark;
+  background: #231c30;
+  font: inherit;
+}
+.rocket-repeat :is(button, select):disabled { opacity: .67; }
+.rocket-repeat p { margin: 0; color: var(--rocket-muted); font-size: 12px; }
 .rocket-primary {
   display: block;
   min-height: 46px;
@@ -145,7 +172,7 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
 .rocket[data-phase="flying"] .rocket-primary { background: #8ff4ca; }
 .rocket-primary:hover:not([aria-disabled="true"]) { filter: brightness(1.1); box-shadow: 0 2px 16px #ccafff40; }
 .rocket-primary[aria-disabled="true"] { background: #322840; color: #c5b8d8; cursor: default; }
-.rocket :is(input, button):focus-visible { outline: 2px solid #dfccff; outline-offset: 2px; }
+.rocket :is(input, button, select):focus-visible { outline: 2px solid #dfccff; outline-offset: 2px; }
 .rocket input[aria-invalid="true"] { border-color: #ffac94; }
 
 @keyframes rocket-signal { 50% { opacity: .55; box-shadow: 0 0 3px var(--rocket-accent); } }

@@ -34,6 +34,9 @@ mod music_qol;
 mod reminders;
 mod reply;
 mod rocket;
+mod casino_solo;
+mod poker;
+mod table_blackjack;
 mod roulette;
 mod shop;
 #[cfg(feature = "voice")]
@@ -70,6 +73,9 @@ pub struct Data {
     pub db: std::sync::Arc<db::Database>,
     pub economy: economy::EconomySettings,
     pub rocket: rocket::State,
+    pub casino_solo: casino_solo::State,
+    pub poker: poker::State,
+    pub table_blackjack: table_blackjack::State,
     pub roulette: roulette::State,
     pub pets: pets::PetSettings,
     pub shop: shop::State,
@@ -125,6 +131,9 @@ impl Data {
             db: std::sync::Arc::new(database),
             economy: economy::EconomySettings::load(settings),
             rocket: Default::default(),
+            casino_solo: Default::default(),
+            poker: Default::default(),
+            table_blackjack: Default::default(),
             roulette: Default::default(),
             pets: pets::PetSettings::load(settings),
             shop: Default::default(),

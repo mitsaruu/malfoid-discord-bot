@@ -6,12 +6,13 @@
   <title>Wortjagd</title>
   <link rel="stylesheet" href="static/style.css">
   <link rel="stylesheet" href="static/rocket.css">
+  <link rel="stylesheet" href="static/casino.css">
 </head>
 <body>
   <div class="splash" id="splash">
     <div class="splash-center">
       <div class="splash-logo" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
-      <h2>Ракетка · Слово дня</h2>
+      <h2>Игры Malfoid</h2>
       <p class="splash-text" id="splash-text" role="status">Загружаем игры…</p>
       <div class="progress"><div class="progress-bar" id="progress"></div></div>
       <p class="tip"><code>/rocket</code> · <code>/words</code></p>
@@ -22,6 +23,10 @@
   <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru" hidden>
     <button type="button" data-game="words" aria-controls="app" aria-pressed="false">Слово дня</button>
     <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false">Ракетка</button>
+    <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false">Минное поле</button>
+    <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false">Покер</button>
+    <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false">Слоты</button>
+    <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false">Блэкджек</button>
   </nav>
 
   <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
@@ -110,6 +115,11 @@
     </div>
   </main>
 
+  <main class="casino" id="mines" aria-label="Минное поле" lang="ru" hidden></main>
+  <main class="casino" id="poker" aria-label="Покер" lang="ru" hidden></main>
+  <main class="casino" id="slots" aria-label="Слоты" lang="ru" hidden></main>
+  <main class="casino" id="blackjack" aria-label="Блэкджек" lang="ru" hidden></main>
+
   <div class="help" id="help" hidden>
     <div class="help-card">
       <h3>Как играть</h3>
@@ -124,6 +134,10 @@
     </div>
   </div>
   <script src="static/rocket.js"></script>
+  <script src="static/mines.js"></script>
+  <script src="static/poker.js"></script>
+  <script src="static/casino_slots.js"></script>
+  <script src="static/table_blackjack.js"></script>
   <script src="static/app.js"></script>
 </body>
 </html>

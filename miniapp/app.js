@@ -1,4 +1,4 @@
-// Игры в слова и «Ракетка» используют одну Discord Activity и общую сессию.
+// Все игры используют одну Discord Activity и общую сессию.
 // Связь с Discord — по протоколу Embedded App SDK (сообщения postMessage окну Discord),
 // ходы и проверка слов — на сервере бота (/api/...), поэтому загаданное слово страница не знает.
 "use strict";
@@ -39,6 +39,8 @@ let busy = false;     // ждём ответа сервера
 let activeGame = null;
 let rocket = null;
 let reloadWords = false;
+const casinoTitles = { mines: "Минное поле", poker: "Техасский холдем", slots: "Слоты", blackjack: "Блэкджек" };
+const casinoViews = new Map();
 
 const gameSwitch = document.getElementById("game-switch");
 const wordsRetry = document.getElementById("words-retry");
@@ -68,8 +70,15 @@ window.addEventListener("message", (event) => {
       waiter.reject(new Error(reason));
     }
     pending.clear();
+    session = null;
     if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
+    else if (casinoViews.has(activeGame)) {
+      casinoViews.get(activeGame).hide();
+      const root = document.getElementById(activeGame);
+      root.textContent = reason;
+    }
     else setStatus(reason, "error");
+    for (const button of gameSwitch.querySelectorAll("button")) button.disabled = true;
     return;
   }
   if (opcode !== OP.FRAME || !data) return;
@@ -182,7 +191,7 @@ function setLanguage(newLang) {
   lang = newLang;
   const game = GAMES[lang];
   LETTERS = new Set(game.keys.flat().filter((key) => key.length === 1));
-  if (activeGame !== "rocket") {
+  if (activeGame === null || activeGame === "words") {
     document.title = game.name;
     document.documentElement.lang = lang;
   }
@@ -322,12 +331,16 @@ function renderPlayers(data) {
 }
 
 let refreshingPlayers = false;
+function outsideWords() {
+  const game = document.body?.dataset.game;
+  return game && game !== "words";
+}
 async function refreshPlayers() {
-  if (!session || document.hidden || refreshingPlayers || document.body?.dataset.game === "rocket") return;
+  if (!session || document.hidden || refreshingPlayers || outsideWords()) return;
   refreshingPlayers = true;
   try {
     const data = await api("api/players");
-    if (document.body?.dataset.game === "rocket") return;
+    if (outsideWords()) return;
     if (data.lang && data.lang !== lang) return;
     renderPlayers(data);
     // Открытая игра тоже переходит к новому слову после московской полуночи.
@@ -469,17 +482,20 @@ async function loadWords() {
 
 function openGame(game, initialWords) {
   if (game === activeGame) return;
+  if (activeGame === "rocket") rocket?.hide();
+  casinoViews.get(activeGame)?.hide();
   activeGame = game;
   document.body.dataset.game = game;
   const words = game === "words";
   document.getElementById("app").hidden = !words;
   playersEl.hidden = !words;
-  document.getElementById("rocket").hidden = words;
+  document.getElementById("rocket").hidden = game !== "rocket";
+  for (const id of Object.keys(casinoTitles)) document.getElementById(id).hidden = id !== game;
+  helpEl.hidden = true;
   for (const button of gameSwitch.querySelectorAll("button")) {
     button.setAttribute("aria-pressed", String(button.dataset.game === game));
   }
   if (words) {
-    rocket?.hide();
     document.title = GAMES[lang].name;
     document.documentElement.lang = lang;
     if (initialWords) {
@@ -489,8 +505,7 @@ function openGame(game, initialWords) {
       reloadWords = true;
       loadWords();
     }
-  } else {
-    helpEl.hidden = true;
+  } else if (game === "rocket") {
     document.title = "Ракетка";
     document.documentElement.lang = "ru";
     if (rocket) rocket.show();
@@ -499,6 +514,23 @@ function openGame(game, initialWords) {
       document.getElementById("rocket-message").textContent = "Не удалось загрузить игру. Откройте Activity заново.";
       document.getElementById("rocket-action").textContent = "Запуск недоступен";
     }
+  } else {
+    const root = document.getElementById(game);
+    document.title = casinoTitles[game];
+    document.documentElement.lang = "ru";
+    if (!casinoViews.has(game)) {
+      const mount = window.CasinoGames?.[game];
+      if (typeof mount !== "function") {
+        root.textContent = "Не удалось загрузить игру. Откройте Activity заново.";
+        return;
+      }
+      const request = (action, fields = {}) => {
+        if (!session) return Promise.reject(new Error("Соединение с Discord закрыто."));
+        return api(`api/games/${game}/${action}`, fields);
+      };
+      casinoViews.set(game, mount({ root, request }));
+    }
+    casinoViews.get(game).show();
   }
 }
 
