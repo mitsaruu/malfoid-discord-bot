@@ -1,8 +1,9 @@
 "use strict";
 
 const ROCKET_POLL_MS = 500;
-const ROCKET_IDLE_POLL_MS = 2400;
+const ROCKET_RETRY_POLL_MS = 2400;
 const ROCKET_MAX_REPEAT_ROUNDS = 10;
+// These shape the chart for confirmed samples and match the Rust flight phases.
 const ROCKET_DOUBLE_MS = 6000;
 const ROCKET_CINEMATIC_DOUBLE_MS = 600;
 const ROCKET_CRASH_EASE_MS = 160;
@@ -11,7 +12,6 @@ const ROCKET_STATUS = {
   idle: "Готовность к старту",
   countdown: "Обратный отсчёт",
   flying: "В полёте",
-  paid: "Монеты получены",
   crashed: "Авария",
   refunded: "Ставка возвращена",
 };
@@ -21,7 +21,24 @@ function rocketActive(flight) {
 }
 
 function rocketCanCashout(flight) {
-  return flight?.status === "flying" && flight.payout == null;
+  return flight?.status === "flying" && flight.can_cashout === true && flight.stake !== null && flight.payout == null;
+}
+
+function rocketUntilLaunch(flight, sampledAt, timestamp) {
+  return Math.max(0, flight.next_launch_ms - Math.max(0, timestamp - sampledAt));
+}
+
+function rocketCanBet(flight, sampledAt, timestamp) {
+  return flight?.status === "countdown" && flight.can_bet === true && flight.stake === null &&
+    rocketUntilLaunch(flight, sampledAt, timestamp) > 0;
+}
+
+function rocketMaxStake({ balance, max_bet }) {
+  return Math.min(balance, max_bet);
+}
+
+function rocketValidStake(snapshot, stake) {
+  return Number.isSafeInteger(stake) && stake >= snapshot.min_bet && stake <= rocketMaxStake(snapshot);
 }
 
 function rocketMultiplierAt(elapsed, cinematicFrom) {
@@ -47,10 +64,12 @@ function rocketResponse(data) {
   const flight = data?.flight;
   const cinematicFrom = flight?.cinematic_from_ms;
   if (!Number.isFinite(data?.balance) || !Number.isFinite(data.min_bet) || !Number.isFinite(data.max_bet) ||
-      (flight !== null && !(typeof flight?.id === "string" && Object.hasOwn(ROCKET_STATUS, flight.status) &&
-        flight.status !== "idle" && Number.isFinite(flight.elapsed_ms) && Number.isFinite(flight.multiplier) &&
-        (cinematicFrom == null || (Number.isFinite(cinematicFrom) && cinematicFrom >= 0 &&
-          cinematicFrom <= flight.elapsed_ms && flight.payout != null))))) {
+      typeof flight?.id !== "string" || !flight.id || !Object.hasOwn(ROCKET_STATUS, flight.status) ||
+      flight.status === "idle" || !Number.isFinite(flight.elapsed_ms) || !Number.isFinite(flight.multiplier) ||
+      (flight.stake !== null && !(Number.isSafeInteger(flight.stake) && flight.stake > 0)) ||
+      !Number.isFinite(flight.next_launch_ms) || flight.next_launch_ms < 0 ||
+      typeof flight.can_bet !== "boolean" || typeof flight.can_cashout !== "boolean" ||
+      (cinematicFrom != null && (!Number.isFinite(cinematicFrom) || cinematicFrom < 0 || cinematicFrom > flight.elapsed_ms))) {
     throw new Error("Сервер вернул неполные данные полёта.");
   }
   return data;
@@ -71,6 +90,7 @@ function createRocketFeed({
   let actionError = "";
   let repeat = null;
   let repeatNotice = "";
+  let lastStartId = null;
 
   function report() {
     onChange({
@@ -87,16 +107,14 @@ function createRocketFeed({
   }
 
   function repeatReady() {
-    if (!repeat) return false;
-    const { flight, balance, min_bet, max_bet } = snapshot;
+    if (!repeat || needsSync) return false;
+    const { flight } = snapshot;
     if (!canAutoStart()) clearRepeat("connection");
-    else if (flight?.id !== repeat.id || flight.stake !== repeat.stake || flight.auto !== repeat.target) {
-      clearRepeat("changed");
-    } else if (flight.status === "refunded") clearRepeat("refunded");
-    else if (flight.status === "crashed") {
-      if (repeat.stake >= min_bet && repeat.stake <= Math.min(balance, max_bet)) return true;
+    else if (flight.status === "refunded" && flight.stake !== null) clearRepeat("refunded");
+    else if (flight.id !== lastStartId && rocketCanBet(flight, sampledAt, now())) {
+      if (rocketValidStake(snapshot, repeat.stake)) return true;
       clearRepeat("stake");
-    } else if (!rocketActive(flight)) clearRepeat("changed");
+    }
     return false;
   }
 
@@ -108,7 +126,7 @@ function createRocketFeed({
   function schedule(startedAt = now()) {
     clearPoll();
     if (!visible || pending) return;
-    const interval = rocketActive(snapshot?.flight) ? ROCKET_POLL_MS : ROCKET_IDLE_POLL_MS;
+    const interval = needsSync ? ROCKET_RETRY_POLL_MS : ROCKET_POLL_MS;
     timer = setTimer(sync, Math.max(50, interval - (now() - startedAt)));
   }
 
@@ -123,7 +141,6 @@ function createRocketFeed({
     if (!visible || pending || read) return;
     clearPoll();
     const startedAt = now();
-    const previous = snapshot?.flight;
     const current = {};
     read = current;
     if (needsSync) report();
@@ -138,15 +155,14 @@ function createRocketFeed({
     } finally {
       if (read === current) {
         read = null;
-        const ready = repeatReady();
-        if (ready && !rocketActive(previous)) {
+        if (repeatReady()) {
+          repeat.id = snapshot.flight.id;
           repeat.remaining--;
           const { id, stake, target } = repeat;
           void mutate("start", { bet: String(stake), auto: target === null ? null : String(target / 100), expected_id: id }, repeat);
         } else {
           report();
-          // Leave time to see the result and stop, then confirm it with a fresh poll.
-          schedule(ready ? now() : startedAt);
+          schedule(startedAt);
         }
       }
     }
@@ -164,13 +180,13 @@ function createRocketFeed({
         if (repeat === run) clearRepeat("connection");
         return;
       }
+      if (action === "start") lastStartId = body.expected_id;
       accept(await request("api/rocket/" + action, body));
       if (run && repeat === run) {
         const next = snapshot.flight;
-        if (!next || next.id === run.id || next.stake !== run.stake || next.auto !== run.target) clearRepeat("changed");
+        if (next.id !== run.id || next.stake !== run.stake || next.auto !== run.target) clearRepeat("changed");
         else if (next.status === "refunded") clearRepeat("refunded");
         else if (!run.remaining) clearRepeat("complete");
-        else run.id = next.id;
       }
     } catch (error) {
       needsSync = true;
@@ -199,23 +215,24 @@ function createRocketFeed({
       if (clearRepeat("stopped")) report();
     },
     sync,
-    startRepeat(rounds) {
+    startRepeat(rounds, stake = snapshot?.flight.stake, target = snapshot?.flight.auto ?? null) {
       if (!visible || !canAutoStart() || pending || needsSync || repeat ||
           !Number.isInteger(rounds) || rounds < 1 || rounds > ROCKET_MAX_REPEAT_ROUNDS) return;
-      const flight = snapshot?.flight;
-      if (!rocketActive(flight) || !Number.isSafeInteger(flight.stake) || flight.stake <= 0 ||
-          (flight.auto !== null && (!Number.isInteger(flight.auto) || flight.auto < 101 || flight.auto > 999))) return;
-      repeat = { id: flight.id, stake: flight.stake, target: flight.auto, remaining: rounds };
+      if (!Number.isSafeInteger(stake) || stake < snapshot.min_bet || stake > snapshot.max_bet ||
+          (target !== null && (!Number.isInteger(target) || target < 101 || target > 999))) return;
+      repeat = { id: snapshot.flight.id, stake, target, remaining: rounds };
       repeatNotice = "";
       report();
+      // Recheck the round after opting in, even if the cached countdown was open.
+      void sync();
     },
     stopRepeat(notice = "stopped") {
       if (clearRepeat(notice)) report();
     },
     async launch(bet, auto) {
-      if (!visible || pending || needsSync || !snapshot || rocketActive(snapshot.flight)) return;
+      if (!visible || pending || needsSync || !rocketCanBet(snapshot?.flight, sampledAt, now())) return;
       if (!clearRepeat("stopped")) repeatNotice = "";
-      await mutate("start", { bet, auto, expected_id: snapshot.flight?.id ?? null });
+      await mutate("start", { bet, auto, expected_id: snapshot.flight.id });
     },
     async cashout() {
       if (!visible || pending || needsSync || !rocketCanCashout(snapshot?.flight)) return;
@@ -312,7 +329,7 @@ function drawRocketBurst(ctx, x, y, progress, color, crashed) {
 function createRocketChart(canvas) {
   const ctx = canvas.getContext("2d");
   const stars = Array.from({ length: 44 }, (_, i) => [((i * 197 + 71) % 503) / 503, ((i * 71 + 13) % 241) / 241]);
-  const colors = { crashed: "#ff957b", paid: "#7af4c7", refunded: "#ffd690" };
+  const colors = { crashed: "#ff957b", refunded: "#ffd690" };
   const tickFactor = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1 });
   const tickTime = new Intl.NumberFormat("ru-RU");
 
@@ -455,37 +472,36 @@ function createRocketView(request) {
 
   const repeatPanel = document.createElement("section");
   repeatPanel.className = "rocket-repeat";
-  repeatPanel.setAttribute("aria-label", "Автостарт");
+  repeatPanel.setAttribute("aria-label", "Автоставка");
   const repeatSetup = document.createElement("div");
   repeatSetup.className = "rocket-repeat-setup";
-  repeatSetup.hidden = true;
   const repeatLabel = document.createElement("label");
-  repeatLabel.textContent = "Доп. раунды";
+  repeatLabel.textContent = "Раунды";
   repeatLabel.htmlFor = "rocket-repeat-rounds";
   const repeatRounds = document.createElement("select");
   repeatRounds.id = "rocket-repeat-rounds";
   repeatRounds.setAttribute("aria-describedby", "rocket-repeat-status");
-  for (let count = 0; count <= ROCKET_MAX_REPEAT_ROUNDS; count++) {
+  for (let count = 1; count <= ROCKET_MAX_REPEAT_ROUNDS; count++) {
     const option = document.createElement("option");
-    option.value = count ? String(count) : "";
-    option.textContent = count ? String(count) : "Выберите";
+    option.value = String(count);
+    option.textContent = option.value;
     repeatRounds.append(option);
   }
+  repeatRounds.value = "1";
   const repeatStart = document.createElement("button");
   repeatStart.type = "button";
   repeatStart.className = "rocket-secondary";
-  repeatStart.textContent = "Включить автостарт";
+  repeatStart.textContent = "Включить автоставку";
   repeatStart.disabled = true;
   repeatSetup.append(repeatLabel, repeatRounds, repeatStart);
   const repeatStop = document.createElement("button");
   repeatStop.type = "button";
   repeatStop.className = "rocket-secondary";
-  repeatStop.textContent = "Остановить автостарт";
+  repeatStop.textContent = "Остановить автоставку";
   repeatStop.hidden = true;
   const repeatStatus = document.createElement("p");
   repeatStatus.id = "rocket-repeat-status";
   repeatStatus.setAttribute("role", "status");
-  repeatStatus.textContent = "Автостарт можно включить во время полёта.";
   repeatPanel.append(repeatSetup, repeatStatus, repeatStop);
   form.insertBefore(repeatPanel, action);
 
@@ -532,69 +548,74 @@ function createRocketView(request) {
       } else {
         crashApproach = null;
       }
-      if (running && status === "countdown") {
-        const drift = Math.min(650, Math.max(0, timestamp - current.sampledAt));
-        visual = { ...confirmed, elapsed: Math.min(0, confirmed.elapsed + drift) };
-      }
     }
-    write(multiplierLabel, displayFactor(confirmed.multiplier));
-    write(clockLabel, status === "countdown" ? "До старта" : "Время полёта");
-    const elapsed = approaching ? confirmed.elapsed : visual.elapsed;
-    write(clock, flight ? seconds.format(Math.abs(elapsed) / 1000) + " с" : "—");
+    const waiting = flight && status !== "flying";
+    const clockTimestamp = current.needsSync ? current.sampledAt : timestamp;
+    const launchIn = waiting ? rocketUntilLaunch(flight, current.sampledAt, clockTimestamp) : 0;
+    write(multiplierLabel, displayFactor(Math.floor(status === "flying" ? visual.multiplier : confirmed.multiplier)));
+    write(clockLabel, status === "countdown" ? "До старта" : waiting ? "До следующего старта" : "Время полёта");
+    const time = waiting ? Math.ceil(launchIn / 100) / 10 : visual.elapsed / 1000;
+    write(clock, flight ? seconds.format(time) + " с" : "—");
+    if (status === "countdown" && launchIn === 0 && action.getAttribute("aria-disabled") === "false") {
+      renderControls(timestamp);
+    }
     draw(approaching ? "flying" : status, visual, flight?.cinematic_from_ms, timestamp, transition, !running);
-    if (running && (rocketActive(flight) ||
+    if (running && (status === "flying" || launchIn > 0 ||
         (transition !== null && timestamp - transition < ROCKET_BURST_MS))) invalidate();
   }
 
-  function maximum(data) {
-    return Math.min(data.balance, data.max_bet);
+  function useCurrentWager(flight) {
+    return rocketActive(flight) && flight.stake !== null;
   }
 
   function repeatTerms(stake, target, rounds) {
-    const cashout = target === null ? "ручной вывод" : "автовывод " + displayFactor(target);
+    const cashout = target == null ? "ручной вывод" : "автовывод " + displayFactor(target);
     const limit = rounds ? " Лимит ставок — " + number.format(stake * rounds) + " мон." : "";
     return number.format(stake) + " мон. за раунд, " + cashout + "." + limit;
   }
 
-  function renderRepeat(flight, locked) {
-    const { repeat, repeatNotice, pending } = current;
-    const active = rocketActive(flight);
-    repeatSetup.hidden = !active || Boolean(repeat);
+  function renderRepeat(flight, locked, lowBalance) {
+    const { repeat, repeatNotice, pending, snapshot } = current;
+    const useWager = useCurrentWager(flight);
+    repeatSetup.hidden = Boolean(repeat);
     repeatStop.hidden = !repeat;
-    repeatRounds.disabled = locked || !canAutoStart();
+    repeatRounds.disabled = locked || Boolean(repeat) || (lowBalance && !useWager);
     repeatStart.disabled = repeatRounds.disabled || !repeatRounds.value;
 
     const notices = {
-      stopped: "Автостарт остановлен.",
-      connection: "Автостарт прерван. Для продолжения включите его заново.",
-      changed: "Автостарт остановлен: раунд изменился.",
-      refunded: "Автостарт остановлен: ставка возвращена.",
-      stake: "Автостарт остановлен: ставка недоступна.",
-      complete: "Автостарт завершён. Лимит раундов исчерпан.",
+      stopped: "Автоставка остановлена.",
+      connection: "Автоставка прервана. Для продолжения включите её заново.",
+      changed: "Автоставка остановлена. Проверьте ставку текущего раунда.",
+      refunded: "Автоставка остановлена. Ставка возвращена.",
+      stake: "Автоставка остановлена. Сумма ставки недоступна.",
+      complete: "Автоставка завершена. Лимит раундов исчерпан.",
     };
-    let status = notices[repeatNotice] || "Автостарт можно включить во время полёта.";
+    const notice = notices[repeatNotice] || "";
+    let status = notice || "Выберите число раундов для автоматических ставок.";
     if (repeat) {
       const progress = pending === "start" ?
-        "Запускаем раунд. После него осталось: " : "Автостарт включён. Осталось раундов: ";
+        "Принимаем ставку. После неё осталось раундов: " : "Автоставка включена. Осталось раундов: ";
       status = progress + repeat.remaining + ". " + repeatTerms(repeat.stake, repeat.target, repeat.remaining);
-    } else if (active && repeatRounds.value) {
-      status = repeatTerms(flight.stake, flight.auto, Number(repeatRounds.value));
-    } else if (active && !repeatNotice) {
-      status = repeatTerms(flight.stake, flight.auto, 0);
+    } else if (snapshot) {
+      const wager = useWager ? { stake: flight.stake, target: flight.auto } : readWager(snapshot);
+      if (wager) status = (notice ? notice + " " : "") + repeatTerms(wager.stake, wager.target, Number(repeatRounds.value));
     }
     write(repeatStatus, status);
   }
 
-  function renderControls() {
+  function renderControls(timestamp = performance.now()) {
     const { snapshot, pending, needsSync, syncing, syncError, actionError } = current;
     const flight = snapshot?.flight;
     const status = flight?.status || "idle";
-    const active = rocketActive(flight);
+    const hasStake = flight?.stake != null;
     const paid = flight?.payout != null && status !== "refunded";
-    const cinematic = paid && flight.cinematic_from_ms != null;
-    const lowBalance = snapshot && maximum(snapshot) < snapshot.min_bet;
-    const locked = Boolean(connectionError || pending || needsSync || !snapshot);
-    const actionEnabled = !locked && (rocketCanCashout(flight) || (!active && !lowBalance));
+    const cinematic = flight?.cinematic_from_ms != null;
+    const lowBalance = snapshot && rocketMaxStake(snapshot) < snapshot.min_bet;
+    const locked = Boolean(!canAutoStart() || pending || needsSync || !snapshot);
+    const canBet = rocketCanBet(flight, current.sampledAt, timestamp);
+    const canCashout = rocketCanCashout(flight);
+    const lost = hasStake && !paid && (status === "crashed" || (status === "flying" && !canCashout));
+    const actionEnabled = !locked && (canCashout || (canBet && !lowBalance));
     root.dataset.phase = status;
     root.dataset.cashedOut = String(paid);
     root.dataset.cinematic = String(cinematic);
@@ -602,25 +623,25 @@ function createRocketView(request) {
       snapshot ? ROCKET_STATUS[status] : "Подключение");
     write(multiplierCaption, status === "crashed" ? "Пик полёта" : cinematic ? "Кинополёт" : "Коэффициент");
     write(balance, snapshot ? number.format(snapshot.balance) + " мон." : "—");
-    settings.hidden = active;
-    settings.disabled = locked || active || lowBalance;
+    settings.hidden = useCurrentWager(flight);
+    settings.disabled = locked || settings.hidden || lowBalance;
     action.setAttribute("aria-disabled", String(!actionEnabled));
-    const actionText = pending === "start" ? "Готовим запуск…" : pending === "cashout" ? "Забираем монеты…" :
+    const actionText = pending === "start" ? "Принимаем ставку…" : pending === "cashout" ? "Забираем монеты…" :
       connectionError ? "Соединение закрыто" : needsSync ? "Подключение…" :
-      status === "countdown" ? "Ждём старта…" : status === "flying" ? (paid ? "Ждём конца полёта…" : "Забрать монеты") :
-      lowBalance ? "Недостаточно монет" : "Запустить ракету";
+      canCashout ? "Забрать монеты" : canBet ? (lowBalance ? "Недостаточно монет" : "Поставить") :
+      status === "countdown" && hasStake ? "Ставка принята" :
+      status === "countdown" ? "Ждём старта…" : status === "flying" ? "Ждём конца полёта…" : "Ждём следующий раунд…";
     write(action, actionText);
     retry.hidden = !syncError || Boolean(connectionError);
     retry.disabled = Boolean(syncing || pending);
-    renderRepeat(flight, locked);
 
-    get("flight").hidden = !flight;
-    if (flight) {
+    get("flight").hidden = !hasStake;
+    if (hasStake) {
       write(get("stake"), number.format(flight.stake) + " мон.");
       write(get("target"), flight.auto == null ? "Выключен" : displayFactor(flight.auto));
       get("payout-row").hidden = flight.payout == null;
       const payoutLabel = status === "refunded" ? "Возврат" : flight.automatic ? "Автовыплата" : "Выплата";
-      const cashoutMultiplier = flight.cashout_multiplier ?? (status === "paid" ? flight.multiplier : null);
+      const cashoutMultiplier = flight.cashout_multiplier;
       write(get("payout-label"), cashoutMultiplier == null ? payoutLabel : payoutLabel + " · " + displayFactor(cashoutMultiplier));
       if (flight.payout != null) write(get("payout"), number.format(flight.payout) + " мон.");
     }
@@ -628,28 +649,30 @@ function createRocketView(request) {
     if (snapshot) {
       if (!bet.value && !bet.dataset.edited) bet.value = String(snapshot.min_bet);
       write(get("bet-hint"), lowBalance ? "Минимальная ставка — " + number.format(snapshot.min_bet) + " мон." :
-        number.format(snapshot.min_bet) + "–" + number.format(maximum(snapshot)) + " мон.");
+        number.format(snapshot.min_bet) + "–" + number.format(rocketMaxStake(snapshot)) + " мон.");
     }
+    renderRepeat(flight, locked, lowBalance);
 
     const result = {
       idle: "Укажите ставку перед стартом.",
-      countdown: "Вывод станет доступен после старта.",
-      flying: cinematic ? "Выплата зафиксирована. Продолжается кинополёт." :
+      countdown: hasStake ? "Вывод станет доступен после старта." :
+        canBet ? "Ставки принимаются до старта." : "Ожидаем старта раунда.",
+      flying: cinematic && paid ? "Выплата зафиксирована. Продолжается кинополёт." :
         paid ? (flight.automatic ? "Автовывод сработал. Полёт продолжается." :
-        "Монеты зачислены. Полёт продолжается.") : "Вывод подтверждает сервер в момент запроса.",
-      paid: flight?.automatic ? "Автовывод сработал." : "Монеты зачислены на баланс.",
-      crashed: paid ? "Ракета разбилась. Выплата уже на балансе." : "Ракета потеряна вместе со ставкой.",
-      refunded: "Монеты возвращены на баланс.",
+        "Монеты зачислены. Полёт продолжается.") : canCashout ? "Вывод подтверждает сервер в момент запроса." :
+        "Ставки откроются в следующем раунде.",
+      crashed: paid ? "Ракета разбилась. Выплата уже на балансе." : "Ставки откроются в следующем раунде.",
+      refunded: hasStake ? "Монеты возвращены на баланс." : "Ставки откроются в следующем раунде.",
     };
     const error = connectionError || syncError || fieldError || actionError;
     message.dataset.tone = error ? "error" : status;
-    write(message, error || (needsSync ? "Обновляем данные полёта…" : result[status]));
+    const feedback = error || (needsSync ? "Обновляем данные полёта…" : result[status]);
+    write(message, !needsSync && lost ? "Ставка проиграна" + (error ? ". " + error : "") : feedback);
   }
 
   function update(view) {
     const previous = current.snapshot?.flight;
     const next = view.snapshot?.flight;
-    if (next?.id !== previous?.id) repeatRounds.value = "";
     if (next?.id !== previous?.id || next?.status !== previous?.status) {
       const sameFlight = shown && previous && previous.id === next?.id;
       transition = sameFlight && rocketActive(previous) && !rocketActive(next) ? view.sampledAt : null;
@@ -684,6 +707,22 @@ function createRocketView(request) {
     renderControls();
   }
 
+  function readWager(data, showError = false) {
+    const rawStake = bet.value.trim().replace(/\s+/g, "");
+    const stake = Number(rawStake);
+    if (!/^\d+$/.test(rawStake) || !rocketValidStake(data, stake)) {
+      if (showError) invalid(bet, "Введите целое число монет от " + number.format(data.min_bet) +
+        " до " + number.format(rocketMaxStake(data)) + ".");
+      return null;
+    }
+    const rawTarget = auto.value.trim().replace(",", ".");
+    if (rawTarget && (!/^[1-9](?:\.\d{1,2})?$/.test(rawTarget) || Number(rawTarget) < 1.01)) {
+      if (showError) invalid(auto, "Введите коэффициент от 1,01× до 9,99× или оставьте поле пустым.");
+      return null;
+    }
+    return { stake, target: rawTarget ? Math.round(Number(rawTarget) * 100) : null };
+  }
+
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     if (action.getAttribute("aria-disabled") === "true") return;
@@ -692,18 +731,10 @@ function createRocketView(request) {
       feed.cashout();
       return;
     }
-    const stake = bet.value.trim().replace(/\s+/g, "");
-    if (!/^\d+$/.test(stake) || Number(stake) < data.min_bet || Number(stake) > maximum(data)) {
-      invalid(bet, "Введите целое число монет от " + number.format(data.min_bet) + " до " + number.format(maximum(data)) + ".");
-      return;
-    }
-    const target = auto.value.trim().replace(",", ".");
-    if (target && (!/^[1-9](?:\.\d{1,2})?$/.test(target) || Number(target) < 1.01)) {
-      invalid(auto, "Введите коэффициент от 1,01× до 9,99× или оставьте поле пустым.");
-      return;
-    }
+    const wager = readWager(data, true);
+    if (!wager) return;
     clearFieldError();
-    feed.launch(stake, target || null);
+    feed.launch(String(wager.stake), wager.target === null ? null : String(wager.target / 100));
   });
 
   bet.addEventListener("input", () => {
@@ -714,22 +745,30 @@ function createRocketView(request) {
   for (const shortcut of ["min", "max"]) {
     get(shortcut).addEventListener("click", () => {
       const data = current.snapshot;
-      bet.value = String(shortcut === "min" ? data.min_bet : maximum(data));
+      bet.value = String(shortcut === "min" ? data.min_bet : rocketMaxStake(data));
       bet.dataset.edited = "true";
       clearFieldError();
     });
   }
   retry.addEventListener("click", feed.sync);
-  repeatRounds.addEventListener("change", renderControls);
+  repeatRounds.addEventListener("change", () => renderControls());
   repeatStart.addEventListener("click", () => {
+    if (repeatStart.disabled) return;
+    const data = current.snapshot;
     const rounds = Number(repeatRounds.value);
-    repeatRounds.value = "";
-    feed.startRepeat(rounds);
+    const wager = useCurrentWager(data.flight) ? { stake: data.flight.stake, target: data.flight.auto ?? null } :
+      readWager(data, true);
+    if (!wager) return;
+    clearFieldError();
+    feed.startRepeat(rounds, wager.stake, wager.target);
+    if (!repeatStop.hidden) repeatStop.focus();
   });
-  repeatStop.addEventListener("click", () => feed.stopRepeat());
+  repeatStop.addEventListener("click", () => {
+    feed.stopRepeat();
+    if (!repeatStart.disabled) repeatStart.focus();
+  });
 
   function suspend() {
-    repeatRounds.value = "";
     feed.hide();
     cancelAnimationFrame(frame);
     frame = null;
@@ -754,7 +793,10 @@ function createRocketView(request) {
     feed.stopRepeat("connection");
     renderControls();
   });
-  window.addEventListener("online", renderControls);
+  window.addEventListener("online", () => {
+    renderControls();
+    if (canAutoStart()) feed.sync();
+  });
   motion.addEventListener("change", invalidate);
   new ResizeObserver(invalidate).observe(chart);
 

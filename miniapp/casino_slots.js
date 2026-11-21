@@ -42,6 +42,7 @@
   const reels = Array.from({ length: 5 }, (_, column) => {
     const frame = element("div", "slots-reel");
     const strip = element("div", "slots-strip");
+    strip.style.position = "relative";
     strip.setAttribute("role", "group");
     strip.setAttribute("aria-label", `Барабан ${column + 1}`);
     const cells = Array.from({ length: 3 }, () => {
@@ -79,7 +80,7 @@
   let ready = false;
   let snapshot = null;
   let reading = null;
-  let animations = [];
+  const motions = new Map();
   let selectedLine = null;
   let lineButtons = [];
   let message = "";
@@ -138,21 +139,25 @@
     if (!bet.value) bet.value = String(result.min_bet);
   }
 
-  function paintReels(highlight = true) {
-    const result = snapshot?.spin;
-    for (const [column, reel] of reels.entries()) {
-      for (const [row, cell] of reel.cells.entries()) {
-        const symbol = result ? snapshot.symbols[result.grid[row][column]] : null;
-        const winning = highlight && result?.wins.some(({ line, count }) => {
-          return column < count && snapshot.paylines[line].rows[column] === row;
-        });
-        const marked = highlight && selectedLine !== null && snapshot.paylines[selectedLine].rows[column] === row;
-        cell.classList.toggle("slots-symbol--win", Boolean(winning));
-        cell.classList.toggle("slots-symbol--marked", marked);
-        cell.classList.toggle("slots-symbol--empty", !symbol);
-        setText(cell, symbol?.icon ?? "·");
-        cell.setAttribute("aria-label", symbol ? `${symbol.name}${winning ? ", выигрыш" : ""}` : "Пусто");
-      }
+  function paintReel(data, column, highlight) {
+    const result = data?.spin;
+    for (const [row, cell] of reels[column].cells.entries()) {
+      const symbol = result ? data.symbols[result.grid[row][column]] : null;
+      const winning = highlight && result?.wins.some(({ line, count }) => {
+        return column < count && data.paylines[line].rows[column] === row;
+      });
+      const marked = highlight && selectedLine !== null && data.paylines[selectedLine].rows[column] === row;
+      cell.classList.toggle("slots-symbol--win", Boolean(winning));
+      cell.classList.toggle("slots-symbol--marked", marked);
+      cell.classList.toggle("slots-symbol--empty", !symbol);
+      setText(cell, symbol?.icon ?? "·");
+      cell.setAttribute("aria-label", symbol ? `${symbol.name}${winning ? ", выигрыш" : ""}` : "Пусто");
+    }
+  }
+
+  function paintReels() {
+    for (let column = 0; column < reels.length; column++) {
+      paintReel(snapshot, column, true);
     }
   }
 
@@ -191,20 +196,82 @@
     ));
   }
 
-  function stopAnimation() {
-    for (const animation of animations) animation.cancel();
-    animations = [];
+  function removeTrack(column) {
+    const motion = motions.get(column);
+    if (!motion) return;
+    motions.delete(column);
+    const { reel, track, animation } = motion;
+    animation?.cancel();
+    track.remove();
+    for (const cell of reel.cells) cell.style.visibility = "";
   }
 
-  async function animateReels() {
-    if (reducedMotion.matches || typeof reels[0].strip.animate !== "function") return;
-    animations = reels.map(({ strip }, index) => strip.animate([
-      { transform: "translateY(-85%)", filter: "blur(3px)", opacity: 0.3 },
-      { transform: "translateY(7%)", filter: "blur(0px)", opacity: 1, offset: 0.83 },
-      { transform: "translateY(0)", filter: "blur(0px)", opacity: 1 },
-    ], { duration: 320 + index * 75, easing: "ease-out", fill: "backwards" }));
-    await Promise.allSettled(animations.map((animation) => animation.finished));
-    animations = [];
+  function stopAnimation() {
+    for (const column of motions.keys()) removeTrack(column);
+  }
+
+  function moveTrack(track, gap, from, to, options) {
+    // The overlay stays three rows tall. Each step is one third of its height plus a third of a gap.
+    const keyframes = [from, to].map((rows) => ({
+      transform: `translateY(calc(-${rows * 100 / 3}% - ${rows * gap / 3}px))`,
+    }));
+    return track.animate(keyframes, options);
+  }
+
+  function fillTrack(track, icons) {
+    track.replaceChildren(...icons.map((icon) => element("span", "slots-symbol", icon)));
+  }
+
+  function startAnimation() {
+    if (reducedMotion.matches || typeof reels[0].strip.animate !== "function" || !snapshot.symbols.length) return;
+    const icons = snapshot.symbols.map(({ icon }) => icon);
+    const gap = parseFloat(window.getComputedStyle(reels[0].strip).rowGap) || 0;
+    for (const [column, reel] of reels.entries()) {
+      const track = element("div", "slots-strip");
+      track.setAttribute("aria-hidden", "true");
+      Object.assign(track.style, {
+        position: "absolute",
+        inset: "0",
+        rowGap: `${gap}px`,
+        gridAutoRows: `calc((100% - ${2 * gap}px) / 3)`,
+      });
+      const iconAt = (row) => icons[(row + column * 2) % icons.length];
+      const duration = icons.length * (65 + column * 6);
+      const motion = { reel, track, animation: null, gap, iconAt, duration, length: icons.length };
+      motions.set(column, motion);
+      fillTrack(track, Array.from({ length: icons.length + 3 }, (_, row) => iconAt(row)));
+      reel.strip.append(track);
+      for (const cell of reel.cells) cell.style.visibility = "hidden";
+      motion.animation = moveTrack(track, gap, 0, icons.length, { duration, iterations: Infinity });
+    }
+  }
+
+  async function settleReels(data) {
+    if (!data.spin) return;
+    await Promise.all([...motions].map(async ([column, motion]) => {
+      try {
+        const { track, gap, iconAt, duration, length } = motion;
+        // Keep the visible symbols and their fractional offset when switching to the stop animation.
+        const position = ((motion.animation.currentTime ?? 0) % duration) / duration * length;
+        const row = Math.floor(position);
+        const steps = 5 + column;
+        const icons = Array.from({ length: steps }, (_, index) => iconAt(row + index));
+        for (const resultRow of data.spin.grid) icons.push(data.symbols[resultRow[column]].icon);
+        motion.animation.cancel();
+        fillTrack(track, icons);
+        motion.animation = moveTrack(track, gap, position - row, steps, {
+          duration: 540 + column * 150,
+          easing: "cubic-bezier(.25,.4,.55,1)",
+          fill: "both",
+        });
+        await motion.animation.finished;
+        paintReel(data, column, false);
+      } catch {
+        // The final render still paints the receipt if animation is canceled or unavailable.
+      } finally {
+        removeTrack(column);
+      }
+    }));
   }
 
   reducedMotion.addEventListener("change", (event) => {
@@ -240,12 +307,16 @@
     message = "";
     render();
     try {
-      accept(await request("spin", { bet: bet.value, expected_round: expected }));
-      if (visible) {
-        paintReels(false);
-        await animateReels();
-      }
+      startAnimation();
+    } catch {
+      stopAnimation();
+    }
+    try {
+      const result = await request("spin", { bet: bet.value, expected_round: expected });
+      await settleReels(result);
+      accept(result);
     } catch (error) {
+      stopAnimation();
       ready = false;
       message = error.message || "Ответ о вращении не получен.";
       try {
@@ -255,6 +326,7 @@
         failure = "Проверь последний результат перед новой ставкой.";
       }
     } finally {
+      stopAnimation();
       busy = false;
       if (visible) render();
     }

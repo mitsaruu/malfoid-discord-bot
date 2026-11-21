@@ -3,6 +3,8 @@
   const ranks = ["Старшая карта", "Пара", "Две пары", "Тройка", "Стрит", "Флеш",
     "Фулл-хаус", "Каре", "Стрит-флеш"];
   const suits = { "♣": "clubs", "♦": "diamonds", "♥": "hearts", "♠": "spades" };
+  const royalName = "Роял-флеш";
+  const royalRanks = ["10", "J", "Q", "K", "A"];
   const moves = { fold: "пас", check: "чек", call: "колл", bet: "ставка", raise: "рейз", all_in: "олл-ин" };
   const fmt = new Intl.NumberFormat("ru-RU");
   const amount = (value) => fmt.format(value);
@@ -25,7 +27,7 @@
     if (element.textContent !== label) element.textContent = label;
   }
 
-  function makeCards(cards, { count = 0, community = false, dealFrom = Infinity, delay = 0 } = {}) {
+  function makeCards(cards, { count = 0, community = false, queueDeal } = {}) {
     const row = node("div", "", "casino-cards");
     for (const [index, label] of (cards || Array(count).fill(null)).entries()) {
       const card = node("span", label, "casino-card");
@@ -38,13 +40,51 @@
         card.setAttribute("role", "img");
         card.setAttribute("aria-label", "Закрытая карта");
       }
-      if (index >= dealFrom && (label || !community)) {
-        card.classList.add("casino-card--dealt");
-        card.style.setProperty("--casino-deal-delay", `${delay + (index - dealFrom) * 44}ms`);
-      }
+      if (label || !community) queueDeal?.(card, index);
       row.append(card);
     }
     return row;
+  }
+
+  function rankName(seat, board) {
+    if (seat.rank === 8) {
+      const cards = new Set([...board, ...(seat.cards ?? [])]);
+      if (Object.keys(suits).some((suit) => royalRanks.every((rank) => cards.has(rank + suit)))) {
+        return royalName;
+      }
+    }
+    return ranks[seat.rank];
+  }
+
+  function makeRankGuide() {
+    const guide = node("details", "", "casino-panel poker-rank-guide");
+    const examples = [
+      [royalName, royalRanks.map((rank) => rank + "♠")],
+      [ranks[8], ["5♥", "6♥", "7♥", "8♥", "9♥"]],
+      [ranks[7], ["Q♠", "Q♥", "Q♦", "Q♣", "5♠"]],
+      [ranks[6], ["J♠", "J♥", "J♦", "4♠", "4♣"]],
+      [ranks[5], ["2♦", "5♦", "8♦", "J♦", "K♦"]],
+      [ranks[4], ["5♠", "6♥", "7♦", "8♣", "9♥"]],
+      [ranks[3], ["7♠", "7♥", "7♦", "J♣", "2♠"]],
+      [ranks[2], ["K♠", "K♥", "4♦", "4♣", "9♠"]],
+      [ranks[1], ["9♠", "9♥", "A♦", "J♣", "3♠"]],
+      [ranks[0], ["A♠", "J♥", "8♦", "5♣", "2♠"]],
+    ];
+    const list = node("ol");
+    for (const [name, cards] of examples) {
+      const item = node("li");
+      const example = node("div", "", "poker-rank-example");
+      example.append(node("strong", name), makeCards(cards));
+      item.append(example);
+      list.append(item);
+    }
+    guide.append(
+      node("summary", "Комбинации покера"),
+      node("p", "От сильнейшей к слабейшей. В холдеме играют лучшие пять карт из семи. Роял-флеш — стрит-флеш от десятки до туза."),
+      list,
+      node("p", "Масти равны. Туз младший только в стрите A–2–3–4–5. При одинаковом типе комбинации сравнивают её ранги, затем кикеры, если они есть. Если лучшие пять карт равны, банк делится."),
+    );
+    return guide;
   }
 
   const modeBar = node("div", "", "casino-toolbar casino-modes");
@@ -63,6 +103,9 @@
   const tableStatus = node("header", "", "casino-table-status");
   tableStatus.append(status, clock);
   const board = node("div", "", "poker-board");
+  const boardTop = node("div", "", "poker-board-top");
+  const deck = node("span", "", "casino-deck");
+  deck.setAttribute("aria-hidden", "true");
   const last = node("p", "", "poker-last");
   const seats = node("div", "", "poker-seats");
   const felt = node("div", "", "poker-felt");
@@ -111,7 +154,7 @@
 
   const feedback = node("p", "", "casino-feedback");
   feedback.setAttribute("role", "status");
-  root.replaceChildren(header, modeBar, tablePanel, controls, feedback, results, previous);
+  root.replaceChildren(header, modeBar, tablePanel, controls, feedback, results, previous, makeRankGuide());
 
   let visible = false;
   let mode = "online";
@@ -125,7 +168,21 @@
   let tableKey;
   let raiseKey;
 
-  function renderTable(table, previous) {
+  function animateDeal(cards) {
+    if (!cards.length || document.hidden || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const origin = deck.getBoundingClientRect();
+    const destinations = cards.map((card) => card.getBoundingClientRect());
+    const stagger = Math.min(90, 650 / Math.max(1, cards.length - 1));
+    cards.forEach((card, index) => {
+      const target = destinations[index];
+      card.style.setProperty("--casino-deal-x", `${origin.left - target.left + (origin.width - target.width) / 2}px`);
+      card.style.setProperty("--casino-deal-y", `${origin.top - target.top + (origin.height - target.height) / 2}px`);
+      card.style.setProperty("--casino-deal-delay", `${index * stagger}ms`);
+      card.classList.add("casino-card--dealt");
+    });
+  }
+
+  function renderTable(table, previous, action) {
     const tableData = { ...table };
     delete tableData.remaining_ms;
     const key = table ? JSON.stringify(tableData) : state ? mode : "loading";
@@ -136,15 +193,23 @@
     results.replaceChildren();
     results.hidden = true;
     last.hidden = true;
+    boardTop.replaceChildren(deck);
     if (table && table.status !== "lobby") {
-      board.append(node("p", `Банк · ${amount(table.pot)}`, "poker-pot"));
+      boardTop.prepend(node("p", `Банк · ${amount(table.pot)}`, "poker-pot"));
     }
+    board.append(boardTop);
     const priorTable = previous?.table;
-    const newHand = previous && table && table.status !== "lobby" &&
-      (priorTable?.id !== table.id || priorTable?.status === "lobby");
-    const boardStart = newHand ? 0 : priorTable?.board?.length ?? Infinity;
+    const newHand = table && table.status !== "lobby" && (action === "solo_start" ||
+      (priorTable?.id === table.id && priorTable.status === "lobby"));
+    const continuing = table && priorTable?.id === table.id && priorTable.status === "playing";
+    const boardStart = newHand ? 0 : continuing ? priorTable.board.length : Infinity;
+    const boardDeals = [];
+    const holeDeals = [];
     board.append(makeCards(Array.from({ length: 5 }, (_, i) => table?.board?.[i]), {
-      community: true, dealFrom: boardStart, delay: newHand ? 100 : 0,
+      community: true,
+      queueDeal(card, index) {
+        if (index >= boardStart) boardDeals.push(card);
+      },
     }));
     if (!table) {
       status.textContent = state ? (mode === "online" ? "Свободный стол" : "Тренировка") : "Загрузка…";
@@ -184,8 +249,13 @@
       const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
       player.append(node("p", `${stack} ${amount(seat.stack)} ${chips}`, "casino-seat-stack"));
       if (seat.cards || (!own && table.status === "playing" && !seat.folded)) {
+        // Deal clockwise from the next seat after the dealer, one card per pass.
+        const order = (i - table.dealer - 1 + table.seats.length) % table.seats.length;
         player.append(makeCards(seat.cards, {
-          count: 2, dealFrom: newHand ? 0 : Infinity, delay: Math.min(offset, 5) * 16,
+          count: 2,
+          queueDeal: newHand ? (card, index) => {
+            holeDeals[index * table.seats.length + order] = card;
+          } : undefined,
         }));
       }
       const details = [];
@@ -197,13 +267,12 @@
       if (seat.all_in) details.push("Олл-ин");
       if (table.actor === i) details.push("Ходит");
       if (table.status !== "finished" && seat.street_bet) details.push(`Ставка ${amount(seat.street_bet)}`);
-      if (seat.rank !== null) details.push(ranks[seat.rank]);
+      if (seat.rank !== null) details.push(rankName(seat, table.board));
       if (seat.won) details.push(`Выигрыш ${amount(seat.won)}`);
       if (seat.returned) details.push(`Возврат ${amount(seat.returned)}`);
       if (details.length) player.append(node("p", details.join(" · "), "casino-seat-details"));
       seats.append(player);
     });
-
     if (table.pots?.length) {
       results.hidden = false;
       results.append(node("h2", "Результат"));
@@ -212,6 +281,7 @@
         results.append(node("p", `${i === 0 ? "Основной банк" : `Побочный банк ${i}`} · ${amount(pot.amount)} · ${winners}`));
       }
     }
+    animateDeal([...holeDeals.filter(Boolean), ...boardDeals]);
   }
 
   function renderClock() {
@@ -223,7 +293,7 @@
     setText(clock, `${label} · ${seconds} с`);
   }
 
-  function render(previousState) {
+  function render(previousState, action) {
     const online = mode === "online";
     const table = state?.table;
     const lobby = table?.status === "lobby";
@@ -239,7 +309,7 @@
       ? state ? `Кошелёк сервера · ${amount(state.balance)} монет` : ""
       : state ? `Тренировочные фишки · по ${amount(state.training_stack)} при пополнении` : "";
     setText(account, summary + blinds);
-    renderTable(table, previousState);
+    renderTable(table, previousState, action);
     renderClock();
 
     joinForm.hidden = !online || !state || (table && !finished && (!lobby || seated));
@@ -287,11 +357,10 @@
     }
   }
 
-  function receive(next) {
-    const previousState = state;
+  function receive(next, previousState, action) {
     state = next;
     deadline = performance.now() + (state.table?.remaining_ms || 0);
-    render(previousState);
+    render(previousState, action);
   }
 
   async function poll() {
@@ -302,9 +371,10 @@
     try {
       const next = await request("state", { mode });
       if (!visible || gen !== generation || pendingPoll !== token) return;
+      const previousState = pollError ? undefined : state;
       if (pollError) setText(feedback, "");
       pollError = false;
-      receive(next);
+      receive(next, previousState);
     } catch (error) {
       if (!visible || gen !== generation || pendingPoll !== token) return;
       pollError = true;
@@ -318,6 +388,7 @@
     if (!visible || !state || pendingAction) return;
     const gen = generation;
     const token = {};
+    const previousState = pollError ? undefined : state;
     pendingAction = token;
     pendingPoll = null;
     pollError = false;
@@ -326,7 +397,7 @@
     try {
       const table = state.table;
       const next = await request(action, { mode, table_id: table?.id ?? null, turn: table?.turn, ...extra });
-      if (visible && gen === generation) receive(next);
+      if (visible && gen === generation) receive(next, previousState, action);
     } catch (error) {
       if (visible && gen === generation) setText(feedback, error.message || "Не удалось выполнить ход.");
     } finally {

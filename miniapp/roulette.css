@@ -72,14 +72,13 @@ body[data-game="roulette"] {
   border-radius: 50%;
   filter: drop-shadow(0 6px 10px #0e1419b0);
 }
-.roulette-pointer {
+.roulette-ball {
   position: absolute;
   z-index: 1;
-  left: 50%;
-  top: 5.2%;
   width: 3.2%;
   aspect-ratio: 1;
-  transform: translateX(-50%);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
   border-radius: 50%;
   background: radial-gradient(circle at 35% 24%, #fffdf7, #f3e4c4 48%, #9a7a55 100%);
   box-shadow: 0 2px 6px #000b;

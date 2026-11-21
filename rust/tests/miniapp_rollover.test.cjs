@@ -136,4 +136,10 @@ test('switching games hides the previous view and stops refreshing word data', a
   assert.equal(panels.rocket.hidden, false);
   assert.equal(panels.app.hidden, true);
   assert.equal(context.gameLobby.hidden, true);
+  vm.runInContext('openGame("lobby")', context);
+  await vm.runInContext('refreshPlayers()', context);
+  assert.equal(context.gameLobby.hidden, false);
+  assert.equal(document.body.dataset.game, 'lobby');
+  assert.equal(panels.rocket.hidden, true);
+  assert.equal(calls.at(-1), 'hide rocket');
 });

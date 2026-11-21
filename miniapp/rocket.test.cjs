@@ -9,13 +9,22 @@ const context = vm.createContext({});
 vm.runInContext(source, context);
 const createRocketFeed = vm.runInContext('createRocketFeed', context);
 
-function snapshot(flight = null, balance = 500) {
+function snapshot(flight = emptyRound(), balance = 500) {
   return { balance, min_bet: 10, max_bet: 1000, flight };
 }
 
 function flight(status, overrides = {}) {
-  return { id: '9223372036854775807', status, stake: 100, elapsed_ms: 0,
-    multiplier: 100, auto: null, payout: null, automatic: false, ...overrides };
+  const result = { id: '9223372036854775807', status, stake: 100, elapsed_ms: 0,
+    multiplier: 100, auto: null, payout: null, automatic: false, next_launch_ms: 25000, ...overrides };
+  return {
+    can_bet: status === 'countdown' && result.stake === null,
+    can_cashout: status === 'flying' && result.stake !== null && result.payout === null,
+    ...result,
+  };
+}
+
+function emptyRound(id = '9223372036854775807', status = 'countdown', overrides = {}) {
+  return flight(status, { id, stake: null, ...overrides });
 }
 
 function transport() {
@@ -32,6 +41,7 @@ function transport() {
       return nextTimer;
     },
     clearTimer: (id) => timers.delete(id),
+    advance(ms) { clock += ms; },
     tick() {
       const [id, { callback, delay }] = timers.entries().next().value;
       timers.delete(id);
@@ -88,6 +98,9 @@ function viewFixture(reducedMotion = false) {
     value = '';
     attributes = new Map();
     setAttribute(name, value) { this.attributes.set(name, value); }
+    getAttribute(name) { return this.attributes.get(name); }
+    removeAttribute(name) { this.attributes.delete(name); }
+    focus() { this.focused = true; }
     append(...children) { this.children.push(...children); }
     insertBefore(child, reference) { this.children.splice(this.children.indexOf(reference), 0, child); }
     getContext() { return canvas; }
@@ -131,65 +144,187 @@ function viewFixture(reducedMotion = false) {
   };
 }
 
-test('start uses server flight ID and optional auto, and ignores a late state poll', async () => {
+test('a spectator can opt into AutoBet using the form before making any wager', async () => {
+  const f = viewFixture();
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying')));
+  const action = f.elements.get('rocket-action');
+  assert.equal(action.getAttribute('aria-disabled'), 'true');
+  assert.equal(f.elements.get('rocket-flight').hidden, true);
+  assert.equal(f.settings.hidden, false);
+  assert.equal(f.setup.hidden, false);
+  assert.equal(f.rounds.value, '1');
+  assert.equal(f.start.disabled, false);
+  const bet = f.elements.get('rocket-bet');
+  bet.value = '70';
+  bet.dispatchEvent(new Event('input'));
+  const auto = f.elements.get('rocket-auto');
+  auto.value = '1,75';
+  auto.dispatchEvent(new Event('input'));
+  f.rounds.value = '2';
+  f.rounds.dispatchEvent(new Event('change'));
+  assert.match(f.status.textContent, /70 мон.*1,75×.*140 мон/);
+  assert.equal(f.start.disabled, false);
+  f.start.dispatchEvent(new Event('click'));
+  assert.equal(f.stop.hidden, false);
+  assert.deepEqual(f.starts(), []);
+  await f.reply(f.requests.at(-1), snapshot(emptyRound('current', 'crashed')));
+  await f.poll(snapshot(emptyRound('next')));
+  assert.deepEqual(f.starts(), [{ bet: '70', auto: '1.75', expected_id: 'next' }]);
+});
+
+test('opening a new scheduled countdown preserves the unsubmitted AutoBet draft', async () => {
+  const f = viewFixture();
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current')));
+  assert.equal(f.start.disabled, false);
+  const bet = f.elements.get('rocket-bet');
+  const auto = f.elements.get('rocket-auto');
+  f.rounds.value = '4';
+  f.rounds.dispatchEvent(new Event('change'));
+  bet.value = '70';
+  bet.dispatchEvent(new Event('input'));
+  auto.value = '1,';
+  auto.dispatchEvent(new Event('input'));
+  await f.poll(snapshot(emptyRound('current', 'flying')));
+  await f.poll(snapshot(emptyRound('current', 'crashed')));
+  await f.poll(snapshot(emptyRound('next')));
+  assert.equal(f.rounds.value, '4');
+  assert.equal(bet.value, '70');
+  assert.equal(auto.value, '1,');
+  assert.equal(f.start.disabled, false);
+  auto.value = '1,75';
+  auto.dispatchEvent(new Event('input'));
+  assert.match(f.status.textContent, /70 мон.*1,75×.*280 мон/);
+  assert.deepEqual(f.starts(), [], 'editing the draft does not opt in');
+});
+
+test('a losing player sees the result while the shared cinematic flight continues', async () => {
+  const f = viewFixture();
+  const action = f.elements.get('rocket-action');
+  const message = f.elements.get('rocket-message');
+  const root = f.elements.get('rocket');
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 4800, multiplier: 174 })));
+  assert.equal(action.getAttribute('aria-disabled'), 'false');
+  const cinematic = { elapsed_ms: 6200, multiplier: 251, cinematic_from_ms: 6000 };
+  await f.poll(snapshot(flight('flying', { ...cinematic, can_cashout: false })));
+  assert.equal(action.getAttribute('aria-disabled'), 'true');
+  assert.equal(message.textContent, 'Ставка проиграна');
+  assert.equal(root.dataset.phase, 'flying');
+  assert.equal(root.dataset.cinematic, 'true');
+  await f.poll(snapshot(emptyRound('current', 'flying', cinematic)));
+  assert.equal(root.dataset.cinematic, 'true');
+  assert.match(message.textContent, /Ставки откроются/);
+});
+
+test('a confirmed loss stays visible after a cashout response is lost', async () => {
+  const f = viewFixture();
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('flying')));
+  f.elements.get('rocket-form').dispatchEvent(new Event('submit', { cancelable: true }));
+  const cashout = f.requests.at(-1);
+  assert.equal(cashout.path, 'api/rocket/cashout');
+  cashout.reject(new TypeError('network error'));
+  await new Promise(setImmediate);
+  await f.reply(f.requests.at(-1), snapshot(flight('flying', { can_cashout: false })));
+  const message = f.elements.get('rocket-message').textContent;
+  assert.match(message, /Ставка проиграна/);
+  assert.match(message, /Ответ на запрос потерян/);
+});
+
+test('countdown and crash wait have different clock labels and never open betting from the clock alone', async () => {
+  const f = viewFixture();
+  const action = f.elements.get('rocket-action');
+  const clock = f.elements.get('rocket-time');
+  const label = f.elements.get('rocket-time-label');
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'crashed', { elapsed_ms: 3000, next_launch_ms: 5000 })));
+  f.frame();
+  assert.equal(label.textContent, 'До следующего старта');
+  assert.equal(clock.textContent, '5,0 с');
+  assert.equal(action.getAttribute('aria-disabled'), 'true');
+  await f.poll(snapshot(emptyRound('next', 'countdown', { next_launch_ms: 240 })));
+  f.frame();
+  assert.equal(label.textContent, 'До старта');
+  assert.equal(clock.textContent, '0,3 с');
+  assert.equal(action.getAttribute('aria-disabled'), 'false');
+  f.advance(240);
+  f.frame();
+  assert.equal(clock.textContent, '0,0 с');
+  assert.equal(action.getAttribute('aria-disabled'), 'true');
+  f.elements.get('rocket-form').dispatchEvent(new Event('submit', { cancelable: true }));
+  assert.deepEqual(f.starts(), []);
+});
+
+test('placing a bet binds it to the open round and discards a late state poll', async () => {
   const f = fixture();
-  const old = flight('crashed');
+  const open = emptyRound();
   f.feed.show();
-  await f.reply(f.requests[0], snapshot(old));
+  await f.reply(f.requests[0], snapshot(open));
   f.tick();
   const start = f.feed.launch('100', '1.75');
-  assert.equal(f.requests[2].path, 'api/rocket/start');
-  assert.equal(JSON.stringify(f.requests[2].body), JSON.stringify({ bet: '100', auto: '1.75', expected_id: old.id }));
-  const next = flight('countdown', { id: '9223372036854775808', elapsed_ms: -3000, auto: 175 });
-  f.requests[2].resolve(snapshot(next, 400));
+  assert.deepEqual(f.starts(), [{ bet: '100', auto: '1.75', expected_id: open.id }]);
+  assert.equal(f.current().pending, 'start');
+  const joined = flight('countdown', { id: open.id, elapsed_ms: -3000, auto: 175 });
+  f.requests[2].resolve(snapshot(joined, 400));
   await start;
-  await f.reply(f.requests[1], snapshot(old));
-  assert.equal(f.current().snapshot.flight, next);
+  await f.reply(f.requests[1], snapshot(open));
+  assert.equal(f.current().snapshot.flight, joined);
   assert.equal(f.current().snapshot.balance, 400);
+  await f.feed.launch('100', null);
+  assert.equal(f.starts().length, 1);
   assert.ok(f.tick() >= 400);
   assert.equal(f.requests[3].path, 'api/rocket/state');
   assert.equal(f.requests[3].body, undefined);
 });
 
-test('cashout is manual, bound to a confirmed flying ID, and sent once while pending', async () => {
+test('cashout requires the server flag, uses the round ID, and is sent once while pending', async () => {
   const f = fixture();
   f.feed.show();
   const countdown = flight('countdown', { auto: 150, elapsed_ms: -40 });
   await f.reply(f.requests[0], snapshot(countdown));
   await f.feed.cashout();
   assert.equal(f.requests.length, 1);
-  assert.ok(f.tick() <= 650);
-  const flying = { ...countdown, status: 'flying', elapsed_ms: 4000, multiplier: 158 };
-  await f.reply(f.requests[1], snapshot(flying));
-  assert.equal(f.requests.length, 2, 'an auto target never triggers a client cashout');
+  await f.poll(snapshot(flight('flying', { auto: 150, can_cashout: false })));
+  await f.feed.cashout();
+  assert.equal(f.requests.length, 2);
+  const flying = flight('flying', { auto: 150, elapsed_ms: 4000, multiplier: 158 });
+  await f.poll(snapshot(flying));
+  assert.equal(f.requests.length, 3, 'an auto target never triggers a client cashout');
   const cashout = f.feed.cashout();
   await f.feed.cashout();
-  assert.equal(f.requests.length, 3);
-  assert.equal(f.requests[2].path, 'api/rocket/cashout');
-  assert.equal(f.requests[2].body.id, countdown.id);
+  assert.equal(f.requests.length, 4);
+  assert.equal(f.requests[3].path, 'api/rocket/cashout');
+  assert.equal(f.requests[3].body.id, countdown.id);
   assert.equal(f.current().pending, 'cashout');
-  const paid = { ...flying, status: 'paid', payout: 158 };
-  f.requests[2].resolve(snapshot(paid, 558));
+  const paid = flight('flying', { payout: 158, cashout_multiplier: 158 });
+  f.requests[3].resolve(snapshot(paid, 558));
   await cashout;
   assert.equal(f.current().snapshot.flight, paid);
-  assert.equal(f.current().pending, null);
+  await f.feed.cashout();
+  assert.equal(f.requests.length, 4);
 });
 
-test('a timed-out launch resyncs before enabling actions and never repeats the POST', async () => {
+test('a timed-out manual bet refreshes state and AutoBet skips that round even after opting in', async () => {
   const f = fixture();
+  const open = emptyRound();
   f.feed.show();
-  await f.reply(f.requests[0], snapshot());
+  await f.reply(f.requests[0], snapshot(open));
   const start = f.feed.launch('100', null);
-  assert.equal(JSON.stringify(f.requests[1].body), '{"bet":"100","auto":null,"expected_id":null}');
+  assert.deepEqual(f.starts(), [{ bet: '100', auto: null, expected_id: open.id }]);
   f.requests[1].reject(Object.assign(new Error('timeout'), { name: 'TimeoutError' }));
   await start;
   assert.equal(f.current().needsSync, true);
   assert.equal(f.requests[2].path, 'api/rocket/state');
   await f.feed.launch('100', null);
   assert.equal(f.requests.length, 3);
-  await f.reply(f.requests[2], snapshot(flight('countdown', { elapsed_ms: -1800 }), 400));
-  assert.equal(f.current().needsSync, false);
-  assert.equal(f.current().snapshot.balance, 400);
+  await f.reply(f.requests[2], snapshot(open));
+  f.feed.startRepeat(1, 100, null);
+  await f.reply(f.requests[3], snapshot(open));
+  assert.equal(f.starts().length, 1);
+  await f.poll(snapshot(emptyRound('next')));
+  assert.deepEqual(f.starts().at(-1), { bet: '100', auto: null, expected_id: 'next' });
 });
 
 test('returning to the view requires a fresh sample and drops the old view’s poll', async () => {
@@ -206,40 +341,40 @@ test('returning to the view requires a fresh sample and drops the old view’s p
   assert.equal(f.timers.size, 0);
 });
 
-test('auto start is opt-in and spends only the selected additional rounds at the original settings', async () => {
+test('AutoBet places the selected number of wagers once per eligible round at the opted-in terms', async () => {
   const f = fixture();
+  const open = emptyRound('first');
   const first = flight('countdown', { id: 'first', stake: 70, auto: 175 });
-  const second = flight('countdown', { id: 'second', stake: 70, auto: 175 });
   const third = flight('countdown', { id: 'third', stake: 70, auto: 175 });
   f.feed.show();
-  await f.reply(f.requests[0], snapshot(first));
+  await f.reply(f.requests[0], snapshot(open));
   assert.equal(f.current().repeat, null);
-  f.feed.startRepeat(2);
-  await f.poll(snapshot({ ...first, status: 'flying' }));
-  assert.deepEqual(f.starts(), []);
-  await f.poll(snapshot({ ...first, status: 'crashed' }, 430));
-  assert.deepEqual(f.starts(), [], 'the completed round remains visible before the next start');
-  await f.poll(snapshot({ ...first, status: 'crashed' }, 430));
-  await f.reply(f.requests.at(-1), snapshot(second, 360));
+  f.feed.startRepeat(2, 70, 175);
+  assert.deepEqual(f.starts(), [], 'the cached countdown cannot trigger an automatic POST');
+  await f.reply(f.requests.at(-1), snapshot(open));
+  await f.reply(f.requests.at(-1), snapshot(first, 430));
   assert.equal(f.current().repeat.remaining, 1);
-  const paid = { ...second, status: 'flying', cashout_multiplier: 175, payout: 122, automatic: true };
-  const crashed = { ...paid, status: 'crashed', multiplier: 220 };
-  await f.poll(snapshot(paid, 482));
-  await f.poll(snapshot(paid, 482));
-  assert.equal(f.starts().length, 1, 'automatic payout leaves the next flight queued');
-  await f.poll(snapshot(crashed, 482));
-  await f.poll(snapshot(crashed, 482));
-  await f.reply(f.requests.at(-1), snapshot(third, 412));
-  await f.poll(snapshot({ ...third, status: 'crashed' }, 412));
-  await f.poll(snapshot({ ...third, status: 'crashed' }, 412));
+  await f.poll(snapshot(open, 430));
+  assert.equal(f.starts().length, 1, 'a stale same-round snapshot cannot trigger another POST');
+  const paid = flight('flying', { id: 'first', stake: 70, auto: 175, payout: 122, cashout_multiplier: 175, automatic: true });
+  await f.poll(snapshot(paid, 552));
+  await f.poll(snapshot({ ...paid, status: 'crashed' }, 552));
+  await f.poll(snapshot(emptyRound('second', 'countdown', { can_bet: false }), 552));
+  await f.poll(snapshot(flight('countdown', { id: 'second' }), 552));
+  await f.poll(snapshot(emptyRound('second', 'flying'), 552));
+  assert.equal(f.starts().length, 1, 'a closed or occupied countdown, flight and crash never submit');
+  await f.poll(snapshot(emptyRound('third'), 552));
+  await f.reply(f.requests.at(-1), snapshot(third, 482));
+  await f.poll(snapshot(emptyRound('fourth'), 482));
   assert.deepEqual(f.starts(), [
     { bet: '70', auto: '1.75', expected_id: 'first' },
-    { bet: '70', auto: '1.75', expected_id: 'second' },
+    { bet: '70', auto: '1.75', expected_id: 'third' },
   ]);
   assert.equal(f.current().repeat, null);
+  assert.equal(f.current().repeatNotice, 'complete');
 });
 
-test('auto start keeps manual cashout mode and waits for the crash after payout', async () => {
+test('AutoBet preserves manual cashout for current and future wagers when no factor is selected', async () => {
   const f = fixture();
   const flying = flight('flying');
   f.feed.show();
@@ -247,25 +382,27 @@ test('auto start keeps manual cashout mode and waits for the crash after payout'
   f.feed.startRepeat(1);
   const cashout = f.feed.cashout();
   assert.equal(f.requests.at(-1).path, 'api/rocket/cashout');
-  const paid = snapshot({ ...flying, payout: 110, cashout_multiplier: 110 }, 510);
-  await f.reply(f.requests.at(-1), paid);
+  const paid = flight('flying', { payout: 110, cashout_multiplier: 110 });
+  await f.reply(f.requests.at(-1), snapshot(paid, 510));
   await cashout;
+  await f.feed.launch('100', null);
   assert.deepEqual(f.starts(), []);
-  const duplicate = f.feed.cashout();
-  assert.equal(f.requests.length, 2, 'a paid flight permits neither cashout nor launch');
-  await duplicate;
-  const earlyLaunch = f.feed.launch('100', null);
-  assert.equal(f.requests.length, 2, 'the next stake is blocked until crash');
-  await earlyLaunch;
-  const cinematic = snapshot({ ...paid.flight, elapsed_ms: 12739, multiplier: 50000, cinematic_from_ms: 8200 }, 510);
-  await f.poll(cinematic);
-  await f.poll(cinematic);
-  assert.deepEqual(f.starts(), [], 'active polling never spends the next stake');
-  const crashed = snapshot({ ...cinematic.flight, status: 'crashed', elapsed_ms: 13339, multiplier: 100000 }, 510);
-  await f.poll(crashed);
-  assert.deepEqual(f.starts(), [], 'the crash stays visible before the next start');
-  await f.poll(crashed);
-  assert.deepEqual(f.starts(), [{ bet: '100', auto: null, expected_id: flying.id }]);
+  await f.poll(snapshot({ ...paid, status: 'crashed' }, 510));
+  assert.deepEqual(f.starts(), []);
+  await f.poll(snapshot(emptyRound('next'), 510));
+  assert.deepEqual(f.starts(), [{ bet: '100', auto: null, expected_id: 'next' }]);
+});
+
+test('a boundary snapshot with zero time left cannot trigger a wager', async () => {
+  const f = fixture();
+  const expired = emptyRound('expired', 'countdown', { next_launch_ms: 0 });
+  f.feed.show();
+  await f.reply(f.requests[0], snapshot(expired));
+  await f.feed.launch('100', null);
+  f.feed.startRepeat(1, 100);
+  await f.reply(f.requests.at(-1), snapshot(expired));
+  assert.deepEqual(f.starts(), []);
+  assert.equal(f.current().repeat.remaining, 1);
 });
 
 test('reloading a cashed-out flight shows the fixed payout and keeps launch locked until crash', async () => {
@@ -293,27 +430,26 @@ test('reloading a cashed-out flight shows the fixed payout and keeps launch lock
   f.frame();
   assert.equal(liveMultiplier.textContent, '2,60×');
   assert.equal(f.elements.get('rocket-multiplier-caption').textContent, 'Пик полёта');
-  assert.equal(action.attributes.get('aria-disabled'), 'false');
+  assert.equal(action.attributes.get('aria-disabled'), 'true');
   assert.match(payoutLabel.textContent, /1,75×/);
   assert.equal(payout.textContent, '175 мон.');
   assert.deepEqual(f.starts(), []);
 });
 
-test('a manual launch supersedes a queued auto start and keeps its own wager settings', async () => {
+test('a manual bet supersedes queued AutoBet while its state request is pending', async () => {
   const f = fixture();
-  const flying = flight('flying');
+  const open = emptyRound('manual');
   f.feed.show();
-  await f.reply(f.requests[0], snapshot(flying));
-  f.feed.startRepeat(2);
-  await f.poll(snapshot({ ...flying, status: 'crashed' }));
+  await f.reply(f.requests[0], snapshot(open));
+  f.feed.startRepeat(2, 100);
+  const refresh = f.requests.at(-1);
   const launch = f.feed.launch('50', '2.5');
   const next = flight('countdown', { id: 'manual', stake: 50, auto: 250 });
   await f.reply(f.requests.at(-1), snapshot(next));
   await launch;
-  const crashed = snapshot({ ...next, status: 'crashed' });
-  await f.poll(crashed);
-  await f.poll(crashed);
-  assert.deepEqual(f.starts(), [{ bet: '50', auto: '2.5', expected_id: flying.id }]);
+  await f.reply(refresh, snapshot(open));
+  await f.poll(snapshot(emptyRound('next')));
+  assert.deepEqual(f.starts(), [{ bet: '50', auto: '2.5', expected_id: 'manual' }]);
   assert.equal(f.current().repeat, null);
 });
 
@@ -343,37 +479,35 @@ for (const [reason, interrupt] of [
     let allowed = true;
     const f = fixture(() => allowed);
     const flying = flight('flying');
-    const crashed = snapshot({ ...flying, status: 'crashed' });
     f.feed.show();
     await f.reply(f.requests[0], snapshot(flying));
     f.feed.startRepeat(2);
-    await f.poll(crashed);
-    f.tick();
     const pending = f.requests.at(-1);
+    const open = snapshot(emptyRound('next'));
     await interrupt(f, () => { allowed = false; });
-    await f.reply(pending, crashed);
-    if (f.requests.at(-1) !== pending) await f.reply(f.requests.at(-1), crashed);
+    await f.reply(pending, open);
+    if (f.requests.at(-1) !== pending) await f.reply(f.requests.at(-1), open);
     allowed = true;
-    await f.poll(crashed);
+    await f.poll(open);
     assert.deepEqual(f.starts(), []);
     assert.equal(f.current().repeat, null);
   });
 }
 
-for (const [name, replacement] of [
-  ['the tracked flight changes', snapshot(flight('crashed', { id: 'elsewhere' }))],
-  ['the round is refunded', snapshot(flight('refunded'))],
-  ['the fixed stake exceeds the available balance', snapshot(flight('crashed'), 99)],
+for (const [name, replacement, notice] of [
+  ['the wager is refunded', snapshot(flight('refunded')), 'refunded'],
+  ['the fixed stake exceeds the available balance at the next countdown', snapshot(emptyRound('next'), 99), 'stake'],
 ]) {
   test('auto start stops when ' + name, async () => {
     const f = fixture();
     f.feed.show();
     await f.reply(f.requests[0], snapshot(flight('flying')));
     f.feed.startRepeat(2);
-    await f.poll(replacement);
-    await f.poll(replacement);
+    await f.reply(f.requests.at(-1), replacement);
+    await f.poll(snapshot(emptyRound('later')));
     assert.deepEqual(f.starts(), []);
     assert.equal(f.current().repeat, null);
+    assert.equal(f.current().repeatNotice, notice);
   });
 }
 
@@ -381,12 +515,10 @@ for (const outcome of ['stop', 'network error']) {
   test('auto start clears the remaining rounds after ' + outcome + ' during a start request', async () => {
     const f = fixture();
     const next = flight('countdown', { id: 'next' });
-    const crashed = snapshot(flight('crashed'));
     f.feed.show();
     await f.reply(f.requests[0], snapshot(flight('flying')));
     f.feed.startRepeat(2);
-    await f.poll(crashed);
-    await f.poll(crashed);
+    await f.reply(f.requests.at(-1), snapshot(emptyRound('next')));
     const start = f.requests.at(-1);
     assert.equal(start.path, 'api/rocket/start');
     if (outcome === 'stop') {
@@ -396,10 +528,10 @@ for (const outcome of ['stop', 'network error']) {
       start.reject(new TypeError('network error'));
       await new Promise(setImmediate);
       assert.equal(f.requests.at(-1).path, 'api/rocket/state');
-      await f.reply(f.requests.at(-1), snapshot(next));
+      await f.reply(f.requests.at(-1), snapshot(emptyRound('next')));
     }
-    await f.poll(snapshot({ ...next, status: 'crashed' }));
-    await f.poll(snapshot({ ...next, status: 'crashed' }));
+    await f.poll(snapshot(emptyRound('next')));
+    await f.poll(snapshot(emptyRound('later')));
     assert.equal(f.starts().length, 1);
     assert.equal(f.current().repeat, null);
   });
@@ -408,13 +540,12 @@ for (const outcome of ['stop', 'network error']) {
 test('the Rocket form shows the additional stake limit and offers Stop while the wager settings are hidden', async () => {
   const f = viewFixture();
   const flying = flight('flying', { stake: 70, auto: 175 });
-  const crashed = snapshot({ ...flying, status: 'crashed' });
   f.view.show();
   await f.reply(f.requests[0], snapshot(flying));
   assert.equal(f.settings.hidden, true);
   assert.equal(f.setup.hidden, false);
   assert.equal(f.start.type, 'button');
-  assert.equal(f.start.disabled, true);
+  assert.equal(f.start.disabled, false);
   f.rounds.value = '2';
   f.rounds.dispatchEvent(new Event('change'));
   assert.match(f.status.textContent, /70 мон.*1,75×.*140 мон/);
@@ -422,10 +553,9 @@ test('the Rocket form shows the additional stake limit and offers Stop while the
   f.start.dispatchEvent(new Event('click'));
   assert.equal(f.stop.hidden, false);
   assert.equal(f.stop.type, 'button');
-  await f.poll(crashed);
   f.stop.dispatchEvent(new Event('click'));
   assert.equal(f.stop.hidden, true);
-  await f.poll(crashed);
+  await f.reply(f.requests.at(-1), snapshot(emptyRound('next')));
   assert.deepEqual(f.starts(), []);
 });
 
@@ -451,22 +581,20 @@ for (const [name, interrupt, resume] of [
   test('the opt-in is cleared when the ' + name, async () => {
     const f = viewFixture();
     const flying = flight('flying');
-    const crashed = snapshot({ ...flying, status: 'crashed' });
     f.view.show();
     await f.reply(f.requests[0], snapshot(flying));
     f.rounds.value = '2';
     f.rounds.dispatchEvent(new Event('change'));
     f.start.dispatchEvent(new Event('click'));
     assert.equal(f.stop.hidden, false);
-    await f.poll(crashed);
-    f.tick();
     const pending = f.requests.at(-1);
+    const open = snapshot(emptyRound('next'));
     interrupt(f);
     assert.equal(f.stop.hidden, true);
-    await f.reply(pending, crashed);
+    await f.reply(pending, open);
     resume(f);
-    if (f.requests.at(-1) !== pending) await f.reply(f.requests.at(-1), crashed);
-    if (f.timers.size) await f.poll(crashed);
+    if (f.requests.at(-1) !== pending) await f.reply(f.requests.at(-1), open);
+    if (f.timers.size) await f.poll(open);
     assert.deepEqual(f.starts(), []);
   });
 }
@@ -481,23 +609,75 @@ test('animation frames move the ship and curve together without predicting throu
   f.frame();
   assert.deepEqual(f.drawing.ship, initial);
   const readout = f.elements.get('rocket-multiplier');
-  assert.equal(readout.textContent, '1,19×');
+  assert.equal(readout.textContent, '1,13×');
 
   f.frame(125);
   const first = f.drawing.ship;
   assert.ok(first[0] > initial[0] && first[1] < initial[1]);
   assert.deepEqual(f.drawing.curve.at(-1), first);
+  assert.equal(readout.textContent, '1,14×', 'rounds the confirmed interpolation down');
   f.frame(250);
   assert.ok(f.drawing.ship[0] > first[0] && f.drawing.ship[1] < first[1]);
+  assert.equal(readout.textContent, '1,16×');
+  f.frame(375);
+  assert.equal(readout.textContent, '1,17×');
   f.frame(500);
   const confirmed = f.drawing.ship;
   f.frame(900); // Delayed crash response.
   assert.deepEqual(f.drawing.ship, confirmed);
+  assert.equal(readout.textContent, '1,19×', 'a stalled poll cannot increase the coefficient');
   await f.poll(snapshot(flight('crashed', { elapsed_ms: 1578, multiplier: 120 })));
   f.frame(500);
   assert.ok(f.drawing.marker[0] >= confirmed[0] && f.drawing.marker[1] <= confirmed[1]);
   assert.deepEqual(f.drawing.curve.at(-1), f.drawing.marker);
   assert.equal(readout.textContent, '1,20×');
+});
+
+test('the live readout displays every confirmed hundredth when frames are frequent enough', async () => {
+  const f = viewFixture();
+  const readout = f.elements.get('rocket-multiplier');
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying', { elapsed_ms: 1060, multiplier: 113 })));
+  f.frame();
+  await f.poll(snapshot(emptyRound('current', 'flying', { elapsed_ms: 1560, multiplier: 119 })));
+  const shown = new Set();
+  for (let elapsed = 0; elapsed <= 528; elapsed += 16) {
+    f.frame(elapsed);
+    shown.add(readout.textContent);
+  }
+  assert.deepEqual([...shown], ['1,13×', '1,14×', '1,15×', '1,16×', '1,17×', '1,18×', '1,19×']);
+});
+
+test('fast cinematic frames skip unreachable hundredths while the chart advances to the confirmed sample', async () => {
+  const f = viewFixture();
+  const readout = f.elements.get('rocket-multiplier');
+  f.view.show();
+  const cinematic = { cinematic_from_ms: 9509 };
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying', {
+    ...cinematic, elapsed_ms: 13500, multiplier: 30135,
+  })));
+  f.frame();
+  await f.poll(snapshot(emptyRound('current', 'flying', {
+    ...cinematic, elapsed_ms: 14000, multiplier: 53696,
+  })));
+  f.frame(16);
+  const first = f.drawing.ship;
+  assert.equal(readout.textContent, '308,88×');
+  f.frame(32);
+  assert.equal(readout.textContent, '316,42×');
+  assert.ok(f.drawing.ship[0] > first[0] && f.drawing.ship[1] < first[1]);
+  assert.deepEqual(f.drawing.curve.at(-1), f.drawing.ship);
+  f.frame(850);
+  assert.equal(readout.textContent, '536,96×');
+});
+
+test('the chart doubling times match both Rust flight phases', () => {
+  const rust = readFileSync(join(__dirname, '../rust/src/rocket.rs'), 'utf8');
+  const normal = Number(rust.match(/^const DOUBLE_SECONDS: f64 = ([\d.]+);/m)[1]) * 1000;
+  const cinematic = Number(rust.match(/^const CINEMATIC_DOUBLE_SECONDS: f64 = ([\d.]+);/m)[1]) * 1000;
+  const multiplierAt = vm.runInContext('rocketMultiplierAt', context);
+  assert.equal(multiplierAt(normal, null), 200);
+  assert.equal(multiplierAt(normal + cinematic, normal), 400);
 });
 
 test('reduced motion paints confirmed positions once and reveals the cinematic peak at crash', async () => {
@@ -519,7 +699,7 @@ test('reduced motion paints confirmed positions once and reveals the cinematic p
   assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
   assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');
   assert.match(f.elements.get('rocket-payout-label').textContent, /2,00×/);
-  assert.equal(f.elements.get('rocket-action').attributes.get('aria-disabled'), 'false');
+  assert.equal(f.elements.get('rocket-action').attributes.get('aria-disabled'), 'true');
   assert.equal(f.hasFrame(), false);
 });
 

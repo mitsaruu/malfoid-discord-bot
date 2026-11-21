@@ -39,18 +39,77 @@ button { font: inherit; color: inherit; cursor: pointer; }
 }
 .game-switch button:hover { color: var(--text); }
 .game-switch button[aria-pressed="true"] { color: var(--text); background: #282a34; border-color: #424553; }
+.game-switch button[data-game="lobby"] { color: #e2d6ff; border-color: #473b57; }
 .game-switch button:focus-visible, .words-retry:focus-visible { outline: 2px solid #bdb2ff; outline-offset: 2px; }
-.game-lobby { padding: clamp(28px, 14vh, 110px) 16px 10px; text-align: center; }
-.game-lobby h1 { font-size: clamp(24px, 5vw, 36px); letter-spacing: -.025em; }
+
+body[data-game="lobby"] {
+  display: flow-root;
+  height: auto;
+  min-height: 100dvh;
+  background: radial-gradient(ellipse at 30% 0, #263044 0, transparent 56%), #12141b;
+}
+.game-lobby {
+  width: min(1000px, calc(100% - 32px));
+  margin: clamp(24px, 7vh, 64px) auto 16px;
+}
+.game-lobby h1 {
+  font-size: clamp(28px, 5vw, 48px);
+  line-height: 1.08;
+  letter-spacing: -.055em;
+}
 body[data-game="lobby"] #game-switch {
-  display: grid; width: min(520px, calc(100% - 32px)); grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
-  background: transparent; border: 0; padding: 0; gap: 8px;
+  display: grid;
+  width: min(1000px, calc(100% - 32px));
+  max-width: none;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0 auto 28px;
+  padding: 0;
+  gap: clamp(9px, 1.55vw, 16px);
+  background: transparent;
+  border: 0;
 }
+body[data-game="lobby"] #game-switch button[data-game="lobby"] { display: none; }
 body[data-game="lobby"] #game-switch button {
-  min-height: 60px; padding: 6px; border-color: #363a47; border-radius: 12px; background: #1d2029;
-  color: var(--text); font-size: 15px;
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: end;
+  aspect-ratio: 4 / 3;
+  min-width: 0;
+  overflow: hidden;
+  padding: clamp(8px, 1.5vw, 16px);
+  border: 1px solid #51596c;
+  border-radius: 14px;
+  background: #222937;
+  box-shadow: 0 7px 19px #080b145c;
+  color: #fff;
+  font-size: clamp(.85rem, 1.9vw, 1.18rem);
+  font-weight: 750;
+  text-align: left;
+  text-shadow: 0 2px 6px #000;
 }
-body[data-game="lobby"] #game-switch button:hover { border-color: #8178a9; background: #272839; }
+body[data-game="lobby"] #game-switch button::before,
+body[data-game="lobby"] #game-switch button::after {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  content: "";
+}
+body[data-game="lobby"] #game-switch button::before {
+  background: url("lobby-games.webp") var(--cover-x, 0%) var(--cover-y, 0%) / 200% 400% no-repeat;
+}
+body[data-game="lobby"] #game-switch button::after {
+  background: linear-gradient(180deg, transparent 43%, #090e1780 75%, #090e17f5);
+}
+body[data-game="lobby"] #game-switch button:hover { border-color: #c3b4ea; }
+#game-switch :is([data-game="rocket"], [data-game="poker"], [data-game="blackjack"], [data-game="coinflip"]) { --cover-x: 100%; }
+#game-switch :is([data-game="mines"], [data-game="poker"]) { --cover-y: 33.3333%; }
+#game-switch :is([data-game="slots"], [data-game="blackjack"]) { --cover-y: 66.6667%; }
+#game-switch :is([data-game="roulette"], [data-game="coinflip"]) { --cover-y: 100%; }
+
+@media (max-width: 660px) {
+  body[data-game="lobby"] #game-switch { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 #app {
   max-width: 500px;

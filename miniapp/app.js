@@ -492,16 +492,19 @@ function openGame(game) {
   activeGame = game;
   document.body.dataset.game = game;
   const words = game === "words";
-  gameLobby.hidden = true;
+  gameLobby.hidden = game !== "lobby";
   document.getElementById("app").hidden = !words;
   playersEl.hidden = !words;
   document.getElementById("rocket").hidden = game !== "rocket";
   for (const id of Object.keys(casinoTitles)) document.getElementById(id).hidden = id !== game;
   helpEl.hidden = true;
-  for (const button of gameSwitch.querySelectorAll("button")) {
+  for (const button of gameSwitch.querySelectorAll("button[aria-pressed]")) {
     button.setAttribute("aria-pressed", String(button.dataset.game === game));
   }
-  if (words) {
+  if (game === "lobby") {
+    document.title = "Игры Malfoid";
+    document.documentElement.lang = "ru";
+  } else if (words) {
     document.title = GAMES[lang].name;
     document.documentElement.lang = lang;
     reloadWords = true;
@@ -536,7 +539,10 @@ function openGame(game) {
 }
 
 for (const button of gameSwitch.querySelectorAll("button")) {
-  button.addEventListener("click", () => openGame(button.dataset.game));
+  button.addEventListener("click", () => {
+    openGame(button.dataset.game);
+    if (button.dataset.game === "lobby") gameLobby.querySelector("h1").focus();
+  });
 }
 wordsRetry.addEventListener("click", () => {
   reloadWords = true;
@@ -571,12 +577,7 @@ async function start() {
       }));
     }
     gameSwitch.hidden = false;
-    if (login.game === "words") openGame("words");
-    else {
-      document.title = "Игры Malfoid";
-      document.body.dataset.game = "lobby";
-      gameLobby.hidden = false;
-    }
+    openGame(login.game === "words" ? "words" : "lobby");
     hideSplash();
     setInterval(() => {
       loadWords();

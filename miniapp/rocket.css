@@ -26,7 +26,6 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
   padding: 27px clamp(14px, 4vw, 42px) 24px;
 }
 
-.rocket[data-phase="paid"] { --rocket-accent: #8ff4ca; }
 .rocket[data-phase="flying"][data-cinematic="true"] { --rocket-accent: #f5cd91; }
 .rocket[data-phase="crashed"] { --rocket-accent: #ffac94; }
 .rocket[data-phase="refunded"] { --rocket-accent: #ffd690; }
@@ -79,7 +78,6 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
   transition: border-color .24s ease;
 }
 
-.rocket[data-phase="paid"] .rocket-scene { border-color: #3d6c61; }
 .rocket[data-phase="crashed"] .rocket-scene { border-color: #7f514d; }
 .rocket-hud { position: relative; display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 17px 19px 0; }
 .rocket-phase { display: flex; gap: 7px; align-items: center; align-self: start; color: var(--rocket-muted); font-size: 12px; }
@@ -171,7 +169,7 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
   transition: filter .17s, box-shadow .17s;
 }
 
-.rocket[data-phase="flying"] .rocket-primary { background: #8ff4ca; }
+.rocket[data-phase="flying"] .rocket-primary:not([aria-disabled="true"]) { background: #8ff4ca; }
 .rocket-primary:hover:not([aria-disabled="true"]) { filter: brightness(1.1); box-shadow: 0 2px 16px #ccafff40; }
 .rocket-primary[aria-disabled="true"] { background: #322840; color: #c5b8d8; cursor: default; }
 .rocket :is(input, button, select):focus-visible { outline: 2px solid #dfccff; outline-offset: 2px; }

@@ -8,6 +8,11 @@
   const format = new Intl.NumberFormat("ru");
   const signed = new Intl.NumberFormat("ru", { signDisplay: "exceptZero" });
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+  const pocketAngle = 360 / wheelOrder.length;
+  const launchRadius = 49;
+  const trackRadius = 45.4;
+  const pocketRadius = 34.2;
+  const easeOut = (progress) => 1 - (1 - progress) ** 3;
 
   function element(tag, text = "", className = "") {
     const node = document.createElement(tag);
@@ -26,10 +31,11 @@
   const wheel = element("canvas", "", "roulette-wheel");
   wheel.width = wheel.height = 900;
   wheel.setAttribute("aria-hidden", "true");
-  const pointer = element("span", "", "roulette-pointer");
-  pointer.setAttribute("aria-hidden", "true");
+  const ball = element("span", "", "roulette-ball");
+  ball.setAttribute("aria-hidden", "true");
+  ball.hidden = true;
   const wheelFrame = element("div", "", "roulette-wheel-frame");
-  wheelFrame.append(wheel, pointer);
+  wheelFrame.append(wheel, ball);
   const resultNumber = element("strong", "—", "roulette-result-number");
   const resultLabel = element("span", "Ожидаем первый результат");
   const resultReadout = element("div", "", "roulette-readout");
@@ -64,6 +70,10 @@
   let feedbackTone = "";
   let shownResult = null;
   let rotation = 0;
+  let ballAngle = 0;
+  let ballRadius = trackRadius;
+  let animationFrame = 0;
+  let waiting = null;
   let spin = null;
 
   function addCell(key, label, column, row, mobileColumn, mobileRow, color = "", type = "group") {
@@ -154,7 +164,7 @@
   function drawWheel() {
     const ctx = wheel.getContext("2d");
     if (!ctx) return;
-    const step = 2 * Math.PI / wheelOrder.length;
+    const step = pocketAngle * Math.PI / 180;
     ctx.translate(450, 450);
     ctx.scale(1.5, 1.5);
 
@@ -227,37 +237,113 @@
     }));
   }
 
-  function updateResult(result, animate) {
-    if (!result || result.id === shownResult?.id || result.id === spin?.id) return;
-    spin?.animation.cancel();
+  function rotateWheel(angle) {
+    rotation = angle;
+    wheel.style.transform = "rotate(" + angle + "deg)";
+  }
+
+  function placeBall(angle, radius) {
+    if (!ball.hidden && angle === ballAngle && radius === ballRadius) return;
+    ballAngle = angle;
+    ballRadius = radius;
+    const radians = angle * Math.PI / 180;
+    ball.style.left = (50 + radius * Math.sin(radians)) + "%";
+    ball.style.top = (50 - radius * Math.cos(radians)) + "%";
+    ball.hidden = false;
+  }
+
+  function clearMotion() {
+    cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+    waiting = null;
     spin = null;
-    if (result.number !== null) {
-      const from = rotation % 360;
-      const stop = (360 - wheelOrder.indexOf(result.number) * 360 / wheelOrder.length) % 360;
-      rotation = stop;
-      wheel.style.transform = "rotate(" + stop + "deg)";
-      if (animate && !reduceMotion.matches && wheel.animate) {
-        const to = from + (stop - from + 360) % 360 + 3 * 360;
-        const animation = wheel.animate(
-          [{ transform: "rotate(" + from + "deg)" }, { transform: "rotate(" + to + "deg)" }],
-          { duration: 2800, easing: "cubic-bezier(.15,.55,.18,1)" },
-        );
-        spin = { id: result.id, animation };
-        resultLabel.textContent = "Колесо вращается";
-        resultNumber.textContent = "—";
-        delete resultNumber.dataset.tone;
-        results.hidden = true;
-        void animation.finished.then(() => {
-          if (spin?.animation !== animation) return;
-          spin = null;
-          displayResult(result);
-          render();
-        }).catch(() => {});
-        return;
-      }
+  }
+
+  function winningRotation(result) {
+    return (360 - wheelOrder.indexOf(result.number) * pocketAngle) % 360;
+  }
+
+  function finishResult(result) {
+    clearMotion();
+    if (result.number === null) {
+      ball.hidden = true;
+    } else {
+      rotateWheel(winningRotation(result));
+      placeBall(0, pocketRadius);
     }
     displayResult(result);
   }
+
+  function syncWaitingBall() {
+    if (spin) return;
+    const round = state?.round;
+    if (visible && round && !round.refunding && !reduceMotion.matches) {
+      if (waiting?.id === round.id) return;
+      clearMotion();
+      waiting = { id: round.id, startedAt: performance.now() };
+      placeBall(pocketAngle * .65, launchRadius);
+      animationFrame = requestAnimationFrame(animateBall);
+      return;
+    }
+    clearMotion();
+    if (!round && shownResult?.number != null) placeBall(0, pocketRadius);
+    else ball.hidden = true;
+  }
+
+  function animateBall(now) {
+    animationFrame = 0;
+    if (spin) {
+      const { result, startedAt, from, to, startAngle, endAngle, startRadius } = spin;
+      const progress = Math.min(1, Math.max(0, now - startedAt) / 2800);
+      if (progress === 1) {
+        finishResult(result);
+        syncWaitingBall();
+        render();
+        return;
+      }
+      const turn = easeOut(progress);
+      const drop = Math.max(0, (progress - .82) / .18) ** 2;
+      rotateWheel(from + (to - from) * turn);
+      placeBall(startAngle + (endAngle - startAngle) * turn, startRadius + (pocketRadius - startRadius) * drop);
+    } else if (waiting) {
+      const elapsed = Math.max(0, now - waiting.startedAt);
+      const launch = easeOut(Math.min(1, elapsed / 300));
+      const pocket = Math.floor(elapsed / 1000);
+      const step = easeOut(Math.max(0, (elapsed % 1000 - 760) / 240));
+      placeBall((.65 * (1 - launch) - pocket - step) * pocketAngle,
+        launchRadius + (trackRadius - launchRadius) * launch);
+    } else {
+      return;
+    }
+    animationFrame = requestAnimationFrame(animateBall);
+  }
+
+  function updateResult(result, animate) {
+    if (!result || result.id === shownResult?.id || result.id === spin?.result.id) return;
+    if (result.number === null || !animate || reduceMotion.matches) {
+      finishResult(result);
+      return;
+    }
+    clearMotion();
+    const from = rotation % 360;
+    const to = from + (winningRotation(result) - from + 360) % 360 + 3 * 360;
+    const startAngle = ball.hidden ? 0 : ballAngle % 360;
+    const startRadius = ball.hidden ? trackRadius : ballRadius;
+    const endAngle = (Math.ceil(startAngle / 360) - 3) * 360;
+    spin = { result, startedAt: performance.now(), from, to, startAngle, endAngle, startRadius };
+    resultLabel.textContent = "Колесо вращается";
+    resultNumber.textContent = "—";
+    delete resultNumber.dataset.tone;
+    results.hidden = true;
+    animationFrame = requestAnimationFrame(animateBall);
+  }
+
+  reduceMotion.addEventListener("change", () => {
+    if (!visible) return;
+    if (reduceMotion.matches && spin) finishResult(spin.result);
+    syncWaitingBall();
+    render();
+  });
 
   function renderFeedback() {
     const message = (pending && !sending ? "Ответ на ставку потерян. Повторите отправку, чтобы проверить ту же ставку." : "")
@@ -299,7 +385,7 @@
     if (clock.textContent !== text) clock.textContent = text;
     const status = !state ? (syncError ? "Стол недоступен" : "Загружаем стол…") :
       round?.refunding ? "Возвращаем ставки" :
-      round && !seconds ? "Подводим итоги" :
+      spin || (round && !seconds) ? "Подводим итоги" :
       round ? "Ставки открыты" : "Стол свободен";
     if (tableState.textContent !== status) {
       tableState.textContent = status;
@@ -327,6 +413,7 @@
     closesAt = performance.now() + (data.round?.remaining_ms ?? 0);
     syncError = "";
     updateResult(data.last_result, data.last_result?.id === openRound);
+    syncWaitingBall();
     if (pending) {
       const source = [data.round, data.last_result].find((round) => round?.id === pending.round_id);
       const receipt = source?.your_bets.find((bet) => bet.request_id === pending.request_id);
@@ -413,11 +500,9 @@
       generation++;
       clearTimeout(pollTimer);
       clearInterval(tickTimer);
-      if (spin) {
-        spin.animation.cancel();
-        spin = null;
-        displayResult(state.last_result);
-      }
+      if (spin) finishResult(spin.result);
+      else clearMotion();
+      ball.hidden = true;
       state = null;
       syncError = "";
     },

@@ -23,18 +23,19 @@
   </div>
 
   <header class="game-lobby" id="game-lobby" hidden>
-    <h1>Выберите игру</h1>
+    <h1 tabindex="-1">Игры Malfoid</h1>
   </header>
 
   <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru" hidden>
-    <button type="button" data-game="words" aria-controls="app" aria-pressed="false">Слово дня</button>
-    <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false">Ракетка</button>
-    <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false">Минное поле</button>
-    <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false">Покер</button>
-    <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false">Слоты</button>
-    <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false">Блэкджек</button>
-    <button type="button" data-game="roulette" aria-controls="roulette" aria-pressed="false">Рулетка</button>
-    <button type="button" data-game="coinflip" aria-controls="coinflip" aria-pressed="false">Орёл или решка</button>
+    <button type="button" data-game="lobby" aria-controls="game-lobby">Все игры</button>
+    <button type="button" data-game="words" aria-controls="app" aria-pressed="false"><span>Слово дня</span></button>
+    <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false"><span>Ракетка</span></button>
+    <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false"><span>Минное поле</span></button>
+    <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false"><span>Покер</span></button>
+    <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false"><span>Слоты</span></button>
+    <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false"><span>Блэкджек</span></button>
+    <button type="button" data-game="roulette" aria-controls="roulette" aria-pressed="false"><span>Рулетка</span></button>
+    <button type="button" data-game="coinflip" aria-controls="coinflip" aria-pressed="false"><span>Орёл или решка</span></button>
   </nav>
 
   <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->

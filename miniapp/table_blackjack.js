@@ -14,7 +14,6 @@
   let serial = 0;
   let timer;
   let snapshot = null;
-  let renderedSnapshot = null;
   let handsKey;
   let busy = false;
   let syncError = "";
@@ -78,12 +77,16 @@
   lobbyActions.append(start, leave);
 
   const dealer = element("section", "", "blackjack-dealer");
+  const dealerTop = element("div", "", "blackjack-dealer-top");
+  const deck = element("span", "", "casino-deck");
+  deck.setAttribute("aria-hidden", "true");
+  dealerTop.append(element("h2", "Дилер"), deck);
   const dealerCards = element("div", "", "blackjack-dealer-cards");
   const emptyHand = element("div", "", "casino-cards");
   emptyHand.setAttribute("aria-hidden", "true");
   emptyHand.append(element("span", "", "casino-card casino-card--empty"),
     element("span", "", "casino-card casino-card--empty"));
-  dealer.append(element("h2", "Дилер"), dealerCards);
+  dealer.append(dealerTop, dealerCards);
   const moveBar = element("div", "", "casino-toolbar");
   moveBar.setAttribute("role", "group");
   moveBar.setAttribute("aria-label", "Действия с рукой");
@@ -106,9 +109,8 @@
   );
   root.replaceChildren(header, modes, felt, dock, feedback, rules);
 
-  function cardsFor(hand, animationFor, delay = 0) {
+  function cardsFor(hand, prepareCard) {
     const display = element("div", "", "casino-cards");
-    let animated = 0;
     for (const [index, card] of hand.cards.entries()) {
       const chip = element("span", card ?? "", "casino-card");
       if (card === null) {
@@ -118,17 +120,13 @@
       } else {
         chip.dataset.suit = suits[card.slice(-1)];
       }
-      const animation = animationFor(index, card);
-      if (animation) {
-        chip.classList.add(animation);
-        chip.style.setProperty("--casino-deal-delay", `${delay + animated++ * 55}ms`);
-      }
+      prepareCard(chip, index, card);
       display.append(chip);
     }
     return display;
   }
 
-  function playerPanel(player, table, user, priorPlayer, animate, delay) {
+  function playerPanel(player, table, user, priorPlayer, queueDeal) {
     const section = element("section", "", "casino-seat blackjack-seat");
     section.classList.toggle("casino-seat--own", player.id === user);
     section.classList.toggle("casino-seat--active", player.hands.some((hand) => hand.active));
@@ -166,8 +164,8 @@
       const title = player.hands.length > 1 ? "Рука " + (index + 1) + " · " : "";
       const active = hand.active ? " • Ход на этой руке" : "";
       handPanel.append(element("p", title + "Очки " + hand.total + " • Ставка " + amounts.format(hand.bet) + active));
-      handPanel.append(cardsFor(hand, (cardIndex, card) => {
-        if (!animate) return;
+      handPanel.append(cardsFor(hand, (chip, cardIndex, card) => {
+        if (!queueDeal) return;
         if (split) {
           if (cardIndex === 0) return;
           const held = heldCards.get(card) ?? 0;
@@ -176,8 +174,8 @@
             return;
           }
         } else if (cardIndex < (priorLengths[index] ?? 0)) return;
-        return "casino-card--dealt";
-      }, delay));
+        queueDeal(chip, cardIndex);
+      }));
       if (hand.outcome) {
         const net = hand.payout - hand.bet;
         const result = net > 0 ? "+" + amounts.format(net) : amounts.format(net);
@@ -188,32 +186,63 @@
     return section;
   }
 
-  function renderHands(table, you, ownSeat) {
-    const previous = renderedSnapshot;
-    renderedSnapshot = snapshot;
+  function animateDeal(cards, turned, playerDraws) {
+    if ((!cards.length && !turned) || document.hidden || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const stagger = Math.min(90, 650 / Math.max(1, cards.length - 1));
+    const turnDelay = playerDraws ? (playerDraws - 1) * stagger + 180 : 0;
+    if (turned) {
+      turned.style.setProperty("--casino-deal-delay", `${turnDelay}ms`);
+      turned.classList.add("casino-card--turned");
+    }
+    if (!cards.length) return;
+    const origin = deck.getBoundingClientRect();
+    const destinations = cards.map((card) => card.getBoundingClientRect());
+    cards.forEach((card, index) => {
+      const target = destinations[index];
+      const delay = turned && index >= playerDraws ? turnDelay + 145 + (index - playerDraws) * stagger : index * stagger;
+      card.style.setProperty("--casino-deal-x", `${origin.left - target.left + (origin.width - target.width) / 2}px`);
+      card.style.setProperty("--casino-deal-y", `${origin.top - target.top + (origin.height - target.height) / 2}px`);
+      card.style.setProperty("--casino-deal-delay", `${delay}ms`);
+      card.classList.add("casino-card--dealt");
+    });
+  }
+
+  function renderHands(table, you, ownSeat, previous, action) {
     const key = table ? JSON.stringify([table.id, table.phase, table.host_id, table.dealer, table.players, you]) : "";
     if (key === handsKey) return;
     handsKey = key;
-    const prior = previous?.table?.id === table?.id ? previous?.table : null;
-    const animate = previous !== null;
+    const prior = table && previous?.table?.id === table.id ? previous.table : null;
+    const opening = table?.dealer && (prior?.phase === "lobby" || (mode === "solo" && action === "join" && previous && !prior));
+    const continuing = prior?.phase === "playing";
+    const passes = [[], []];
+    const playerDeals = [];
+    const dealerDeals = [];
+    let turned;
+
+    // Collect cards in server seat order before putting the local seat first on screen.
+    const queuePlayer = opening ? (card, index) => (passes[index] ?? playerDeals).push(card)
+      : continuing ? (card) => playerDeals.push(card) : undefined;
+    const panels = (table?.players ?? []).map((player) => playerPanel(
+      player, table, you, prior?.players.find((seat) => seat.id === player.id), queuePlayer,
+    ));
+    if (ownSeat && table.phase !== "lobby") {
+      const [ownPanel] = panels.splice(table.players.indexOf(ownSeat), 1);
+      panels.unshift(ownPanel);
+    }
+    players.replaceChildren(...panels);
 
     if (table?.dealer) {
       const priorCards = prior?.dealer?.cards ?? [];
-      dealerCards.replaceChildren(cardsFor(table.dealer, (index, card) => {
-        if (!animate) return;
-        if (index >= priorCards.length) return "casino-card--dealt";
-        if (priorCards[index] === null && card !== null) return "casino-card--turned";
+      dealerCards.replaceChildren(cardsFor(table.dealer, (chip, index, card) => {
+        if (opening && index < 2) passes[index].push(chip);
+        else if ((opening || continuing) && index >= priorCards.length) dealerDeals.push(chip);
+        else if (continuing && priorCards[index] === null && card !== null) turned = chip;
       }), element("p", "Очки " + table.dealer.total));
     } else {
       dealerCards.replaceChildren(emptyHand);
     }
 
-    const roster = ownSeat && table.phase !== "lobby"
-      ? [ownSeat, ...table.players.filter((player) => player !== ownSeat)]
-      : table?.players ?? [];
-    players.replaceChildren(...roster.map((player, index) => playerPanel(
-      player, table, you, prior?.players.find((seat) => seat.id === player.id), animate, Math.min(index, 4) * 18,
-    )));
+    animateDeal([...passes.flat(), ...playerDeals, ...dealerDeals], turned, playerDeals.length);
   }
 
   function statusText(table, you, seated) {
@@ -233,7 +262,7 @@
     return current ? "Ходит " + current.name : "Ход дилера.";
   }
 
-  function render() {
+  function render(previous, action) {
     const table = snapshot?.table;
     const you = snapshot?.user_id;
     const actions = snapshot?.actions ?? [];
@@ -273,7 +302,7 @@
     moveBar.hidden = table?.phase !== "playing" || !ownSeat;
     dock.hidden = betForm.hidden && lobbyActions.hidden && moveBar.hidden;
     for (const { action, control } of moves) control.disabled = !editable || !actions.includes(action);
-    renderHands(table, you, ownSeat);
+    renderHands(table, you, ownSeat, previous, action);
   }
 
   function accept(data) {
@@ -281,22 +310,25 @@
         (data.table !== null && !Array.isArray(data.table?.players))) {
       throw new Error("Сервер вернул неполные данные стола.");
     }
+    const previous = syncError ? null : snapshot;
     snapshot = data;
     syncError = "";
+    return previous;
   }
 
   async function refresh() {
     if (!visible || busy) return;
     clearTimeout(timer);
     const token = ++serial;
+    let previous;
     try {
       const data = await request("state", { mode });
-      if (token === serial) accept(data);
+      if (token === serial) previous = accept(data);
     } catch (error) {
       if (token === serial) syncError = error.message || "Не удалось обновить стол.";
     } finally {
       if (visible && token === serial) {
-        render();
+        render(previous);
         timer = setTimeout(refresh, snapshot?.table ? 1000 : 1900);
       }
     }
@@ -307,18 +339,19 @@
     clearTimeout(timer);
     const token = ++serial;
     const table = snapshot.table;
+    let previous;
     busy = true;
     actionError = "";
     render();
     try {
       const data = await request(action, { ...fields, mode, round: table?.id ?? null, turn: table?.turn });
-      if (token === serial) accept(data);
+      if (token === serial) previous = accept(data);
     } catch (error) {
       if (token === serial) actionError = error.message || "Не удалось выполнить действие.";
     } finally {
       busy = false;
       if (visible) {
-        render();
+        render(previous, action);
         void refresh();
       }
     }
