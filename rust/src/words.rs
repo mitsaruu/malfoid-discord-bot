@@ -1,4 +1,4 @@
-//! Игры в слова из 5 букв: /words открывает русское или немецкое слово дня.
+//! Игры в слова из 5 букв: русское и немецкое слово дня доступны в /games.
 //! Здесь правила, словари, проверка слов по Викисловарю и работа с базой. Мини-приложение — в miniapp.rs,
 //! картинка и сообщения в чат — в wordboard.rs.
 //!
@@ -39,7 +39,7 @@ impl Lang {
     }
 
     pub fn command(self) -> &'static str {
-        "/words"
+        "/games"
     }
 
     /// «немецкое слово» / «русское слово»
@@ -598,8 +598,8 @@ mod tests {
 
     #[test]
     fn unified_command_and_moscow_rollover() {
-        assert_eq!(Lang::Ru.command(), "/words");
-        assert_eq!(Lang::De.command(), "/words");
+        assert_eq!(Lang::Ru.command(), "/games");
+        assert_eq!(Lang::De.command(), "/games");
         let old = crate::config::Settings::parse("[wortspiel]\ntimezone=Europe/Berlin\n[slovo]\ntimezone=Europe/Moscow\n");
         let settings = WordSettings::load(&old);
         let midnight: chrono::DateTime<chrono::Utc> = "2026-11-15T21:00:00Z".parse().unwrap();

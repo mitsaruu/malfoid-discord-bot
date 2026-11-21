@@ -242,22 +242,14 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
     let name = member.display_name().to_string();
     let now = Instant::now();
     let lang = crate::wordsummary::preferred_lang(&app.data, guild, user);
-    let session = Session {
+    let mut session = Session {
         guild, user, name: name.clone(), face: member.face(), channel, parent, created: now, checked: now, lang,
     };
-    let wants_rocket = app.data.rocket.take_open(guild, user);
-    let (game, state) = if wants_rocket {
-        check_game_channel(&app.data, &session, "rocket")?;
-        ("rocket", Value::Null)
-    } else {
-        check_game_channel(&app.data, &session, "words")?;
-        let game = words::daily_game(&app.data, guild, user, lang).map_err(failed)?;
-        let state = app.state_of(&session, &game)?;
-        if !game.finished() {
-            app.refresh_board(&session, lang);
-        }
-        ("words", state)
-    };
+    check_game_channel(&app.data, &session, "games")?;
+    let game = app.data.boards.take_word_link(guild, user, channel).await.map(|lang| {
+        session.lang = lang;
+        "words"
+    });
     let pass = Alphanumeric.sample_string(&mut rand::rng(), 32);
     {
         let mut sessions = locked(&app.sessions);
@@ -269,7 +261,7 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         }
         sessions.insert(pass.clone(), session);
     }
-    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": game, "state": state })).into_response())
+    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": game })).into_response())
 }
 
 async fn rocket_state(State(app): State<App>, headers: HeaderMap) -> Reply {
@@ -363,6 +355,9 @@ fn start_game_cleanup(data: Shared) {
 async fn state(State(app): State<App>, headers: HeaderMap) -> Reply {
     let (_, session) = app.authorized(&headers, Some("words"), false).await?;
     let game = words::daily_game(&app.data, session.guild, session.user, session.lang).map_err(failed)?;
+    if !game.finished() {
+        app.refresh_board(&session, session.lang);
+    }
     Ok(Json(json!({ "state": app.state_of(&session, &game)? })).into_response())
 }
 

@@ -19,9 +19,12 @@
   const title = element("h1", "", "Мины");
   title.id = "mines-title";
   root.setAttribute("aria-labelledby", title.id);
-  const wallet = element("p");
-  const panel = element("section", "casino-panel");
-  const form = element("form", "casino-toolbar");
+  const wallet = element("p", "casino-balance");
+  const header = element("header", "casino-header");
+  header.append(title, wallet);
+  const layout = element("div", "mines-layout");
+  const panel = element("section", "casino-panel mines-controls");
+  const form = element("form", "mines-form");
   const betLabel = element("label", "", "Ставка");
   const bet = element("input");
   bet.type = "text";
@@ -42,24 +45,20 @@
   countLabel.append(mineCount);
   const start = button("Открыть поле", "casino-button", "submit");
   form.append(betLabel, maximum, countLabel, start);
-  const controls = element("div", "casino-toolbar");
+  const controls = element("div", "mines-cashout");
   const cashout = button("Забрать монеты", "casino-button");
-  const countdown = element("span");
+  const countdown = element("span", "casino-timer");
   controls.append(cashout, countdown);
   const feedback = element("p", "casino-feedback");
   feedback.setAttribute("role", "status");
   const errorMessage = element("p", "casino-feedback");
   errorMessage.setAttribute("role", "status");
   const retry = button("Обновить состояние");
-  const grid = element("div", "casino-grid");
+  const grid = element("div", "mines-grid");
   grid.setAttribute("role", "group");
   grid.setAttribute("aria-label", "Поле из 25 клеток");
-  grid.style.gridTemplateColumns = "repeat(5, minmax(0, 1fr))";
-  grid.style.maxWidth = "32rem";
   const tiles = Array.from({ length: 25 }, (_, index) => {
-    const tile = button("·", "casino-card");
-    tile.style.minWidth = "0";
-    tile.style.padding = "0";
+    const tile = button("·", "mines-tile");
     tile.addEventListener("click", () => {
       if (snapshot?.round?.status !== "active" || snapshot.round.cells[index] !== "hidden") return;
       mutate("reveal", { round_id: snapshot.round.id, cell: index });
@@ -67,9 +66,12 @@
     grid.append(tile);
     return tile;
   });
-  const rules = element("p");
-  panel.append(form, controls, feedback, grid, errorMessage, retry, rules);
-  root.replaceChildren(title, wallet, panel);
+  const field = element("section", "mines-field");
+  field.append(grid);
+  const rules = element("p", "mines-rules");
+  panel.append(form, controls, feedback, errorMessage, retry);
+  layout.append(panel, field);
+  root.replaceChildren(header, layout, rules);
 
   let visible = false;
   let pending = false;
@@ -82,10 +84,10 @@
   let failure = "";
   let actionError = "";
   const tileViews = {
-    hidden: ["·", "закрыта", ""],
-    safe: ["◆", "безопасна", "#23534a"],
-    mine: ["✹", "мина", "#5a343d"],
-    hit: ["✕", "подрыв", "#a33446"],
+    hidden: ["·", "закрыта"],
+    safe: ["◆", "безопасна"],
+    mine: ["✹", "мина"],
+    hit: ["✕", "подрыв"],
   };
 
   function setText(node, text) {
@@ -118,6 +120,7 @@
     bet.disabled = maximum.disabled = mineCount.disabled = start.disabled = blocked || active;
     cashout.disabled = blocked || !active || round.cashout == null;
     cashout.hidden = countdown.hidden = !active;
+    controls.hidden = !active;
     retry.hidden = !failure;
     retry.disabled = pending || reading !== null;
     errorMessage.hidden = !(failure || actionError);
@@ -143,12 +146,10 @@
     updateClock();
     for (const [index, tile] of tiles.entries()) {
       const state = round?.cells[index] ?? "hidden";
-      const [icon, description, color] = tileViews[state];
+      const [icon, description] = tileViews[state];
       tile.disabled = blocked || !active || state !== "hidden";
       if (tile.dataset.state !== state) {
         tile.dataset.state = state;
-        tile.style.backgroundColor = color;
-        tile.style.opacity = state === "hidden" ? "" : "1";
         tile.setAttribute("aria-label", `Ряд ${Math.floor(index / 5) + 1}, клетка ${index % 5 + 1}, ${description}`);
         setText(tile, icon);
       }

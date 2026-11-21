@@ -85,19 +85,23 @@ function viewFixture() {
   const window = Object.assign(new EventTarget(), { matchMedia: () => new EventTarget() });
   const navigator = { onLine: true };
   const io = transport();
+  let paint;
   const browser = vm.createContext({
     document, window, navigator, request: io.request,
     performance: { now: io.now }, setTimeout: io.setTimer, clearTimeout: io.clearTimer,
     ResizeObserver: class { observe() {} },
-    requestAnimationFrame: () => 1,
-    cancelAnimationFrame() {},
+    requestAnimationFrame: (callback) => { paint = callback; return 1; },
+    cancelAnimationFrame: () => { paint = null; },
   });
   vm.runInContext(source, browser);
   const view = vm.runInContext('createRocketView(request)', browser);
   const [, panel] = form.children;
   const [setup, status, stop] = panel.children;
   const [, rounds, start] = setup.children;
-  return { ...io, view, document, window, navigator, settings, setup, status, rounds, start, stop };
+  return {
+    ...io, view, document, window, navigator, elements, settings, setup, status, rounds, start, stop,
+    frame: (sinceSample = 0) => paint(io.now() + sinceSample),
+  };
 }
 
 test('start uses server flight ID and optional auto, and ignores a late state poll', async () => {
@@ -191,8 +195,13 @@ test('auto start is opt-in and spends only the selected additional rounds at the
   await f.poll(snapshot({ ...first, status: 'crashed' }, 430));
   await f.reply(f.requests.at(-1), snapshot(second, 360));
   assert.equal(f.current().repeat.remaining, 1);
-  await f.poll(snapshot({ ...second, status: 'paid', automatic: true }, 482));
-  await f.poll(snapshot({ ...second, status: 'paid', automatic: true }, 482));
+  const paid = { ...second, status: 'flying', cashout_multiplier: 175, payout: 122, automatic: true };
+  const crashed = { ...paid, status: 'crashed', multiplier: 220 };
+  await f.poll(snapshot(paid, 482));
+  await f.poll(snapshot(paid, 482));
+  assert.equal(f.starts().length, 1, 'automatic payout leaves the next flight queued');
+  await f.poll(snapshot(crashed, 482));
+  await f.poll(snapshot(crashed, 482));
   await f.reply(f.requests.at(-1), snapshot(third, 412));
   await f.poll(snapshot({ ...third, status: 'crashed' }, 412));
   await f.poll(snapshot({ ...third, status: 'crashed' }, 412));
@@ -203,7 +212,7 @@ test('auto start is opt-in and spends only the selected additional rounds at the
   assert.equal(f.current().repeat, null);
 });
 
-test('auto start keeps manual cashout mode and allows manual cashout during the run', async () => {
+test('auto start keeps manual cashout mode and waits for the crash after payout', async () => {
   const f = fixture();
   const flying = flight('flying');
   f.feed.show();
@@ -211,12 +220,56 @@ test('auto start keeps manual cashout mode and allows manual cashout during the 
   f.feed.startRepeat(1);
   const cashout = f.feed.cashout();
   assert.equal(f.requests.at(-1).path, 'api/rocket/cashout');
-  const paid = snapshot({ ...flying, status: 'paid', payout: 110 });
+  const paid = snapshot({ ...flying, payout: 110, cashout_multiplier: 110 }, 510);
   await f.reply(f.requests.at(-1), paid);
   await cashout;
   assert.deepEqual(f.starts(), []);
+  const duplicate = f.feed.cashout();
+  assert.equal(f.requests.length, 2, 'a paid flight permits neither cashout nor launch');
+  await duplicate;
+  const earlyLaunch = f.feed.launch('100', null);
+  assert.equal(f.requests.length, 2, 'the next stake is blocked until crash');
+  await earlyLaunch;
   await f.poll(paid);
+  await f.poll(paid);
+  assert.deepEqual(f.starts(), [], 'active polling never spends the next stake');
+  const crashed = snapshot({ ...paid.flight, status: 'crashed', multiplier: 240 }, 510);
+  await f.poll(crashed);
+  assert.deepEqual(f.starts(), [], 'the crash stays visible before the next start');
+  await f.poll(crashed);
   assert.deepEqual(f.starts(), [{ bet: '100', auto: null, expected_id: flying.id }]);
+});
+
+test('reloading a cashed-out flight shows the fixed payout and keeps launch locked until crash', async () => {
+  const f = viewFixture();
+  const action = f.elements.get('rocket-action');
+  const payoutLabel = f.elements.get('rocket-payout-label');
+  const payout = f.elements.get('rocket-payout');
+  const liveMultiplier = f.elements.get('rocket-multiplier');
+  const clock = f.elements.get('rocket-time');
+  const paid = flight('flying', { multiplier: 210, elapsed_ms: 6500, auto: 175,
+    payout: 175, cashout_multiplier: 175, automatic: true });
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(paid, 575));
+  assert.equal(f.settings.hidden, true);
+  assert.equal(action.attributes.get('aria-disabled'), 'true');
+  assert.match(payoutLabel.textContent, /1,75×/);
+  assert.equal(payout.textContent, '175 мон.');
+  assert.equal(f.stop.hidden, true, 'reload never opts back into auto start');
+  f.frame();
+  const initialTime = clock.textContent;
+  f.frame(400);
+  assert.notEqual(clock.textContent, initialTime);
+  assert.equal(liveMultiplier.textContent, '2,10×');
+
+  await f.poll(snapshot({ ...paid, status: 'crashed', multiplier: 260, elapsed_ms: 8271 }, 575));
+  f.frame();
+  assert.equal(liveMultiplier.textContent, '2,60×');
+  assert.equal(f.elements.get('rocket-multiplier-caption').textContent, 'Пик полёта');
+  assert.equal(action.attributes.get('aria-disabled'), 'false');
+  assert.match(payoutLabel.textContent, /1,75×/);
+  assert.equal(payout.textContent, '175 мон.');
+  assert.deepEqual(f.starts(), []);
 });
 
 test('a manual launch supersedes a queued auto start and keeps its own wager settings', async () => {
@@ -391,11 +444,12 @@ for (const [name, interrupt, resume] of [
   });
 }
 
-test('visual telemetry extrapolates briefly from the server time and freezes at server outcomes', () => {
-  const flying = flight('flying', { elapsed_ms: 5800, multiplier: 195 });
-  assert.equal(rocketTelemetry(flying, 200).multiplier, 200);
+test('visual telemetry advances the clock but only shows the confirmed multiplier', () => {
+  const flying = flight('flying', { elapsed_ms: 5800, multiplier: 195, payout: 150, cashout_multiplier: 150 });
+  assert.equal(rocketTelemetry(flying, 200).elapsed, 6000);
+  assert.equal(rocketTelemetry(flying, 200).multiplier, 195);
   assert.equal(rocketTelemetry(flying, 8000).elapsed, rocketTelemetry(flying, 650).elapsed);
-  assert.equal(rocketTelemetry(flight('flying', { elapsed_ms: 19800, multiplier: 985 }), 650).multiplier, 1000);
+  assert.equal(rocketTelemetry(flight('flying', { elapsed_ms: 19800, multiplier: 985 }), 650).multiplier, 985);
   assert.equal(rocketTelemetry(flight('countdown', { elapsed_ms: -10 }), 500).elapsed, 0);
   assert.equal(rocketTelemetry(flight('crashed', { multiplier: 146, elapsed_ms: 3250 }), 650).multiplier, 146);
   assert.equal(rocketTelemetry(flight('paid', { multiplier: 185, elapsed_ms: 5600 }), 650).elapsed, 5600);

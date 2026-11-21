@@ -107,6 +107,7 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
 .rocket-flight div + div { margin-top: 5px; }
 .rocket-flight dt { color: var(--rocket-muted); font-size: 12px; }
 .rocket-flight dd { margin: 0; font-size: 13px; font-weight: 650; text-align: right; }
+.rocket[data-cashed-out="true"] #rocket-payout { color: #8ff4ca; }
 .rocket-form { margin-top: 14px; }
 .rocket-form fieldset { border: 0; margin: 0; padding: 0; min-inline-size: 0; display: grid; gap: 14px; }
 .rocket-field { display: grid; gap: 6px; }

@@ -313,7 +313,6 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         economy::coinflip(),
         economy::slots(),
         blackjack::blackjack(),
-        rocket::rocket(),
         roulette::roulette(),
         pets::open_case(),
         pets::cases(),
@@ -330,7 +329,7 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         levels::rank(),
         levels::leaderboard(),
         levels::money_leaderboard(),
-        wordboard::words(),
+        wordboard::games(),
         wordstats::wordstats(),
         wordstats::wordtop(),
         wordstats::wordduel(),
@@ -601,33 +600,30 @@ mod tests {
     }
 
     #[test]
-    fn registered_commands_have_one_word_game_and_new_music_library() {
+    fn registered_commands_have_one_activity_launcher_and_music_library() {
         let commands = super::bot_commands();
         let payload = serde_json::to_value(poise::builtins::create_application_commands(&commands)).unwrap();
         let list = payload.as_array().unwrap();
         let names: std::collections::BTreeSet<_> = list.iter().map(|c| c["name"].as_str().unwrap()).collect();
         assert_eq!(names.len(), list.len());
-        assert!(names.contains("words"));
-        assert!(!names.contains("slovo") && !names.contains("wort"));
+        let games = list.iter().find(|c| c["name"] == "games").unwrap();
+        assert!(games["options"].as_array().is_none_or(Vec::is_empty));
+        for retired in ["slovo", "wort", "words", "rocket"] {
+            assert!(!names.contains(retired));
+        }
         assert!(!names.contains("welcome_channel"));
         assert!(names.contains("music_channel") && names.contains("status"));
-        let rocket = list.iter().find(|c| c["name"] == "rocket").unwrap();
-        assert!(rocket["options"].as_array().is_none_or(Vec::is_empty));
         let roulette = list.iter().find(|c| c["name"] == "roulette").unwrap();
         assert_eq!(roulette["options"][1]["name"], "space");
         assert_eq!(roulette["options"][1]["autocomplete"], true);
-        let words = list.iter().find(|c| c["name"] == "words").unwrap();
-        assert_eq!(words["options"].as_array().unwrap().len(), 1);
-        assert_eq!(words["options"][0]["name"], "language");
-        assert_eq!(words["options"][0]["choices"].as_array().unwrap().len(), 2);
         #[cfg(feature = "voice")]
         {
-            assert_eq!(names.len(), 79);
+            assert_eq!(names.len(), 78);
             assert!(names.contains("favorites") && names.contains("history"));
         }
         #[cfg(not(feature = "voice"))]
         {
-            assert_eq!(names.len(), 58);
+            assert_eq!(names.len(), 57);
             assert!(!names.contains("favorites") && !names.contains("history"));
         }
     }

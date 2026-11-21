@@ -9,15 +9,20 @@ use std::collections::BTreeSet;
 
 /// Какие команды работают только в канале для игр, если его выбрали (settings.ini → [channels] games_commands).
 pub const DEFAULT_GAMES_COMMANDS: &str = "rank, leaderboard, money_leaderboard, dick_growth, dick_size, \
-    dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, rocket, roulette, case, pets, pets_collect, pet_feed, pet_sell, \
+    dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, games, rocket, roulette, case, pets, pets_collect, pet_feed, pet_sell, \
     dice, roll, predskazanie, shar, words, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz";
 
 /// Названия через запятую → набор названий без «/» и в нижнем регистре.
 pub fn parse_commands(text: &str) -> BTreeSet<String> {
-    text.split(',').map(|name| {
+    let mut commands: BTreeSet<_> = text.split(',').map(|name| {
         let name = name.trim().trim_start_matches('/').to_lowercase();
         if matches!(name.as_str(), "wort" | "slovo") { "words".to_string() } else { name }
-    }).filter(|name| !name.is_empty() && !crate::music_channels::is_music_command(name)).collect()
+    }).filter(|name| !name.is_empty() && !crate::music_channels::is_music_command(name)).collect();
+    // Старые настройки игрового канала включают команды, объединённые в /games.
+    if commands.contains("words") || commands.contains("rocket") {
+        commands.insert("games".into());
+    }
+    commands
 }
 
 /// Что боту можно в этом канале. None — не получилось узнать (нет данных о сервере).
@@ -79,7 +84,9 @@ pub async fn set_games_channel(
             channel.id)).await;
     }
     data.db.set_games_channel(guild, Some(channel.id.get()))?;
-    let commands: Vec<String> = data.games_commands.iter().map(|name| format!("/{name}")).collect();
+    let commands: Vec<String> = data.games_commands.iter()
+        .filter(|name| !matches!(name.as_str(), "words" | "rocket"))
+        .map(|name| format!("/{name}")).collect();
     say(ctx, format!(
         "✅ Теперь эти команды работают только в <#{}>:\n{}\nЧтобы снова разрешить их везде — вызови /games_channel без канала.",
         channel.id, commands.join(", "))).await
@@ -201,6 +208,9 @@ mod tests {
         assert!(parse_commands(DEFAULT_GAMES_COMMANDS).contains("wordduel"));
         let legacy = parse_commands("wort, /slovo, wordstats");
         assert!(legacy.contains("words"));
+        assert!(!allowed_here(&legacy, "games", Some(9), 5, None));
+        assert!(allowed_here(&legacy, "games", Some(9), 5, Some(9)));
+        assert!(parse_commands("rocket").contains("games"));
         assert!(!legacy.contains("wort") && !legacy.contains("slovo"));
         assert!(!allowed_here(&legacy, "words", Some(9), 5, None));
     }

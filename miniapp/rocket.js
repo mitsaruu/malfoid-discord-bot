@@ -19,6 +19,10 @@ function rocketActive(flight) {
   return flight?.status === "countdown" || flight?.status === "flying";
 }
 
+function rocketCanCashout(flight) {
+  return flight?.status === "flying" && flight.payout == null;
+}
+
 function rocketMultiplierAt(elapsed) {
   return elapsed >= ROCKET_MAX_DURATION ? ROCKET_MAX_MULTIPLIER : 100 * 2 ** (Math.max(0, elapsed) / ROCKET_DOUBLE_MS);
 }
@@ -30,8 +34,9 @@ function rocketTelemetry(flight, sinceSample) {
   if (flight.status !== "flying" || drift === 0) {
     return { elapsed: Math.max(0, flight.elapsed_ms), multiplier: flight.multiplier };
   }
+  // Only the clock is interpolated. The server confirms every displayed multiplier.
   const elapsed = Math.min(ROCKET_MAX_DURATION, Math.max(0, flight.elapsed_ms + drift));
-  return { elapsed, multiplier: Math.max(flight.multiplier, Math.floor(rocketMultiplierAt(elapsed))) };
+  return { elapsed, multiplier: flight.multiplier };
 }
 
 function rocketResponse(data) {
@@ -207,7 +212,7 @@ function createRocketFeed({
       await mutate("start", { bet, auto, expected_id: snapshot.flight?.id ?? null });
     },
     async cashout() {
-      if (!visible || pending || needsSync || snapshot?.flight?.status !== "flying") return;
+      if (!visible || pending || needsSync || !rocketCanCashout(snapshot?.flight)) return;
       await mutate("cashout", { id: snapshot.flight.id });
     },
   };
@@ -303,7 +308,7 @@ function createRocketChart(canvas) {
   const stars = Array.from({ length: 44 }, (_, i) => [((i * 197 + 71) % 503) / 503, ((i * 71 + 13) % 241) / 241]);
   const colors = { crashed: "#ff957b", paid: "#7af4c7", refunded: "#ffd690" };
 
-  return function draw(status, { elapsed, multiplier }, timestamp, transition, reducedMotion) {
+  return function draw(status, { elapsed, multiplier: factor }, timestamp, transition, reducedMotion) {
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     if (!ctx || width < 100 || height < 100) return;
@@ -321,8 +326,6 @@ function createRocketChart(canvas) {
     const top = 25;
     const time = Math.max(0, elapsed);
     const timeLimit = Math.max(10500, time * 1.21);
-    const factor = rocketActive({ status }) && status === "flying" && !reducedMotion ?
-      Math.max(multiplier, rocketMultiplierAt(time)) : multiplier;
     const factorLimit = Math.max(250, factor * 1.24);
     const xFor = (value) => left + (right - left) * value / timeLimit;
     const yFor = (value) => bottom - (bottom - top) * (value - 100) / (factorLimit - 100);
@@ -411,6 +414,7 @@ function createRocketView(request) {
   const clock = get("time");
   const clockLabel = get("time-label");
   const multiplierLabel = get("multiplier");
+  const multiplierCaption = get("multiplier-caption");
   const balance = get("balance");
   const message = get("message");
   const retry = get("retry");
@@ -549,19 +553,22 @@ function createRocketView(request) {
     const flight = snapshot?.flight;
     const status = flight?.status || "idle";
     const active = rocketActive(flight);
+    const paid = flight?.payout != null && status !== "refunded";
     const lowBalance = snapshot && maximum(snapshot) < snapshot.min_bet;
     const locked = Boolean(connectionError || pending || needsSync || !snapshot);
-    const actionEnabled = !locked && (status === "flying" || (!active && !lowBalance));
+    const actionEnabled = !locked && (rocketCanCashout(flight) || (!active && !lowBalance));
     root.dataset.phase = status;
+    root.dataset.cashedOut = String(paid);
     write(phaseLabel, connectionError || (!snapshot && syncError) ? "Нет соединения" :
       snapshot ? ROCKET_STATUS[status] : "Подключение");
+    write(multiplierCaption, status === "crashed" ? "Пик полёта" : "Коэффициент");
     write(balance, snapshot ? number.format(snapshot.balance) + " мон." : "—");
     settings.hidden = active;
     settings.disabled = locked || active || lowBalance;
     action.setAttribute("aria-disabled", String(!actionEnabled));
     const actionText = pending === "start" ? "Готовим запуск…" : pending === "cashout" ? "Забираем монеты…" :
       connectionError ? "Соединение закрыто" : needsSync ? "Подключение…" :
-      status === "countdown" ? "Ждём старта…" : status === "flying" ? "Забрать монеты" :
+      status === "countdown" ? "Ждём старта…" : status === "flying" ? (paid ? "Ждём конца полёта…" : "Забрать монеты") :
       lowBalance ? "Недостаточно монет" : "Запустить ракету";
     write(action, actionText);
     retry.hidden = !syncError || Boolean(connectionError);
@@ -573,7 +580,9 @@ function createRocketView(request) {
       write(get("stake"), number.format(flight.stake) + " мон.");
       write(get("target"), flight.auto == null ? "Выключен" : displayFactor(flight.auto));
       get("payout-row").hidden = flight.payout == null;
-      write(get("payout-label"), status === "refunded" ? "Возврат" : flight.automatic ? "Автовыплата" : "Выплата");
+      const payoutLabel = status === "refunded" ? "Возврат" : flight.automatic ? "Автовыплата" : "Выплата";
+      const cashoutMultiplier = flight.cashout_multiplier ?? (status === "paid" ? flight.multiplier : null);
+      write(get("payout-label"), cashoutMultiplier == null ? payoutLabel : payoutLabel + " · " + displayFactor(cashoutMultiplier));
       if (flight.payout != null) write(get("payout"), number.format(flight.payout) + " мон.");
     }
 
@@ -586,9 +595,10 @@ function createRocketView(request) {
     const result = {
       idle: "Укажите ставку перед стартом.",
       countdown: "Вывод станет доступен после старта.",
-      flying: "Вывод подтверждает сервер в момент запроса.",
+      flying: paid ? (flight.automatic ? "Автовывод сработал. Полёт продолжается." :
+        "Монеты зачислены. Полёт продолжается.") : "Вывод подтверждает сервер в момент запроса.",
       paid: flight?.automatic ? "Автовывод сработал." : "Монеты зачислены на баланс.",
-      crashed: "Ракета потеряна вместе со ставкой.",
+      crashed: paid ? "Ракета разбилась. Выплата уже на балансе." : "Ракета потеряна вместе со ставкой.",
       refunded: "Монеты возвращены на баланс.",
     };
     const error = connectionError || syncError || fieldError || actionError;
@@ -627,7 +637,7 @@ function createRocketView(request) {
     event.preventDefault();
     if (action.getAttribute("aria-disabled") === "true") return;
     const data = current.snapshot;
-    if (data.flight?.status === "flying") {
+    if (rocketCanCashout(data.flight)) {
       feed.cashout();
       return;
     }

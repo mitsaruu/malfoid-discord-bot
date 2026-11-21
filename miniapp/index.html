@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Wortjagd</title>
+  <title>Игры Malfoid</title>
   <link rel="stylesheet" href="static/style.css">
   <link rel="stylesheet" href="static/rocket.css">
   <link rel="stylesheet" href="static/casino.css">
@@ -15,10 +15,14 @@
       <h2>Игры Malfoid</h2>
       <p class="splash-text" id="splash-text" role="status">Загружаем игры…</p>
       <div class="progress"><div class="progress-bar" id="progress"></div></div>
-      <p class="tip"><code>/rocket</code> · <code>/words</code></p>
+      <p class="tip"><code>/games</code></p>
     </div>
     <footer class="splash-footer">The BakaSoft Solution Games</footer>
   </div>
+
+  <header class="game-lobby" id="game-lobby" hidden>
+    <h1>Выберите игру</h1>
+  </header>
 
   <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru" hidden>
     <button type="button" data-game="words" aria-controls="app" aria-pressed="false">Слово дня</button>
@@ -69,7 +73,7 @@
           <div class="rocket-phase"><i aria-hidden="true"></i><span id="rocket-phase" role="status">Подключение</span></div>
           <div class="rocket-clock"><span id="rocket-time-label">Время полёта</span><strong id="rocket-time">—</strong></div>
           <div class="rocket-readout">
-            <span>Коэффициент</span>
+            <span id="rocket-multiplier-caption">Коэффициент</span>
             <strong id="rocket-multiplier">1,00×</strong>
           </div>
         </div>

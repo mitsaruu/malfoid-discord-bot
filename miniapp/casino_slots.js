@@ -19,8 +19,11 @@
   const title = element("h1", "", "Слоты");
   title.id = "slots-title";
   root.setAttribute("aria-labelledby", title.id);
-  const wallet = element("p");
-  const panel = element("section", "casino-panel");
+  const wallet = element("p", "casino-balance");
+  const header = element("header", "casino-header");
+  header.append(title, wallet);
+  const panel = element("section", "slots-cabinet");
+  const dock = element("div", "casino-dock slots-dock");
   const form = element("form", "casino-toolbar");
   const betLabel = element("label", "", "Ставка");
   const bet = element("input");
@@ -33,25 +36,17 @@
   const maximum = button("Макс.");
   const spin = button("Вращать", "casino-button", "submit");
   form.append(betLabel, maximum, spin);
-  const grid = element("div", "casino-grid");
+  const grid = element("div", "slots-reels");
   grid.setAttribute("role", "group");
   grid.setAttribute("aria-label", "Пять барабанов по три символа");
-  grid.style.gridTemplateColumns = "repeat(5, minmax(0, 1fr))";
-  grid.style.maxWidth = "35rem";
-  grid.style.marginBlock = "12px";
   const reels = Array.from({ length: 5 }, (_, column) => {
-    const frame = element("div");
-    frame.style.overflow = "hidden";
-    frame.style.borderRadius = "8px";
-    const strip = element("div", "casino-grid");
+    const frame = element("div", "slots-reel");
+    const strip = element("div", "slots-strip");
     strip.setAttribute("role", "group");
     strip.setAttribute("aria-label", `Барабан ${column + 1}`);
     const cells = Array.from({ length: 3 }, () => {
-      const cell = element("span", "casino-card", "·");
+      const cell = element("span", "slots-symbol", "·");
       cell.setAttribute("role", "img");
-      cell.style.minWidth = "0";
-      cell.style.padding = "0";
-      cell.style.fontSize = "clamp(1.05rem, 5vw, 2rem)";
       strip.append(cell);
       return cell;
     });
@@ -61,24 +56,23 @@
   });
   const feedback = element("p", "casino-feedback");
   feedback.setAttribute("role", "status");
-  const wins = element("ul");
+  const wins = element("ul", "slots-wins");
   const notice = element("p", "casino-feedback");
   notice.setAttribute("role", "status");
   const retry = button("Проверить последний результат");
-  panel.append(form, grid, feedback, wins, notice, retry);
+  dock.append(form, feedback, wins, notice, retry);
+  panel.append(grid, dock);
 
   const rules = element("section", "casino-panel");
   const linesHeading = element("h2", "", "Линии выплат");
-  const linePicker = element("div", "casino-toolbar");
+  const linePicker = element("div", "casino-toolbar slots-lines");
   linePicker.setAttribute("role", "group");
   linePicker.setAttribute("aria-label", "Подсветка линии на барабанах");
   const explanation = element("p", "", "Три и более одинаковых символа подряд от левого края дают выплату по линии. Каждый множитель применяется к полной ставке. Выплаты по линиям складываются.");
-  const paytable = element("table");
-  paytable.style.width = "100%";
-  paytable.style.textAlign = "center";
+  const paytable = element("table", "slots-paytable");
   paytable.setAttribute("aria-label", "Таблица выплат");
   rules.append(linesHeading, linePicker, explanation, element("h2", "", "Таблица выплат"), paytable);
-  root.replaceChildren(title, wallet, panel, rules);
+  root.replaceChildren(header, panel, rules);
 
   let visible = false;
   let busy = false;
@@ -99,11 +93,8 @@
     lineButtons = snapshot.paylines.map(({ name, rows }, index) => {
       const choice = button(name);
       choice.setAttribute("aria-pressed", "false");
-      const diagram = element("span", "casino-grid");
+      const diagram = element("span", "slots-line-diagram");
       diagram.setAttribute("aria-hidden", "true");
-      diagram.style.gridTemplateColumns = "repeat(5, 1fr)";
-      diagram.style.gap = "0 2px";
-      diagram.style.lineHeight = "1";
       for (let row = 0; row < 3; row++) {
         for (const activeRow of rows) {
           diagram.append(element("span", "", row === activeRow ? "●" : "·"));
@@ -156,8 +147,9 @@
           return column < count && snapshot.paylines[line].rows[column] === row;
         });
         const marked = highlight && selectedLine !== null && snapshot.paylines[selectedLine].rows[column] === row;
-        cell.style.backgroundColor = winning ? "#f5ce92" : marked ? "#fff1d2" : "";
-        cell.style.boxShadow = marked ? "inset 0 0 0 3px #8f5d29" : "";
+        cell.classList.toggle("slots-symbol--win", Boolean(winning));
+        cell.classList.toggle("slots-symbol--marked", marked);
+        cell.classList.toggle("slots-symbol--empty", !symbol);
         setText(cell, symbol?.icon ?? "·");
         cell.setAttribute("aria-label", symbol ? `${symbol.name}${winning ? ", выигрыш" : ""}` : "Пусто");
       }

@@ -25,34 +25,46 @@
     if (element.textContent !== label) element.textContent = label;
   }
 
-  function makeCards(cards, count = 0) {
-    const row = node("div", "", "casino-toolbar");
+  function makeCards(cards, count = 0, community = false) {
+    const row = node("div", "", "casino-cards");
     for (const label of cards || Array(count).fill(null)) {
-      const card = node("span", label || "▧", "casino-card");
+      const card = node("span", label, "casino-card");
       if (label) card.dataset.suit = suits[label.slice(-1)];
-      else card.setAttribute("aria-label", "Закрытая карта");
+      else if (community) {
+        card.classList.add("casino-card--empty");
+        card.setAttribute("aria-hidden", "true");
+      } else {
+        card.classList.add("casino-card--back");
+        card.setAttribute("role", "img");
+        card.setAttribute("aria-label", "Закрытая карта");
+      }
       row.append(card);
     }
     return row;
   }
 
-  const modeBar = node("div", "", "casino-toolbar");
+  const modeBar = node("div", "", "casino-toolbar casino-modes");
   modeBar.setAttribute("role", "group");
   modeBar.setAttribute("aria-label", "Режим покера");
   const onlineTab = button("Игра на сервере", () => select("online"));
   const soloTab = button("Тренировка с ботом", () => select("solo"));
   modeBar.append(onlineTab, soloTab);
 
-  const account = node("p");
+  const account = node("p", "", "casino-balance");
+  const header = node("header", "", "casino-header");
+  header.append(node("h1", "Техасский холдем"), account);
   const status = node("h2", "Загрузка…");
   status.setAttribute("aria-live", "polite");
-  const clock = node("p");
-  const board = node("div");
-  const last = node("p");
-  const tablePanel = node("section", "", "casino-panel");
-  tablePanel.append(status, clock, board, last);
-  const seats = node("div", "", "casino-grid");
-  seats.style.gridTemplateColumns = "repeat(auto-fit, minmax(min(100%, 220px), 1fr))";
+  const clock = node("p", "", "casino-timer");
+  const tableStatus = node("header", "", "casino-table-status");
+  tableStatus.append(status, clock);
+  const board = node("div", "", "poker-board");
+  const last = node("p", "", "poker-last");
+  const seats = node("div", "", "poker-seats");
+  const felt = node("div", "", "poker-felt");
+  felt.append(board, seats);
+  const tablePanel = node("section", "", "poker-table");
+  tablePanel.append(tableStatus, felt, last);
   const results = node("div", "", "casino-panel");
   const previous = node("p");
 
@@ -90,13 +102,12 @@
   raise.type = "submit";
   raiseForm.append(raiseLabel, raise);
   handControls.append(fold, check, call, allIn, raiseForm);
-  const controls = node("div", "", "casino-panel");
+  const controls = node("div", "", "casino-panel casino-dock");
   controls.append(joinForm, lobbyControls, handControls);
 
   const feedback = node("p", "", "casino-feedback");
   feedback.setAttribute("role", "status");
-  root.replaceChildren(node("h1", "Техасский холдем"), modeBar, account, tablePanel,
-    controls, feedback, seats, results, previous);
+  root.replaceChildren(header, modeBar, tablePanel, controls, feedback, results, previous);
 
   let visible = false;
   let mode = "online";
@@ -121,6 +132,10 @@
     results.replaceChildren();
     results.hidden = true;
     last.hidden = true;
+    if (table && table.status !== "lobby") {
+      board.append(node("p", `Банк · ${amount(table.pot)}`, "poker-pot"));
+    }
+    board.append(makeCards(Array.from({ length: 5 }, (_, i) => table?.board?.[i]), 0, true));
     if (!table) {
       status.textContent = state ? (mode === "online" ? "Свободный стол" : "Тренировка") : "Загрузка…";
       return;
@@ -140,12 +155,6 @@
         break;
     }
 
-    if (table.status !== "lobby") {
-      board.append(node("p", `Банк · ${amount(table.pot)}`));
-      if (table.board.length) board.append(makeCards(table.board));
-      const mine = table.seats[table.you]?.cards;
-      if (mine) board.append(node("p", "Ваши карты"), makeCards(mine));
-    }
     if (table.last_action) {
       const action = table.last_action;
       const chips = action.amount ? ` · ${amount(action.amount)}` : "";
@@ -154,10 +163,19 @@
     }
 
     table.seats.forEach((seat, i) => {
-      const player = node("section", "", "casino-panel");
-      const name = seat.name + (table.you === i ? " (вы)" : "");
-      player.append(node("h2", name));
+      const player = node("section", "", "casino-seat poker-seat");
+      const own = table.you === i;
+      const offset = (i - (table.you ?? 0) + table.seats.length) % table.seats.length;
+      player.dataset.position = String(Math.round(offset * 10 / table.seats.length));
+      player.classList.toggle("casino-seat--own", own);
+      player.classList.toggle("casino-seat--active", table.actor === i);
+      player.append(node("h3", seat.name + (own ? " (вы)" : "")));
       const chips = mode === "solo" ? "фишек" : "монет";
+      const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
+      player.append(node("p", `${stack} ${amount(seat.stack)} ${chips}`, "casino-seat-stack"));
+      if (seat.cards || (!own && table.status === "playing" && !seat.folded)) {
+        player.append(makeCards(seat.cards, 2));
+      }
       const details = [];
       if (table.status === "lobby" && i === 0) details.push("Создатель стола");
       if (table.dealer === i) details.push("Дилер");
@@ -170,12 +188,7 @@
       if (seat.rank !== null) details.push(ranks[seat.rank]);
       if (seat.won) details.push(`Выигрыш ${amount(seat.won)}`);
       if (seat.returned) details.push(`Возврат ${amount(seat.returned)}`);
-      const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
-      details.unshift(`${stack} ${amount(seat.stack)} ${chips}`);
-      player.append(node("p", details.join(" · ")));
-      if (i !== table.you && (seat.cards || (table.status === "playing" && !seat.folded))) {
-        player.append(makeCards(seat.cards, 2));
-      }
+      if (details.length) player.append(node("p", details.join(" · "), "casino-seat-details"));
       seats.append(player);
     });
 

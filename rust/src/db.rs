@@ -12,7 +12,7 @@ pub struct Pet {
     pub species: String, // вид — ключ из списка видов
     pub level: i64,
     pub last_collect: f64, // с какого момента копится доход
-    pub spent: i64,        // сколько монет в него вложено (кейс + корм) — для продажи
+    pub spent: i64,        // сколько монет вложено в питомца (кейс + корм)
 }
 
 fn pet_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pet> {

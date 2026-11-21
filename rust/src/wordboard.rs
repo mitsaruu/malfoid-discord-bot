@@ -1,5 +1,5 @@
 //! Слова в чате: картинка с полями всех, кто играет в слово дня (обновляется после каждого хода),
-//! кнопка «Играть!» и единая команда /words, которая открывает мини-приложение.
+//! кнопка «Играть!» и команда /games для запуска общего мини-приложения.
 
 use crate::draw::{self, Anchor, Fonts};
 use crate::levels::fetch_avatar;
@@ -115,6 +115,22 @@ pub struct BoardState {
     boards: tokio::sync::Mutex<HashMap<BoardKey, Board>>,
     delivery: [tokio::sync::Mutex<()>; 32],
     avatars: tokio::sync::Mutex<HashMap<String, (Instant, Option<Vec<u8>>)>>,
+    open_words: tokio::sync::Mutex<HashMap<(u64, u64, u64), (Instant, Lang)>>,
+}
+
+const WORD_LINK_TTL: Duration = Duration::from_secs(60);
+
+impl BoardState {
+    async fn remember_word_link(&self, guild: u64, user: u64, channel: u64, lang: Lang) {
+        let mut links = self.open_words.lock().await;
+        links.retain(|_, (opened, _)| opened.elapsed() < WORD_LINK_TTL);
+        links.insert((guild, user, channel), (Instant::now(), lang));
+    }
+
+    pub(crate) async fn take_word_link(&self, guild: u64, user: u64, channel: u64) -> Option<Lang> {
+        self.open_words.lock().await.remove(&(guild, user, channel))
+            .and_then(|(opened, lang)| (opened.elapsed() < WORD_LINK_TTL).then_some(lang))
+    }
 }
 
 /// Ключ включает версию и серверный вариант аватара из Discord.
@@ -273,26 +289,19 @@ fn ephemeral(text: impl Into<String>) -> serenity::CreateInteractionResponse {
 }
 
 /// Открывает мини-приложение сразу на нужной игре. respond — как ответить на команду или нажатие кнопки.
-async fn open_miniapp<F, Fut>(data: &Data, guild: Option<serenity::GuildId>, user: serenity::UserId, lang: Lang, respond: F) -> Result<(), Error>
+async fn open_miniapp<F, Fut>(data: &Data, respond: F) -> Result<bool, Error>
 where
     F: Fn(serenity::CreateInteractionResponse) -> Fut,
     Fut: std::future::Future<Output = serenity::Result<()>>,
 {
     if !data.miniapp_ready() {
-        respond(ephemeral(format!(
-            "🧩 Мини-приложение {} ещё не настроено. Админу: инструкция в rust/README.md, раздел «Игра в слова».", lang.name()))).await?;
-        return Ok(());
+        respond(ephemeral("🧩 Мини-приложение ещё не настроено. Админу: инструкция в rust/README.md.")).await?;
+        return Ok(false);
     }
-    if let Some(guild) = guild {
-        // страница спросит при входе, какую игру открыть
-        data.rocket.take_open(guild.get(), user.get());
-        crate::wordsummary::set_lang(data, guild.get(), user.get(), lang)?;
-    }
-    launch_activity(respond).await;
-    Ok(())
+    Ok(launch_activity(respond).await)
 }
 
-pub(crate) async fn launch_activity<F, Fut>(respond: F) -> bool
+async fn launch_activity<F, Fut>(respond: F) -> bool
 where
     F: Fn(serenity::CreateInteractionResponse) -> Fut,
     Fut: std::future::Future<Output = serenity::Result<()>>,
@@ -309,59 +318,48 @@ where
     true
 }
 
-async fn open_from_command(ctx: Context<'_>, lang: Lang) -> Result<(), Error> {
+/// Открыть мини-приложение со всеми играми
+#[poise::command(slash_command, guild_only)]
+pub async fn games(ctx: Context<'_>) -> Result<(), Error> {
     let poise::Context::Application(app) = ctx else { return Ok(()) };
     if let Some(guild) = ctx.guild_id() {
-        let player = Player { id: ctx.author().id.get(), name: ctx.author().name.to_string(), face: ctx.author().face() };
-        crate::wordsummary::remember_channel(ctx.data(), guild.get(), ctx.channel_id().get(), &player, lang)?;
+        ctx.data().boards.take_word_link(guild.get(), ctx.author().id.get(), ctx.channel_id().get()).await;
     }
     let http = ctx.serenity_context().http.clone();
-    open_miniapp(ctx.data(), ctx.guild_id(), ctx.author().id, lang, |response| app.interaction.create_response(&http, response)).await
-}
-
-#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
-pub enum WordLanguage {
-    #[name = "Русский"]
-    Russian,
-    #[name = "Немецкий"]
-    German,
-}
-
-/// 5 букв: русское и немецкое слово дня в мини-приложении
-#[poise::command(slash_command, guild_only)]
-pub async fn words(
-    ctx: Context<'_>,
-    #[description = "Язык слова; без выбора — последний использованный"] language: Option<WordLanguage>,
-) -> Result<(), Error> {
-    let lang = match language {
-        Some(WordLanguage::Russian) => Lang::Ru,
-        Some(WordLanguage::German) => Lang::De,
-        None => crate::wordsummary::preferred_lang(ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get()),
-    };
-    open_from_command(ctx, lang).await
+    open_miniapp(ctx.data(), |response| app.interaction.create_response(&http, response)).await?;
+    Ok(())
 }
 
 /// Нажатие кнопки «Играть!» под картинкой (работает и под старыми картинками, после перезапуска бота).
 /// Возвращает true, если это была наша кнопка.
 pub async fn play_pressed(ctx: &serenity::Context, data: &Data, press: &serenity::ComponentInteraction) -> bool {
     let Some(lang) = Lang::ALL.into_iter().find(|lang| lang.button() == press.data.custom_id) else { return false };
+    let user = press.user.id.get();
+    let channel = press.channel_id.get();
     if let Some(guild) = press.guild_id {
         let parent = press.channel.as_ref().and_then(|channel| channel.parent_id).map(|id| id.get());
         let allowed = data.db.games_channel(guild.get()).is_ok_and(|allowed| {
-            crate::admin::allowed_here(&data.games_commands, "words", allowed, press.channel_id.get(), parent)
+            ["games", "words"].into_iter().all(|command| {
+                crate::admin::allowed_here(&data.games_commands, command, allowed, channel, parent)
+            })
         });
         if !allowed {
             let _ = press.create_response(ctx, serenity::CreateInteractionResponse::Message(
-                serenity::CreateInteractionResponseMessage::new().content("Запусти /words в игровом канале сервера.").ephemeral(true),
+                serenity::CreateInteractionResponseMessage::new().content("Запусти /games в игровом канале сервера.").ephemeral(true),
             )).await;
             return true;
         }
-        let player = Player { id: press.user.id.get(), name: press.user.name.to_string(), face: press.user.face() };
-        if let Err(error) = crate::wordsummary::remember_channel(data, guild.get(), press.channel_id.get(), &player, lang) {
-            println!("Не получилось сохранить канал игры: {error}");
+        match crate::wordsummary::set_lang(data, guild.get(), user, lang) {
+            Ok(()) => data.boards.remember_word_link(guild.get(), user, channel, lang).await,
+            Err(error) => println!("Не получилось сохранить язык игры: {error}"),
         }
     }
-    let result = open_miniapp(data, press.guild_id, press.user.id, lang, |response| press.create_response(ctx, response)).await;
+    let result = open_miniapp(data, |response| press.create_response(ctx, response)).await;
+    if !matches!(result, Ok(true)) {
+        if let Some(guild) = press.guild_id {
+            data.boards.take_word_link(guild.get(), user, channel).await;
+        }
+    }
     if let Err(error) = result {
         println!("Кнопка «Играть!»: {}", crate::interactions::sanitize_error(&error.to_string()));
     }
@@ -372,13 +370,15 @@ pub async fn play_pressed(ctx: &serenity::Context, data: &Data, press: &serenity
 mod tests {
     use super::*;
 
-    #[test]
-    fn unified_activity_exposes_one_optional_language() {
-        let command = words();
-        assert_eq!(command.name, "words");
-        assert_eq!(command.parameters.len(), 1);
-        assert_eq!(command.parameters[0].name, "language");
-        assert!(!command.parameters[0].required);
+    #[tokio::test]
+    async fn word_links_are_channel_bound_single_use_and_expire() {
+        let boards = BoardState::default();
+        boards.remember_word_link(1, 2, 3, Lang::De).await;
+        assert_eq!(boards.take_word_link(1, 2, 4).await, None);
+        assert_eq!(boards.take_word_link(1, 2, 3).await, Some(Lang::De));
+        assert_eq!(boards.take_word_link(1, 2, 3).await, None);
+        boards.open_words.lock().await.insert((1, 2, 3), (Instant::now() - WORD_LINK_TTL, Lang::Ru));
+        assert_eq!(boards.take_word_link(1, 2, 3).await, None);
     }
 
     #[test]

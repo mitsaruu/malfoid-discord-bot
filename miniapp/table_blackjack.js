@@ -34,18 +34,21 @@
 
   const solo = button("Один на один", () => selectMode("solo"));
   const online = button("Стол сервера", () => selectMode("online"));
-  const modes = element("div", "", "casino-toolbar");
+  const modes = element("div", "", "casino-toolbar casino-modes");
   modes.setAttribute("role", "group");
   modes.setAttribute("aria-label", "Режим блэкджека");
   modes.append(solo, online);
 
-  const summary = element("section", "", "casino-panel");
-  const wallet = element("p");
+  const dock = element("section", "", "casino-panel casino-dock");
+  const wallet = element("p", "", "casino-balance");
+  const header = element("header", "", "casino-header");
+  header.append(element("h1", "Блэкджек"), wallet);
   const status = element("p");
-  const remaining = element("p");
+  const remaining = element("p", "", "casino-timer");
+  const tableStatus = element("header", "", "casino-table-status");
+  tableStatus.append(status, remaining);
   const feedback = element("p", "", "casino-feedback");
   feedback.setAttribute("role", "status");
-  summary.append(wallet, status, remaining, feedback);
 
   const betForm = element("form", "", "casino-toolbar");
   const label = element("label", "Ставка в монетах");
@@ -66,16 +69,18 @@
     event.preventDefault();
     void submit("join", { bet: bet.value });
   });
-  summary.append(betForm);
 
   const lobbyActions = element("div", "", "casino-toolbar");
   const start = button("Начать раздачу", () => submit("start"), true);
   const leave = button("Выйти и вернуть ставку", () => submit("leave"));
   lobbyActions.append(start, leave);
-  summary.append(lobbyActions);
 
-  const dealer = element("section", "", "casino-panel");
-  const dealerCards = element("div");
+  const dealer = element("section", "", "blackjack-dealer");
+  const dealerCards = element("div", "", "blackjack-dealer-cards");
+  const emptyHand = element("div", "", "casino-cards");
+  emptyHand.setAttribute("aria-hidden", "true");
+  emptyHand.append(element("span", "", "casino-card casino-card--empty"),
+    element("span", "", "casino-card casino-card--empty"));
   dealer.append(element("h2", "Дилер"), dealerCards);
   const moveBar = element("div", "", "casino-toolbar");
   moveBar.setAttribute("role", "group");
@@ -85,7 +90,10 @@
     moveBar.append(control);
     return { action, control };
   });
-  const players = element("div", "", "casino-grid");
+  const players = element("div", "", "blackjack-players");
+  const felt = element("section", "", "blackjack-felt");
+  felt.append(tableStatus, dealer, players);
+  dock.append(betForm, lobbyActions, moveBar);
   const rules = element("details", "", "casino-panel");
   rules.append(
     element("summary", "Правила блэкджека"),
@@ -94,37 +102,47 @@
     element("p", "Две карты одной стоимости можно разделить на две руки с одинаковыми ставками, всего до четырёх рук. Разделённым тузам дают по одной карте. Удвоение на двух картах добавляет ещё одну карту и завершает руку."),
     element("p", "Стол сервера вмещает от 2 до 7 игроков. Если раздача не началась вовремя, ставки возвращаются. Когда время хода истекает, игрок останавливается на всех своих руках."),
   );
-  root.replaceChildren(element("h1", "Блэкджек"), modes, summary, dealer, moveBar, players, rules);
+  root.replaceChildren(header, modes, felt, dock, feedback, rules);
 
   function cardsFor(hand) {
-    const display = element("div", "", "casino-toolbar");
+    const display = element("div", "", "casino-cards");
     for (const card of hand.cards) {
-      const chip = element("span", card ?? "🂠", "casino-card");
-      if (card === null) chip.setAttribute("aria-label", "Закрытая карта");
-      else chip.dataset.suit = suits[card.slice(-1)];
+      const chip = element("span", card ?? "", "casino-card");
+      if (card === null) {
+        chip.classList.add("casino-card--back");
+        chip.setAttribute("role", "img");
+        chip.setAttribute("aria-label", "Закрытая карта");
+      } else {
+        chip.dataset.suit = suits[card.slice(-1)];
+      }
       display.append(chip);
     }
     return display;
   }
 
   function playerPanel(player, table, user) {
-    const section = element("section", "", "casino-panel");
-    const name = element("h2", player.id === user ? player.name + " (вы)" : player.name);
+    const section = element("section", "", "casino-seat blackjack-seat");
+    section.classList.toggle("casino-seat--own", player.id === user);
+    section.classList.toggle("casino-seat--active", player.hands.some((hand) => hand.active));
+    const name = element("h3", player.id === user ? player.name + " (вы)" : player.name);
     section.append(name);
     if (table.phase === "lobby") {
       section.append(element("p", "Ставка " + amounts.format(player.bet) + " • " +
         (player.id === table.host_id ? "Открывает раздачу" : "Готов к раздаче")));
     }
     player.hands.forEach((hand, index) => {
+      const handPanel = element("div", "", "blackjack-hand");
+      handPanel.classList.toggle("blackjack-hand--active", hand.active);
       const title = player.hands.length > 1 ? "Рука " + (index + 1) + " · " : "";
       const active = hand.active ? " • Ход на этой руке" : "";
-      section.append(element("p", title + "Очки " + hand.total + " • Ставка " + amounts.format(hand.bet) + active));
-      section.append(cardsFor(hand));
+      handPanel.append(element("p", title + "Очки " + hand.total + " • Ставка " + amounts.format(hand.bet) + active));
+      handPanel.append(cardsFor(hand));
       if (hand.outcome) {
         const net = hand.payout - hand.bet;
         const result = net > 0 ? "+" + amounts.format(net) : amounts.format(net);
-        section.append(element("p", outcomes[hand.outcome] + " • " + result, "casino-feedback"));
+        handPanel.append(element("p", outcomes[hand.outcome] + " • " + result, "casino-feedback"));
       }
+      section.append(handPanel);
     });
     return section;
   }
@@ -183,10 +201,13 @@
     start.hidden = table?.host_id !== you;
     start.disabled = !editable || !actions.includes("start");
     leave.disabled = !editable || !actions.includes("leave");
-    dealer.hidden = !table?.dealer;
-    dealerCards.replaceChildren();
-    if (table?.dealer) dealerCards.append(cardsFor(table.dealer), element("p", "Очки " + table.dealer.total));
+    if (table?.dealer) {
+      dealerCards.replaceChildren(cardsFor(table.dealer), element("p", "Очки " + table.dealer.total));
+    } else {
+      dealerCards.replaceChildren(emptyHand);
+    }
     moveBar.hidden = table?.phase !== "playing" || !ownSeat;
+    dock.hidden = betForm.hidden && lobbyActions.hidden && moveBar.hidden;
     for (const { action, control } of moves) control.disabled = !editable || !actions.includes(action);
     const roster = ownSeat && table.phase !== "lobby"
       ? [ownSeat, ...table.players.filter((player) => player !== ownSeat)]

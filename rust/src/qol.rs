@@ -61,7 +61,6 @@ fn section(name: &str) -> usize {
                 | "coinflip"
                 | "slots"
                 | "blackjack"
-                | "rocket"
                 | "roulette"
                 | "case"
                 | "cases"
@@ -73,7 +72,7 @@ fn section(name: &str) -> usize {
         || name.starts_with("dick")
         || matches!(
             name,
-            "wort" | "slovo" | "dice" | "roll" | "predskazanie" | "shar" | "rank" | "leaderboard"
+            "games" | "dice" | "roll" | "predskazanie" | "shar" | "rank" | "leaderboard"
         )
     {
         2
@@ -98,8 +97,8 @@ fn help_embed(commands: &[poise::Command<Shared, Error>], page: usize) -> s::Cre
     lines.sort();
     let example = [
         "`/play название` · `/queue` — страницы и кнопки управления",
-        "`/daily` · `/pets` · `/shop` · `/rocket` · `/roulette bet:100 space:red`",
-        "`/words` · `/wordstats`",
+        "`/daily` · `/pets` · `/shop` · `/roulette bet:100 space:red`",
+        "`/games` · `/wordstats`",
         "`/ask question:объясни закон Ома model:Hydrogen thinking:high` · `/ai_limits`",
         "`/music_channel channel:#музыка` · `/status` · `/server_settings`",
     ][page];

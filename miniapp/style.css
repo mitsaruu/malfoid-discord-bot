@@ -40,6 +40,17 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .game-switch button:hover { color: var(--text); }
 .game-switch button[aria-pressed="true"] { color: var(--text); background: #282a34; border-color: #424553; }
 .game-switch button:focus-visible, .words-retry:focus-visible { outline: 2px solid #bdb2ff; outline-offset: 2px; }
+.game-lobby { padding: clamp(28px, 14vh, 110px) 16px 10px; text-align: center; }
+.game-lobby h1 { font-size: clamp(24px, 5vw, 36px); letter-spacing: -.025em; }
+body[data-game="lobby"] #game-switch {
+  display: grid; width: min(520px, calc(100% - 32px)); grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+  background: transparent; border: 0; padding: 0; gap: 8px;
+}
+body[data-game="lobby"] #game-switch button {
+  min-height: 60px; padding: 6px; border-color: #363a47; border-radius: 12px; background: #1d2029;
+  color: var(--text); font-size: 15px;
+}
+body[data-game="lobby"] #game-switch button:hover { border-color: #8178a9; background: #272839; }
 
 #app {
   max-width: 500px;

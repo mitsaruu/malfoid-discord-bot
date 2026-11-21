@@ -43,6 +43,7 @@ const casinoTitles = { mines: "Минное поле", poker: "Техасски�
 const casinoViews = new Map();
 
 const gameSwitch = document.getElementById("game-switch");
+const gameLobby = document.getElementById("game-lobby");
 const wordsRetry = document.getElementById("words-retry");
 
 // ---------- Связь с Discord (минимальный Embedded App SDK) ----------
@@ -77,7 +78,8 @@ window.addEventListener("message", (event) => {
       const root = document.getElementById(activeGame);
       root.textContent = reason;
     }
-    else setStatus(reason, "error");
+    else if (activeGame === "words") setStatus(reason, "error");
+    else gameLobby.querySelector("h1").textContent = reason;
     for (const button of gameSwitch.querySelectorAll("button")) button.disabled = true;
     return;
   }
@@ -480,13 +482,14 @@ async function loadWords() {
   }
 }
 
-function openGame(game, initialWords) {
+function openGame(game) {
   if (game === activeGame) return;
   if (activeGame === "rocket") rocket?.hide();
   casinoViews.get(activeGame)?.hide();
   activeGame = game;
   document.body.dataset.game = game;
   const words = game === "words";
+  gameLobby.hidden = true;
   document.getElementById("app").hidden = !words;
   playersEl.hidden = !words;
   document.getElementById("rocket").hidden = game !== "rocket";
@@ -498,13 +501,8 @@ function openGame(game, initialWords) {
   if (words) {
     document.title = GAMES[lang].name;
     document.documentElement.lang = lang;
-    if (initialWords) {
-      applyWords(initialWords);
-      refreshPlayers();
-    } else {
-      reloadWords = true;
-      loadWords();
-    }
+    reloadWords = true;
+    loadWords();
   } else if (game === "rocket") {
     document.title = "Ракетка";
     document.documentElement.lang = "ru";
@@ -547,7 +545,7 @@ async function start() {
   buildBoard();
   setLanguage("ru");
   if (!params.get("frame_id")) {
-    loadingFailed("Откройте Activity внутри Discord через /rocket, /words или меню приложений.");
+    loadingFailed("Откройте мини-приложение внутри Discord через /games или меню приложений.");
     return;
   }
   try {
@@ -569,8 +567,13 @@ async function start() {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
       }));
     }
-    openGame(login.game === "rocket" ? "rocket" : "words", login.state);
     gameSwitch.hidden = false;
+    if (login.game === "words") openGame("words");
+    else {
+      document.title = "Игры Malfoid";
+      document.body.dataset.game = "lobby";
+      gameLobby.hidden = false;
+    }
     hideSplash();
     setInterval(() => {
       loadWords();
