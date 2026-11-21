@@ -3,9 +3,10 @@
 const ROCKET_POLL_MS = 500;
 const ROCKET_IDLE_POLL_MS = 2400;
 const ROCKET_MAX_REPEAT_ROUNDS = 10;
-const ROCKET_MAX_MULTIPLIER = 1000;
 const ROCKET_DOUBLE_MS = 6000;
-const ROCKET_MAX_DURATION = ROCKET_DOUBLE_MS * Math.log2(ROCKET_MAX_MULTIPLIER / 100);
+const ROCKET_CINEMATIC_DOUBLE_MS = 600;
+const ROCKET_CRASH_EASE_MS = 160;
+const ROCKET_BURST_MS = 760;
 const ROCKET_STATUS = {
   idle: "Готовность к старту",
   countdown: "Обратный отсчёт",
@@ -23,28 +24,33 @@ function rocketCanCashout(flight) {
   return flight?.status === "flying" && flight.payout == null;
 }
 
-function rocketMultiplierAt(elapsed) {
-  return elapsed >= ROCKET_MAX_DURATION ? ROCKET_MAX_MULTIPLIER : 100 * 2 ** (Math.max(0, elapsed) / ROCKET_DOUBLE_MS);
+function rocketMultiplierAt(elapsed, cinematicFrom) {
+  const normal = Math.min(elapsed, cinematicFrom ?? elapsed);
+  return 100 * 2 ** (normal / ROCKET_DOUBLE_MS + (elapsed - normal) / ROCKET_CINEMATIC_DOUBLE_MS);
 }
 
-function rocketTelemetry(flight, sinceSample) {
-  if (!flight) return { elapsed: 0, multiplier: 100 };
-  const drift = Math.min(650, Math.max(0, sinceSample));
-  if (flight.status === "countdown") return { elapsed: Math.min(0, flight.elapsed_ms + drift), multiplier: 100 };
-  if (flight.status !== "flying" || drift === 0) {
-    return { elapsed: Math.max(0, flight.elapsed_ms), multiplier: flight.multiplier };
-  }
-  // Only the clock is interpolated. The server confirms every displayed multiplier.
-  const elapsed = Math.min(ROCKET_MAX_DURATION, Math.max(0, flight.elapsed_ms + drift));
-  return { elapsed, multiplier: flight.multiplier };
+function rocketPoint(flight) {
+  return { elapsed: flight?.elapsed_ms ?? 0, multiplier: flight?.multiplier ?? 100 };
+}
+
+function interpolateRocket({ from, to }, progress) {
+  if (progress <= 0) return from;
+  if (progress >= 1) return to;
+  return {
+    elapsed: from.elapsed + (to.elapsed - from.elapsed) * progress,
+    multiplier: from.multiplier + (to.multiplier - from.multiplier) * progress,
+  };
 }
 
 function rocketResponse(data) {
   if (data?.error) throw new Error(data.error);
   const flight = data?.flight;
+  const cinematicFrom = flight?.cinematic_from_ms;
   if (!Number.isFinite(data?.balance) || !Number.isFinite(data.min_bet) || !Number.isFinite(data.max_bet) ||
       (flight !== null && !(typeof flight?.id === "string" && Object.hasOwn(ROCKET_STATUS, flight.status) &&
-        flight.status !== "idle" && Number.isFinite(flight.elapsed_ms) && Number.isFinite(flight.multiplier)))) {
+        flight.status !== "idle" && Number.isFinite(flight.elapsed_ms) && Number.isFinite(flight.multiplier) &&
+        (cinematicFrom == null || (Number.isFinite(cinematicFrom) && cinematicFrom >= 0 &&
+          cinematicFrom <= flight.elapsed_ms && flight.payout != null))))) {
     throw new Error("Сервер вернул неполные данные полёта.");
   }
   return data;
@@ -87,10 +93,10 @@ function createRocketFeed({
     else if (flight?.id !== repeat.id || flight.stake !== repeat.stake || flight.auto !== repeat.target) {
       clearRepeat("changed");
     } else if (flight.status === "refunded") clearRepeat("refunded");
-    else if (!rocketActive(flight)) {
+    else if (flight.status === "crashed") {
       if (repeat.stake >= min_bet && repeat.stake <= Math.min(balance, max_bet)) return true;
       clearRepeat("stake");
-    }
+    } else if (!rocketActive(flight)) clearRepeat("changed");
     return false;
   }
 
@@ -307,8 +313,10 @@ function createRocketChart(canvas) {
   const ctx = canvas.getContext("2d");
   const stars = Array.from({ length: 44 }, (_, i) => [((i * 197 + 71) % 503) / 503, ((i * 71 + 13) % 241) / 241]);
   const colors = { crashed: "#ff957b", paid: "#7af4c7", refunded: "#ffd690" };
+  const tickFactor = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1 });
+  const tickTime = new Intl.NumberFormat("ru-RU");
 
-  return function draw(status, { elapsed, multiplier: factor }, timestamp, transition, reducedMotion) {
+  return function draw(status, { elapsed, multiplier: factor }, cinematicFrom, timestamp, transition, reducedMotion) {
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     if (!ctx || width < 100 || height < 100) return;
@@ -320,18 +328,18 @@ function createRocketChart(canvas) {
     ctx.setTransform(pixelWidth / width, 0, 0, pixelHeight / height, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    const left = width < 365 ? 45 : 57;
+    const left = width < 365 ? 51 : 57;
     const right = width - (width < 365 ? 22 : 30);
     const bottom = height - 34;
     const top = 25;
     const time = Math.max(0, elapsed);
-    const timeLimit = Math.max(10500, time * 1.21);
-    const factorLimit = Math.max(250, factor * 1.24);
+    const timeLimit = Math.max(10500, time + 4000);
+    const factorLimit = Math.max(250, factor * 1.12 + 70);
     const xFor = (value) => left + (right - left) * value / timeLimit;
     const yFor = (value) => bottom - (bottom - top) * (value - 100) / (factorLimit - 100);
     const x = xFor(time);
     const y = yFor(factor);
-    const color = colors[status] || "#bcabff";
+    const color = colors[status] || (cinematicFrom != null && time >= cinematicFrom ? "#f5cd91" : "#bcabff");
 
     stars.forEach(([sx, sy], i) => {
       ctx.fillStyle = i % 5 ? "#b5a8ee34" : "#d5c9ff75";
@@ -343,13 +351,14 @@ function createRocketChart(canvas) {
     ctx.lineWidth = 1;
     ctx.strokeStyle = "#b5a1eb21";
     ctx.textAlign = "right";
-    const factorStep = factorLimit >= 800 ? 200 : factorLimit >= 425 ? 100 : 50;
+    const stepScale = 10 ** Math.floor(Math.log10(factorLimit / 5));
+    const factorStep = Math.max(50, [1, 2, 5, 10].find((step) => step * stepScale >= factorLimit / 5) * stepScale);
     ctx.beginPath();
-    for (let value = 100; value <= factorLimit; value += factorStep) {
+    for (let value = 100; value <= factorLimit; value += factorStep - value % factorStep) {
       const lineY = yFor(value);
       ctx.moveTo(left, lineY);
       ctx.lineTo(right, lineY);
-      ctx.fillText((value / 100).toLocaleString("ru-RU", { minimumFractionDigits: 1 }) + "×", left - 8, lineY + 4);
+      ctx.fillText(tickFactor.format(value / 100) + "×", left - 8, lineY + 4);
     }
     ctx.textAlign = "center";
     const timeStep = timeLimit > 15500 ? 4000 : width < 365 ? 2500 : 2000;
@@ -357,19 +366,24 @@ function createRocketChart(canvas) {
       const lineX = xFor(value);
       ctx.moveTo(lineX, top);
       ctx.lineTo(lineX, bottom);
-      ctx.fillText((value / 1000).toLocaleString("ru-RU") + " с", lineX, bottom + 21);
+      ctx.fillText(tickTime.format(value / 1000) + " с", lineX, bottom + 21);
     }
     ctx.stroke();
 
+    let angle = -.22;
     if (time > 0) {
-      const heightAtTime = rocketMultiplierAt(time) - 100;
+      const heightAtTime = rocketMultiplierAt(time, cinematicFrom) - 100;
+      const yAt = (t) => {
+        const gain = heightAtTime ? (rocketMultiplierAt(t, cinematicFrom) - 100) / heightAtTime : t / time;
+        return yFor(100 + (factor - 100) * gain);
+      };
       const curve = new Path2D();
       curve.moveTo(left, bottom);
-      for (let i = 1; i <= 48; i++) {
+      for (let i = 1; i < 48; i++) {
         const t = time * i / 48;
-        const gain = (rocketMultiplierAt(t) - 100) / heightAtTime;
-        curve.lineTo(xFor(t), yFor(100 + (factor - 100) * gain));
+        curve.lineTo(xFor(t), yAt(t));
       }
+      curve.lineTo(x, y);
       const area = new Path2D(curve);
       area.lineTo(x, bottom);
       area.closePath();
@@ -384,12 +398,12 @@ function createRocketChart(canvas) {
       ctx.shadowBlur = 13;
       ctx.stroke(curve);
       ctx.shadowBlur = 0;
+      const behind = Math.max(0, time - 90);
+      angle = Math.min(angle, Math.atan2(y - yAt(behind), x - xFor(behind)));
     }
 
     if (status === "idle" || status === "countdown" || status === "flying") {
-      const ahead = yFor(rocketMultiplierAt(time + 90));
-      const angle = Math.atan2(ahead - yFor(rocketMultiplierAt(time)), xFor(90) - xFor(0));
-      drawRocketShip(ctx, x, y, Math.min(-.22, angle), timestamp, status === "flying", reducedMotion, color);
+      drawRocketShip(ctx, x, y, angle, timestamp, status === "flying", reducedMotion, color);
     } else {
       ctx.fillStyle = color;
       ctx.beginPath();
@@ -399,8 +413,9 @@ function createRocketChart(canvas) {
       ctx.strokeStyle = color;
       ctx.arc(x, y, 8, 0, Math.PI * 2);
       ctx.stroke();
-      if (!reducedMotion && transition !== null && timestamp - transition < 760 && status !== "refunded") {
-        drawRocketBurst(ctx, x, y, Math.max(0, (timestamp - transition) / 760), color, status === "crashed");
+      if (!reducedMotion && transition !== null && timestamp >= transition &&
+          timestamp - transition < ROCKET_BURST_MS && status !== "refunded") {
+        drawRocketBurst(ctx, x, y, (timestamp - transition) / ROCKET_BURST_MS, color, status === "crashed");
       }
     }
   };
@@ -433,7 +448,8 @@ function createRocketView(request) {
   let shown = false;
   let frame = null;
   let transition = null;
-  let lastTelemetry = null;
+  let flightMotion = null;
+  let crashApproach = null;
   let fieldError = "";
   let connectionError = "";
 
@@ -494,19 +510,40 @@ function createRocketView(request) {
     if (!shown || document.hidden) return;
     const flight = current.snapshot?.flight;
     const status = flight?.status || "idle";
-    const running = !motion.matches && !connectionError;
-    const telemetry = rocketTelemetry(flight, running ? timestamp - current.sampledAt : 0);
-    // A latency spike can make a new live sample trail the preceding frame slightly.
-    if (running && rocketActive(flight) && lastTelemetry?.id === flight.id && lastTelemetry.status === status) {
-      telemetry.elapsed = Math.max(lastTelemetry.elapsed, telemetry.elapsed);
-      telemetry.multiplier = Math.max(lastTelemetry.multiplier, telemetry.multiplier);
+    const running = !motion.matches && !connectionError && !current.needsSync;
+    const confirmed = rocketPoint(flight);
+    const approaching = running && crashApproach && timestamp < transition;
+    let visual = confirmed;
+    if (running && status === "flying") {
+      if (flightMotion?.flight !== flight) {
+        // Start from the position at receipt, and stop at the newest confirmed point.
+        // A crash can happen immediately after any live sample.
+        const from = flightMotion?.flight.id === flight.id ?
+          interpolateRocket(flightMotion, (current.sampledAt - flightMotion.startedAt) / ROCKET_POLL_MS) : confirmed;
+        flightMotion = { flight, from, to: confirmed, startedAt: current.sampledAt };
+      }
+      visual = interpolateRocket(flightMotion, (timestamp - flightMotion.startedAt) / ROCKET_POLL_MS);
+      flightMotion.painted = visual;
+    } else {
+      flightMotion = null;
+      if (approaching) {
+        const remaining = Math.min(1, (transition - timestamp) / ROCKET_CRASH_EASE_MS);
+        visual = interpolateRocket(crashApproach, 1 - remaining ** 2);
+      } else {
+        crashApproach = null;
+      }
+      if (running && status === "countdown") {
+        const drift = Math.min(650, Math.max(0, timestamp - current.sampledAt));
+        visual = { ...confirmed, elapsed: Math.min(0, confirmed.elapsed + drift) };
+      }
     }
-    lastTelemetry = { id: flight?.id, status, ...telemetry };
-    write(multiplierLabel, displayFactor(telemetry.multiplier));
+    write(multiplierLabel, displayFactor(confirmed.multiplier));
     write(clockLabel, status === "countdown" ? "До старта" : "Время полёта");
-    write(clock, flight ? seconds.format(Math.abs(telemetry.elapsed) / 1000) + " с" : "—");
-    draw(status, telemetry, timestamp, transition, !running);
-    if (running && (rocketActive(flight) || (transition !== null && timestamp - transition < 760))) invalidate();
+    const elapsed = approaching ? confirmed.elapsed : visual.elapsed;
+    write(clock, flight ? seconds.format(Math.abs(elapsed) / 1000) + " с" : "—");
+    draw(approaching ? "flying" : status, visual, flight?.cinematic_from_ms, timestamp, transition, !running);
+    if (running && (rocketActive(flight) ||
+        (transition !== null && timestamp - transition < ROCKET_BURST_MS))) invalidate();
   }
 
   function maximum(data) {
@@ -554,14 +591,16 @@ function createRocketView(request) {
     const status = flight?.status || "idle";
     const active = rocketActive(flight);
     const paid = flight?.payout != null && status !== "refunded";
+    const cinematic = paid && flight.cinematic_from_ms != null;
     const lowBalance = snapshot && maximum(snapshot) < snapshot.min_bet;
     const locked = Boolean(connectionError || pending || needsSync || !snapshot);
     const actionEnabled = !locked && (rocketCanCashout(flight) || (!active && !lowBalance));
     root.dataset.phase = status;
     root.dataset.cashedOut = String(paid);
+    root.dataset.cinematic = String(cinematic);
     write(phaseLabel, connectionError || (!snapshot && syncError) ? "Нет соединения" :
       snapshot ? ROCKET_STATUS[status] : "Подключение");
-    write(multiplierCaption, status === "crashed" ? "Пик полёта" : "Коэффициент");
+    write(multiplierCaption, status === "crashed" ? "Пик полёта" : cinematic ? "Кинополёт" : "Коэффициент");
     write(balance, snapshot ? number.format(snapshot.balance) + " мон." : "—");
     settings.hidden = active;
     settings.disabled = locked || active || lowBalance;
@@ -595,7 +634,8 @@ function createRocketView(request) {
     const result = {
       idle: "Укажите ставку перед стартом.",
       countdown: "Вывод станет доступен после старта.",
-      flying: paid ? (flight.automatic ? "Автовывод сработал. Полёт продолжается." :
+      flying: cinematic ? "Выплата зафиксирована. Продолжается кинополёт." :
+        paid ? (flight.automatic ? "Автовывод сработал. Полёт продолжается." :
         "Монеты зачислены. Полёт продолжается.") : "Вывод подтверждает сервер в момент запроса.",
       paid: flight?.automatic ? "Автовывод сработал." : "Монеты зачислены на баланс.",
       crashed: paid ? "Ракета разбилась. Выплата уже на балансе." : "Ракета потеряна вместе со ставкой.",
@@ -611,8 +651,19 @@ function createRocketView(request) {
     const next = view.snapshot?.flight;
     if (next?.id !== previous?.id) repeatRounds.value = "";
     if (next?.id !== previous?.id || next?.status !== previous?.status) {
-      transition = shown && rocketActive(previous) && previous.id === next?.id && !rocketActive(next) ?
-        performance.now() : null;
+      const sameFlight = shown && previous && previous.id === next?.id;
+      transition = sameFlight && rocketActive(previous) && !rocketActive(next) ? view.sampledAt : null;
+      crashApproach = null;
+      if (sameFlight && !current.needsSync && !view.needsSync && !motion.matches) {
+        if (previous.status === "countdown" && next.status === "flying") {
+          flightMotion = { flight: next, from: rocketPoint(null), to: rocketPoint(next), startedAt: view.sampledAt };
+        } else if (previous.status === "flying" && next.status === "crashed" &&
+            flightMotion?.flight.id === next.id && flightMotion.painted) {
+          // The peak is now known. Finish the last segment before drawing the burst.
+          crashApproach = { from: flightMotion.painted, to: rocketPoint(next) };
+          transition += ROCKET_CRASH_EASE_MS;
+        }
+      }
     }
     current = view;
     renderControls();
@@ -682,7 +733,8 @@ function createRocketView(request) {
     feed.hide();
     cancelAnimationFrame(frame);
     frame = null;
-    lastTelemetry = null;
+    flightMotion = null;
+    crashApproach = null;
     transition = null;
   }
 

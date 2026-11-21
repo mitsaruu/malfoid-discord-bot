@@ -25,9 +25,9 @@
     if (element.textContent !== label) element.textContent = label;
   }
 
-  function makeCards(cards, count = 0, community = false) {
+  function makeCards(cards, { count = 0, community = false, dealFrom = Infinity, delay = 0 } = {}) {
     const row = node("div", "", "casino-cards");
-    for (const label of cards || Array(count).fill(null)) {
+    for (const [index, label] of (cards || Array(count).fill(null)).entries()) {
       const card = node("span", label, "casino-card");
       if (label) card.dataset.suit = suits[label.slice(-1)];
       else if (community) {
@@ -37,6 +37,10 @@
         card.classList.add("casino-card--back");
         card.setAttribute("role", "img");
         card.setAttribute("aria-label", "Закрытая карта");
+      }
+      if (index >= dealFrom && (label || !community)) {
+        card.classList.add("casino-card--dealt");
+        card.style.setProperty("--casino-deal-delay", `${delay + (index - dealFrom) * 44}ms`);
       }
       row.append(card);
     }
@@ -121,7 +125,7 @@
   let tableKey;
   let raiseKey;
 
-  function renderTable(table) {
+  function renderTable(table, previous) {
     const tableData = { ...table };
     delete tableData.remaining_ms;
     const key = table ? JSON.stringify(tableData) : state ? mode : "loading";
@@ -135,7 +139,13 @@
     if (table && table.status !== "lobby") {
       board.append(node("p", `Банк · ${amount(table.pot)}`, "poker-pot"));
     }
-    board.append(makeCards(Array.from({ length: 5 }, (_, i) => table?.board?.[i]), 0, true));
+    const priorTable = previous?.table;
+    const newHand = previous && table && table.status !== "lobby" &&
+      (priorTable?.id !== table.id || priorTable?.status === "lobby");
+    const boardStart = newHand ? 0 : priorTable?.board?.length ?? Infinity;
+    board.append(makeCards(Array.from({ length: 5 }, (_, i) => table?.board?.[i]), {
+      community: true, dealFrom: boardStart, delay: newHand ? 100 : 0,
+    }));
     if (!table) {
       status.textContent = state ? (mode === "online" ? "Свободный стол" : "Тренировка") : "Загрузка…";
       return;
@@ -174,7 +184,9 @@
       const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
       player.append(node("p", `${stack} ${amount(seat.stack)} ${chips}`, "casino-seat-stack"));
       if (seat.cards || (!own && table.status === "playing" && !seat.folded)) {
-        player.append(makeCards(seat.cards, 2));
+        player.append(makeCards(seat.cards, {
+          count: 2, dealFrom: newHand ? 0 : Infinity, delay: Math.min(offset, 5) * 16,
+        }));
       }
       const details = [];
       if (table.status === "lobby" && i === 0) details.push("Создатель стола");
@@ -211,7 +223,7 @@
     setText(clock, `${label} · ${seconds} с`);
   }
 
-  function render() {
+  function render(previousState) {
     const online = mode === "online";
     const table = state?.table;
     const lobby = table?.status === "lobby";
@@ -227,7 +239,7 @@
       ? state ? `Кошелёк сервера · ${amount(state.balance)} монет` : ""
       : state ? `Тренировочные фишки · по ${amount(state.training_stack)} при пополнении` : "";
     setText(account, summary + blinds);
-    renderTable(table);
+    renderTable(table, previousState);
     renderClock();
 
     joinForm.hidden = !online || !state || (table && !finished && (!lobby || seated));
@@ -276,9 +288,10 @@
   }
 
   function receive(next) {
+    const previousState = state;
     state = next;
     deadline = performance.now() + (state.table?.remaining_ms || 0);
-    render();
+    render(previousState);
   }
 
   async function poll() {

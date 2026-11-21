@@ -7,6 +7,8 @@
   <link rel="stylesheet" href="static/style.css">
   <link rel="stylesheet" href="static/rocket.css">
   <link rel="stylesheet" href="static/casino.css">
+  <link rel="stylesheet" href="static/roulette.css">
+  <link rel="stylesheet" href="static/coinflip.css">
 </head>
 <body>
   <div class="splash" id="splash">
@@ -31,6 +33,8 @@
     <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false">Покер</button>
     <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false">Слоты</button>
     <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false">Блэкджек</button>
+    <button type="button" data-game="roulette" aria-controls="roulette" aria-pressed="false">Рулетка</button>
+    <button type="button" data-game="coinflip" aria-controls="coinflip" aria-pressed="false">Орёл или решка</button>
   </nav>
 
   <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
@@ -123,6 +127,8 @@
   <main class="casino" id="poker" aria-label="Покер" lang="ru" hidden></main>
   <main class="casino" id="slots" aria-label="Слоты" lang="ru" hidden></main>
   <main class="casino" id="blackjack" aria-label="Блэкджек" lang="ru" hidden></main>
+  <main class="casino" id="roulette" aria-label="Рулетка" lang="ru" hidden></main>
+  <main class="casino" id="coinflip" aria-label="Орёл или решка" lang="ru" hidden></main>
 
   <div class="help" id="help" hidden>
     <div class="help-card">
@@ -142,6 +148,8 @@
   <script src="static/poker.js"></script>
   <script src="static/casino_slots.js"></script>
   <script src="static/table_blackjack.js"></script>
+  <script src="static/roulette.js"></script>
+  <script src="static/coinflip.js"></script>
   <script src="static/app.js"></script>
 </body>
 </html>

@@ -112,7 +112,7 @@
     setText(countdown, `До авторасчёта ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`);
   }
 
-  function render() {
+  function render(hitCell) {
     const round = snapshot?.round;
     const active = round?.status === "active";
     const blocked = pending || !ready;
@@ -149,6 +149,7 @@
       const [icon, description] = tileViews[state];
       tile.disabled = blocked || !active || state !== "hidden";
       if (tile.dataset.state !== state) {
+        tile.classList.toggle("mines-tile--exploded", index === hitCell && state === "hit");
         tile.dataset.state = state;
         tile.setAttribute("aria-label", `Ряд ${Math.floor(index / 5) + 1}, клетка ${index % 5 + 1}, ${description}`);
         setText(tile, icon);
@@ -190,8 +191,14 @@
     pending = true;
     actionError = "";
     render();
+    let hitCell;
     try {
-      accept(await request(action, fields));
+      const result = await request(action, fields);
+      if (action === "reveal" && result.round?.id === fields.round_id &&
+          result.round.status === "lost" && result.round.cells[fields.cell] === "hit") {
+        hitCell = fields.cell;
+      }
+      accept(result);
     } catch (error) {
       actionError = error.message || "Не удалось подтвердить ход.";
       ready = false;
@@ -203,7 +210,7 @@
     } finally {
       pending = false;
       if (visible) {
-        render();
+        render(hitCell);
         schedule();
       }
     }
@@ -238,6 +245,7 @@
     hide() {
       visible = false;
       reading = null;
+      for (const tile of tiles) tile.classList.remove("mines-tile--exploded");
       clearTimeout(poll);
       clearInterval(clock);
     },

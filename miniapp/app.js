@@ -39,7 +39,10 @@ let busy = false;     // ждём ответа сервера
 let activeGame = null;
 let rocket = null;
 let reloadWords = false;
-const casinoTitles = { mines: "Минное поле", poker: "Техасский холдем", slots: "Слоты", blackjack: "Блэкджек" };
+const casinoTitles = {
+  mines: "Минное поле", poker: "Техасский холдем", slots: "Слоты", blackjack: "Блэкджек",
+  roulette: "Рулетка", coinflip: "Орёл или решка",
+};
 const casinoViews = new Map();
 
 const gameSwitch = document.getElementById("game-switch");

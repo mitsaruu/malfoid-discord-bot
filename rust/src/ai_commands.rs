@@ -48,7 +48,7 @@ pub async fn ask(
     ctx.defer().await?;
     if ai::directed_insult(data, &question).await {
         vanish(ctx).await;
-        ai::punish_rudeness(ctx.serenity_context(), data, ctx.guild_id(), ctx.author(), ctx.channel_id()).await;
+        moderation::warn_for_insult(ctx.http(), data, ctx.guild_id(), ctx.author(), ctx.channel_id(), ctx.framework().bot_id()).await;
         return Ok(());
     }
     let bot = ctx.framework().bot_id().get();

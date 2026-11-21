@@ -1,7 +1,6 @@
 //! Ядро ИИ: запросы к Gemini, характер и правила, лимиты, память разговора, грубость.
 //! Команды (/ask, /summary, /quiz…) — в ai_commands.rs.
 
-use crate::admin::report_error;
 use crate::moderation::Requester;
 use crate::text::plural;
 use crate::{db, Data};
@@ -160,17 +159,19 @@ impl AiSettings {
     }
 }
 
-/// Настройки тайм-аутов за грубость из settings.ini, раздел [moderation].
+/// Настройки варнов за грубость из settings.ini, раздел [moderation].
 pub struct RudeSettings {
     pub strike_reset: i64,       // через сколько минут без грубостей счётчик обнуляется
-    pub announce: bool,          // писать ли в чат, что человек получил тайм-аут
+    pub announce: bool,          // писать ли в чат, что человек получил варн
 }
 
 impl RudeSettings {
     pub fn load(settings: &crate::config::Settings) -> Self {
+        let legacy_announce = settings.text("moderation", "announce_timeouts", "on");
+        let announce = settings.text("moderation", "announce_warnings", &legacy_announce);
         Self {
             strike_reset: settings.int("moderation", "strike_reset_minutes", 60),
-            announce: !["off", "нет", "no", "0"].contains(&settings.text("moderation", "announce_timeouts", "on").to_lowercase().as_str()),
+            announce: !["off", "нет", "no", "0"].contains(&announce.to_lowercase().as_str()),
         }
     }
 }
@@ -944,7 +945,7 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     Ok(text)
 }
 
-// ---------- Адресная проверка оскорблений и минутный тайм-аут ----------
+// ---------- Адресная проверка оскорблений ----------
 
 fn directed_insult_result(text: &str) -> bool {
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text.trim()) else { return false };
@@ -997,39 +998,6 @@ pub fn minutes_text(minutes: i64) -> String {
         format!("{hours} {}", plural(hours, "час", "часа", "часов"))
     } else {
         format!("{minutes} {}", plural(minutes, "минуту", "минуты", "минут"))
-    }
-}
-
-/// Прямое оскорбление бота: ровно минута с первого случая.
-pub async fn punish_rudeness(ctx: &serenity::Context, data: &Data, guild: Option<serenity::GuildId>, user: &serenity::User, channel: serenity::ChannelId) {
-    let Some(guild) = guild else { return }; // в личных сообщениях тайм-аутов нет
-    if user.bot {
-        return; // другим ботам тайм-ауты не даём — им достаточно того, что бот промолчал
-    }
-    let Ok(count) = data.db.add_rude_strike(guild.get(), user.id.get(), db::now(), data.ai.rude.strike_reset as f64 * 60.0) else { return };
-    println!("Грубость к боту: пользователь={} сервер={guild} подряд={count}", user.id);
-    let minutes = 1;
-    let reason = format!("Грубость к боту ({count} раз подряд)");
-    let timeout = crate::moderation::set_timeout(
-        ctx, data, guild, user.id, crate::moderation::TimeoutChange::Extend(minutes), &reason,
-    ).await;
-    if matches!(timeout, Ok(false)) { return; }
-    if let Err(error) = timeout {
-        // Нет права Moderate Members, роль бота ниже или это администратор/владелец — пишем только в логи
-        println!("Не получилось дать тайм-аут {}: {error}", user.id);
-        let details = format!(
-            "Хотела дать тайм-аут <@{}> за грубость ({count} раз подряд), но не получилось: {error}. Нужно право \
-             «Отправлять участников подумать» (Moderate Members), и моя роль должна быть выше его роли.", user.id);
-        report_error(&ctx.http, data, Some(guild), "Тайм-аут за грубость", &details).await;
-        return;
-    }
-    let text = format!("🔇 <@{}> отдохнёт {}. Хватит грубить.", user.id, minutes_text(minutes));
-    let announced = if data.ai.rude.announce {
-        let message = serenity::CreateMessage::new().content(&text).allowed_mentions(serenity::CreateAllowedMentions::new());
-        channel.send_message(ctx, message).await.is_ok()
-    } else { false };
-    if !announced || data.db.log_channel(guild.get()).ok().flatten() != Some(channel.get()) {
-        crate::moderation::send_log(ctx, data, guild, &format!("{text} ({count} раз подряд, в <#{channel}>)")).await;
     }
 }
 

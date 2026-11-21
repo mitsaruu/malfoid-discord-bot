@@ -2,7 +2,7 @@
 
 use crate::{
     db::{Database, Wallet},
-    economy::MAX_BET,
+    economy::{settle_bet_on, CoinSide, MAX_BET},
     wagers, Data, Error,
 };
 use rand::{seq::SliceRandom, Rng};
@@ -26,7 +26,7 @@ type Reply = Result<Value, String>;
 pub struct State {
     mines: Mutex<HashMap<Player, MinesRound>>,
     initial_revision: OnceLock<u64>,
-    slots_prepared: OnceLock<()>,
+    receipts_prepared: OnceLock<()>,
 }
 
 impl State {
@@ -34,17 +34,23 @@ impl State {
         self.mines.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    fn prepare_slots(&self, db: &Database) -> rusqlite::Result<()> {
-        if self.slots_prepared.get().is_none() {
+    fn prepare_receipts(&self, db: &Database) -> rusqlite::Result<()> {
+        if self.receipts_prepared.get().is_none() {
             db.lock().execute_batch(
                 "CREATE TABLE IF NOT EXISTS miniapp_slots_results (
                      guild_id INTEGER NOT NULL,
                      user_id INTEGER NOT NULL,
                      receipt TEXT NOT NULL,
                      PRIMARY KEY (guild_id, user_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS miniapp_coinflip_results (
+                     guild_id INTEGER NOT NULL,
+                     user_id INTEGER NOT NULL,
+                     receipt TEXT NOT NULL,
+                     PRIMARY KEY (guild_id, user_id)
                  );",
             )?;
-            let _ = self.slots_prepared.set(());
+            let _ = self.receipts_prepared.set(());
         }
         Ok(())
     }
@@ -95,6 +101,7 @@ pub fn handle(
     match game {
         "mines" => Ok(handle_mines(data, wallet, minimum, action, body)?),
         "slots" => Ok(handle_slots(data, wallet, minimum, action, body)?),
+        "coinflip" => Ok(handle_coinflip(data, wallet, minimum, action, body)?),
         _ => Ok(Err("Неизвестная игра.".into())),
     }
 }
@@ -413,6 +420,74 @@ fn slot_wins(grid: &SlotGrid) -> Vec<SlotWin> {
         .collect()
 }
 
+fn load_receipt(tx: &Transaction<'_>, query: &str, wallet: &Wallet<'_>) -> rusqlite::Result<Option<Value>> {
+    tx.query_row(query, params![wallet.guild as i64, wallet.user as i64], |row| {
+        let raw: String = row.get(0)?;
+        serde_json::from_str(&raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+        })
+    }).optional()
+}
+
+fn is_current_round(previous: Option<u64>, expected: Option<&Value>) -> bool {
+    match expected {
+        Some(Value::Null) => previous.is_none(),
+        Some(value) => round_id(value).is_some_and(|id| previous == Some(id)),
+        None => false,
+    }
+}
+
+fn handle_coinflip(
+    data: &Data,
+    wallet: Wallet<'_>,
+    minimum: i64,
+    action: &str,
+    body: &Value,
+) -> rusqlite::Result<Reply> {
+    if !matches!(action, "state" | "flip") {
+        return Ok(Err("Неизвестное действие.".into()));
+    }
+    data.casino_solo.prepare_receipts(&data.db)?;
+    data.db.transaction(|tx| {
+        let mut flip = load_receipt(tx,
+            "SELECT receipt FROM miniapp_coinflip_results WHERE guild_id = ?1 AND user_id = ?2", &wallet)?;
+        let balance;
+        if action == "flip" {
+            let previous = flip.as_ref().and_then(|receipt| round_id(&receipt["id"]));
+            if !is_current_round(previous, body.get("expected_round")) {
+                return Ok(Err(STALE_ROUND.into()));
+            }
+            let Some(side) = body["side"].as_str().and_then(CoinSide::from_key) else {
+                return Ok(Err("Выбери орла или решку.".into()));
+            };
+            let Some(bet) = body["bet"].as_str() else {
+                return Ok(Err("Укажи ставку в монетах.".into()));
+            };
+            let result = CoinSide::roll();
+            let multiplier = side.payout_multiplier(result);
+            let (stake, new_balance) = match settle_bet_on(tx, wallet, bet, minimum, multiplier)? {
+                Ok(result) => result,
+                Err(error) => return Ok(Err(error)),
+            };
+            let id = available_wager_id(tx, previous)?;
+            let receipt = json!({
+                "id": id.to_string(), "side": side.key(), "result": result.key(),
+                "stake": stake, "payout": stake * multiplier,
+            });
+            tx.execute(
+                "INSERT INTO miniapp_coinflip_results (guild_id, user_id, receipt) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (guild_id, user_id) DO UPDATE SET receipt = excluded.receipt",
+                params![wallet.guild as i64, wallet.user as i64, receipt.to_string()],
+            )?;
+            flip = Some(receipt);
+            balance = new_balance;
+        } else {
+            (balance, _) = wallet.open(tx)?;
+        }
+        Ok(Ok(json!({"balance": balance, "min_bet": minimum, "max_bet": MAX_BET, "flip": flip})))
+    })
+}
+
 fn handle_slots(
     data: &Data,
     wallet: Wallet<'_>,
@@ -423,31 +498,15 @@ fn handle_slots(
     if !matches!(action, "state" | "spin") {
         return Ok(Err("Неизвестное действие.".into()));
     }
-    data.casino_solo.prepare_slots(&data.db)?;
+    data.casino_solo.prepare_receipts(&data.db)?;
     data.db.transaction(|tx| {
-        let key = params![wallet.guild as i64, wallet.user as i64];
-        let mut spin: Option<Value> = tx
-            .query_row(
-                "SELECT receipt FROM miniapp_slots_results WHERE guild_id = ?1 AND user_id = ?2",
-                key,
-                |row| {
-                    let raw: String = row.get(0)?;
-                    serde_json::from_str(&raw).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-                    })
-                },
-            )
-            .optional()?;
+        let mut spin = load_receipt(tx,
+            "SELECT receipt FROM miniapp_slots_results WHERE guild_id = ?1 AND user_id = ?2", &wallet)?;
         let (mut balance, _) = wallet.open(tx)?;
         if action == "spin" {
             // The previous receipt acts as a compare-and-swap token, including after process restart.
             let previous = spin.as_ref().and_then(|receipt| round_id(&receipt["id"]));
-            let expected = match body.get("expected_round") {
-                Some(Value::Null) => None,
-                Some(value) if round_id(value).is_some() => round_id(value),
-                _ => return Ok(Err(STALE_ROUND.into())),
-            };
-            if expected != previous {
+            if !is_current_round(previous, body.get("expected_round")) {
                 return Ok(Err(STALE_ROUND.into()));
             }
             let Some(bet) = body["bet"].as_str() else {
@@ -770,5 +829,29 @@ mod tests {
         assert_eq!(state["balance"], 500);
         assert!(state["spin"].is_null());
         assert_eq!(wagers::refund(&data.db, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn coinflip_saves_the_result_and_charges_a_receipt_only_once() {
+        let mut data = data();
+        let initial = call(&data, "coinflip", "state", json!({})).unwrap();
+        assert_eq!(initial["balance"], 500);
+        assert!(initial["flip"].is_null());
+        let fields = json!({"bet": "100", "side": "heads", "expected_round": null});
+        let played = call(&data, "coinflip", "flip", fields.clone()).unwrap();
+        let flip = &played["flip"];
+        assert_eq!(flip["side"], "heads");
+        assert_eq!(flip["stake"], 100);
+        let head = flip["result"] == "heads";
+        assert!(head || flip["result"] == "tails");
+        assert_eq!(flip["payout"], if head { 200 } else { 0 });
+        assert_eq!(played["balance"], if head { 600 } else { 400 });
+
+        data.casino_solo = State::default();
+        assert!(call(&data, "coinflip", "flip", fields).is_err());
+        assert!(call(&data, "coinflip", "flip", json!({
+            "bet": "100", "side": "edge", "expected_round": flip["id"],
+        })).is_err());
+        assert_eq!(call(&data, "coinflip", "state", json!({})).unwrap(), played);
     }
 }

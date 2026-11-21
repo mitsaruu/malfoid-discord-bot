@@ -21,8 +21,8 @@ pub fn error_context(ctx: Context<'_>) -> String {
 
 /// None — команда сама выбирает тип или видимость своего первого ответа.
 fn defer_privately(command: &str) -> Option<bool> {
-    if matches!(command, "games" | "roulette"
-        | "coinflip" | "slots" | "give_money" | "blackjack" | "shop_buy"
+    if matches!(command, "games"
+        | "coinflip" | "give_money" | "blackjack" | "shop_buy"
         | "case" | "pet_feed" | "pet_sell" | "pet_battle" | "pet_trade" | "wordduel" | "dick_growth")
     {
         return None;
@@ -85,7 +85,6 @@ mod tests {
     #[test]
     fn activity_and_private_commands_keep_their_response_type() {
         assert_eq!(defer_privately("games"), None);
-        assert_eq!(defer_privately("roulette"), None);
         assert_eq!(defer_privately("warns"), Some(true));
         assert_eq!(defer_privately("favorites"), Some(true));
         assert_eq!(defer_privately("history"), Some(true));

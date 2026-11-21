@@ -311,9 +311,7 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         economy::daily(),
         economy::give_money(),
         economy::coinflip(),
-        economy::slots(),
         blackjack::blackjack(),
-        roulette::roulette(),
         pets::open_case(),
         pets::cases(),
         pets::show_pets(),
@@ -608,22 +606,20 @@ mod tests {
         assert_eq!(names.len(), list.len());
         let games = list.iter().find(|c| c["name"] == "games").unwrap();
         assert!(games["options"].as_array().is_none_or(Vec::is_empty));
-        for retired in ["slovo", "wort", "words", "rocket"] {
+        for retired in ["slovo", "wort", "words", "rocket", "slots", "roulette"] {
             assert!(!names.contains(retired));
         }
         assert!(!names.contains("welcome_channel"));
         assert!(names.contains("music_channel") && names.contains("status"));
-        let roulette = list.iter().find(|c| c["name"] == "roulette").unwrap();
-        assert_eq!(roulette["options"][1]["name"], "space");
-        assert_eq!(roulette["options"][1]["autocomplete"], true);
+        assert!(names.contains("coinflip") && names.contains("blackjack"));
         #[cfg(feature = "voice")]
         {
-            assert_eq!(names.len(), 78);
+            assert_eq!(names.len(), 76);
             assert!(names.contains("favorites") && names.contains("history"));
         }
         #[cfg(not(feature = "voice"))]
         {
-            assert_eq!(names.len(), 57);
+            assert_eq!(names.len(), 55);
             assert!(!names.contains("favorites") && !names.contains("history"));
         }
     }

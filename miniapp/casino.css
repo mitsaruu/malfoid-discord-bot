@@ -289,6 +289,54 @@
 .casino .mines-tile[data-state="hit"] { background: #742d46; border-color: #e495ae; color: #ffe4ed; }
 .casino .mines-rules { color: var(--muted); font-size: .83rem; }
 
+@media (prefers-reduced-motion: no-preference) {
+  .casino-card--dealt {
+    animation: casino-deal 230ms cubic-bezier(.2, .75, .3, 1) var(--casino-deal-delay, 0ms) backwards;
+  }
+  .casino-card--turned {
+    animation: casino-turn-card 225ms ease-out var(--casino-deal-delay, 0ms) backwards;
+  }
+  .mines-tile--exploded {
+    position: relative;
+    animation: mines-impact 290ms ease-out;
+  }
+  .mines-tile--exploded::after {
+    position: absolute;
+    inset: 5%;
+    border-radius: inherit;
+    content: "";
+    pointer-events: none;
+    background:
+      radial-gradient(circle at 24% 31%, #ffd199 0 1px, transparent 2.5px),
+      radial-gradient(circle at 70% 22%, #ffe1af 0 1px, transparent 2.5px),
+      radial-gradient(circle at 78% 69%, #ffd199 0 1px, transparent 2.5px),
+      radial-gradient(circle at 32% 78%, #ffad8b 0 1px, transparent 2.5px),
+      radial-gradient(circle, #ffd597b8, #ff876d65 28%, transparent 62%);
+    animation: mines-burst 360ms ease-out both;
+  }
+}
+
+@keyframes casino-deal {
+  from { opacity: 0; transform: translateY(-24%) rotate(-7deg) scale(.92); }
+  72% { opacity: 1; transform: translateY(2%); }
+  to { transform: none; }
+}
+
+@keyframes casino-turn-card {
+  from { opacity: .25; transform: perspective(160px) rotateY(-80deg); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes mines-impact {
+  25% { transform: scale(1.055); }
+  62% { transform: scale(.98); }
+}
+
+@keyframes mines-burst {
+  from { opacity: .95; transform: scale(.38); }
+  to { opacity: 0; transform: scale(1.12); }
+}
+
 @media (max-width: 640px) {
   .poker-felt {
     grid-template-columns: repeat(4, minmax(0, 1fr));

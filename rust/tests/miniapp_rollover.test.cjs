@@ -106,25 +106,33 @@ test('a guess crossing midnight carries its old date and clears stale input', as
 
 test('switching games hides the previous view and stops refreshing word data', async () => {
   const panels = Object.fromEntries(
-    ['app', 'rocket', 'poker', 'blackjack', 'mines', 'slots'].map(id => [id, { hidden: true }]),
+    ['app', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip']
+      .map(id => [id, { hidden: true }]),
   );
   const calls = [];
+  const mount = (game) => ({ request }) => ({
+    show() { request('state'); },
+    hide() { calls.push(`hide ${game}`); },
+  });
   const document = { body: { dataset: { game: 'lobby' } }, documentElement: {}, getElementById: id => panels[id] };
   const context = vm.createContext({
     document, activeGame: null, session: 'test', lang: 'ru', reloadWords: false,
-    casinoViews: new Map(), casinoTitles: { poker: 'Покер', blackjack: 'Блэкджек', mines: 'Минное поле', slots: 'Слоты' },
+    casinoViews: new Map(),
     helpEl: {}, playersEl: {}, gameLobby: { hidden: false }, gameSwitch: { querySelectorAll: () => [] },
     rocket: { show() { calls.push('show rocket'); }, hide() { calls.push('hide rocket'); } },
-    window: { CasinoGames: { poker: () => ({ show() { calls.push('show poker'); }, hide() { calls.push('hide poker'); } }) } },
-    api: () => { throw Error('A hidden game must not refresh word data'); },
+    window: { CasinoGames: { roulette: mount('roulette'), coinflip: mount('coinflip') } },
+    api: (path) => { calls.push(path); return Promise.resolve({}); },
   });
   vm.runInContext(polling, context);
+  vm.runInContext(app.slice(app.indexOf('const casinoTitles'), app.indexOf('const casinoViews')), context);
   vm.runInContext(app.slice(app.indexOf('function openGame('), app.indexOf('\nfor (const button of gameSwitch', app.indexOf('function openGame('))), context);
   await vm.runInContext('refreshPlayers()', context);
-  vm.runInContext('openGame("rocket"); openGame("poker"); openGame("rocket");', context);
+  vm.runInContext('openGame("rocket"); openGame("roulette"); openGame("coinflip"); openGame("rocket");', context);
   await vm.runInContext('refreshPlayers()', context);
-  assert.deepEqual(calls, ['show rocket', 'hide rocket', 'show poker', 'hide poker', 'show rocket']);
-  assert.equal(panels.poker.hidden, true);
+  assert.deepEqual(calls, ['show rocket', 'hide rocket', 'api/games/roulette/state', 'hide roulette',
+    'api/games/coinflip/state', 'hide coinflip', 'show rocket']);
+  assert.equal(panels.roulette.hidden, true);
+  assert.equal(panels.coinflip.hidden, true);
   assert.equal(panels.rocket.hidden, false);
   assert.equal(panels.app.hidden, true);
   assert.equal(context.gameLobby.hidden, true);

@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const source = readFileSync(join(__dirname, 'rocket.js'), 'utf8');
 const context = vm.createContext({});
 vm.runInContext(source, context);
-const { createRocketFeed, rocketTelemetry } = vm.runInContext('({ createRocketFeed, rocketTelemetry })', context);
+const createRocketFeed = vm.runInContext('createRocketFeed', context);
 
 function snapshot(flight = null, balance = 500) {
   return { balance, min_bet: 10, max_bet: 1000, flight };
@@ -61,7 +61,27 @@ function fixture(canAutoStart = () => true) {
   return { ...io, feed, current: () => current };
 }
 
-function viewFixture() {
+function viewFixture(reducedMotion = false) {
+  const drawing = {};
+  const gradient = { addColorStop() {} };
+  const canvas = {
+    setTransform() {}, fillRect() {}, fillText() {}, beginPath() {}, moveTo() {}, lineTo() {},
+    fill() {}, save() {}, restore() {}, rotate() {}, quadraticCurveTo() {}, bezierCurveTo() {}, closePath() {},
+    clearRect() { delete drawing.ship; delete drawing.curve; delete drawing.marker; delete drawing.burst; },
+    translate(x, y) { drawing.ship = [x, y]; },
+    arc(x, y, radius) {
+      if (radius === 4) drawing.marker ??= [x, y];
+      if (radius === 5.25) drawing.burst = [x, y];
+    },
+    stroke(path) { if (path) drawing.curve = path.points; },
+    createLinearGradient() { return gradient; },
+  };
+  class Path2D {
+    constructor(path) { this.points = path ? [...path.points] : []; }
+    moveTo(x, y) { this.points.push([x, y]); }
+    lineTo(x, y) { this.points.push([x, y]); }
+    closePath() {}
+  }
   class Element extends EventTarget {
     dataset = {};
     children = [];
@@ -70,10 +90,11 @@ function viewFixture() {
     setAttribute(name, value) { this.attributes.set(name, value); }
     append(...children) { this.children.push(...children); }
     insertBefore(child, reference) { this.children.splice(this.children.indexOf(reference), 0, child); }
-    getContext() { return null; }
+    getContext() { return canvas; }
   }
   const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
   const elements = new Map(Array.from(html.matchAll(/\bid="(rocket[^"]*)"/g), ([, id]) => [id, new Element()]));
+  Object.assign(elements.get('rocket-chart'), { clientWidth: 350, clientHeight: 220 });
   const form = elements.get('rocket-form');
   const settings = elements.get('rocket-settings');
   form.append(settings, elements.get('rocket-action'));
@@ -82,12 +103,13 @@ function viewFixture() {
     createElement: () => new Element(),
     getElementById: (id) => elements.get(id),
   });
-  const window = Object.assign(new EventTarget(), { matchMedia: () => new EventTarget() });
+  const motion = Object.assign(new EventTarget(), { matches: reducedMotion });
+  const window = Object.assign(new EventTarget(), { matchMedia: () => motion });
   const navigator = { onLine: true };
   const io = transport();
   let paint;
   const browser = vm.createContext({
-    document, window, navigator, request: io.request,
+    document, window, navigator, Path2D, request: io.request,
     performance: { now: io.now }, setTimeout: io.setTimer, clearTimeout: io.clearTimer,
     ResizeObserver: class { observe() {} },
     requestAnimationFrame: (callback) => { paint = callback; return 1; },
@@ -100,7 +122,12 @@ function viewFixture() {
   const [, rounds, start] = setup.children;
   return {
     ...io, view, document, window, navigator, elements, settings, setup, status, rounds, start, stop,
-    frame: (sinceSample = 0) => paint(io.now() + sinceSample),
+    drawing, motion, hasFrame: () => Boolean(paint),
+    frame(sinceSample = 0) {
+      const callback = paint;
+      paint = null;
+      callback(io.now() + sinceSample);
+    },
   };
 }
 
@@ -230,10 +257,11 @@ test('auto start keeps manual cashout mode and waits for the crash after payout'
   const earlyLaunch = f.feed.launch('100', null);
   assert.equal(f.requests.length, 2, 'the next stake is blocked until crash');
   await earlyLaunch;
-  await f.poll(paid);
-  await f.poll(paid);
+  const cinematic = snapshot({ ...paid.flight, elapsed_ms: 12739, multiplier: 50000, cinematic_from_ms: 8200 }, 510);
+  await f.poll(cinematic);
+  await f.poll(cinematic);
   assert.deepEqual(f.starts(), [], 'active polling never spends the next stake');
-  const crashed = snapshot({ ...paid.flight, status: 'crashed', multiplier: 240 }, 510);
+  const crashed = snapshot({ ...cinematic.flight, status: 'crashed', elapsed_ms: 13339, multiplier: 100000 }, 510);
   await f.poll(crashed);
   assert.deepEqual(f.starts(), [], 'the crash stays visible before the next start');
   await f.poll(crashed);
@@ -257,9 +285,8 @@ test('reloading a cashed-out flight shows the fixed payout and keeps launch lock
   assert.equal(payout.textContent, '175 мон.');
   assert.equal(f.stop.hidden, true, 'reload never opts back into auto start');
   f.frame();
-  const initialTime = clock.textContent;
   f.frame(400);
-  assert.notEqual(clock.textContent, initialTime);
+  assert.equal(clock.textContent, '6,5 с');
   assert.equal(liveMultiplier.textContent, '2,10×');
 
   await f.poll(snapshot({ ...paid, status: 'crashed', multiplier: 260, elapsed_ms: 8271 }, 575));
@@ -444,13 +471,85 @@ for (const [name, interrupt, resume] of [
   });
 }
 
-test('visual telemetry advances the clock but only shows the confirmed multiplier', () => {
-  const flying = flight('flying', { elapsed_ms: 5800, multiplier: 195, payout: 150, cashout_multiplier: 150 });
-  assert.equal(rocketTelemetry(flying, 200).elapsed, 6000);
-  assert.equal(rocketTelemetry(flying, 200).multiplier, 195);
-  assert.equal(rocketTelemetry(flying, 8000).elapsed, rocketTelemetry(flying, 650).elapsed);
-  assert.equal(rocketTelemetry(flight('flying', { elapsed_ms: 19800, multiplier: 985 }), 650).multiplier, 985);
-  assert.equal(rocketTelemetry(flight('countdown', { elapsed_ms: -10 }), 500).elapsed, 0);
-  assert.equal(rocketTelemetry(flight('crashed', { multiplier: 146, elapsed_ms: 3250 }), 650).multiplier, 146);
-  assert.equal(rocketTelemetry(flight('paid', { multiplier: 185, elapsed_ms: 5600 }), 650).elapsed, 5600);
+test('animation frames move the ship and curve together without predicting through a sudden crash', async () => {
+  const f = viewFixture();
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 1060, multiplier: 113 })));
+  f.frame();
+  const initial = f.drawing.ship;
+  await f.poll(snapshot(flight('flying', { elapsed_ms: 1560, multiplier: 119 })));
+  f.frame();
+  assert.deepEqual(f.drawing.ship, initial);
+  const readout = f.elements.get('rocket-multiplier');
+  assert.equal(readout.textContent, '1,19×');
+
+  f.frame(125);
+  const first = f.drawing.ship;
+  assert.ok(first[0] > initial[0] && first[1] < initial[1]);
+  assert.deepEqual(f.drawing.curve.at(-1), first);
+  f.frame(250);
+  assert.ok(f.drawing.ship[0] > first[0] && f.drawing.ship[1] < first[1]);
+  f.frame(500);
+  const confirmed = f.drawing.ship;
+  f.frame(900); // Delayed crash response.
+  assert.deepEqual(f.drawing.ship, confirmed);
+  await f.poll(snapshot(flight('crashed', { elapsed_ms: 1578, multiplier: 120 })));
+  f.frame(500);
+  assert.ok(f.drawing.marker[0] >= confirmed[0] && f.drawing.marker[1] <= confirmed[1]);
+  assert.deepEqual(f.drawing.curve.at(-1), f.drawing.marker);
+  assert.equal(readout.textContent, '1,20×');
+});
+
+test('reduced motion paints confirmed positions once and reveals the cinematic peak at crash', async () => {
+  const f = viewFixture(true);
+  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 9509 };
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 14000, multiplier: 53696 }), 600));
+  f.frame();
+  const initial = f.drawing.ship;
+  assert.equal(f.hasFrame(), false);
+  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 14500, multiplier: 95675 }), 600));
+  f.frame();
+  assert.ok(f.drawing.ship[0] > initial[0] && f.drawing.ship[1] < initial[1]);
+  assert.equal(f.hasFrame(), false);
+  assert.equal(f.elements.get('rocket-multiplier').textContent, '956,75×');
+  assert.equal(f.elements.get('rocket-action').attributes.get('aria-disabled'), 'true');
+  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 14538, multiplier: 100000 }), 600));
+  f.frame();
+  assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
+  assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');
+  assert.match(f.elements.get('rocket-payout-label').textContent, /2,00×/);
+  assert.equal(f.elements.get('rocket-action').attributes.get('aria-disabled'), 'false');
+  assert.equal(f.hasFrame(), false);
+});
+
+test('a confirmed cinematic crash reveals the peak immediately while the ship eases into the burst', async () => {
+  const f = viewFixture();
+  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 9509 };
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 13500, multiplier: 30135 }), 600));
+  f.frame();
+  const lastPaint = f.drawing.ship;
+  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 14000, multiplier: 53696 }), 600));
+  f.frame();
+  assert.deepEqual(f.drawing.ship, lastPaint);
+  f.frame(480);
+  const beforeCrash = f.drawing.ship;
+
+  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 14538, multiplier: 100000 }), 600));
+  f.frame();
+  assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
+  assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');
+  assert.equal(f.drawing.marker, undefined);
+  assert.deepEqual(f.drawing.ship, beforeCrash);
+  f.frame(60);
+  const approaching = f.drawing.ship;
+  assert.ok(approaching[0] > beforeCrash[0] && approaching[1] < beforeCrash[1]);
+  assert.equal(f.drawing.marker, undefined);
+  assert.deepEqual(f.drawing.curve.at(-1), approaching);
+  f.frame(160);
+  assert.equal(f.drawing.ship, undefined);
+  assert.ok(f.drawing.marker[0] > approaching[0] && f.drawing.marker[1] < approaching[1]);
+  assert.deepEqual(f.drawing.curve.at(-1), f.drawing.marker);
+  assert.deepEqual(f.drawing.burst, f.drawing.marker);
 });

@@ -1,6 +1,6 @@
 //! Настройки сервера и модерация: канал для игр (/games_channel), канал логов (/log_channel),
-//! просмотр и снятие варнов (/warns, /warns_clear). Сами варны выдаёт ИИ по просьбе модератора (moderation.rs)
-//! и анти-спам (chat.rs).
+//! просмотр и снятие варнов (/warns, /warns_clear). Варны выдаются по просьбе модератора, за оскорбления
+//! бота (moderation.rs) и за спам (chat.rs).
 
 use crate::reply::{say, whisper};
 use crate::{Context, Data, Error};
@@ -85,7 +85,7 @@ pub async fn set_games_channel(
     }
     data.db.set_games_channel(guild, Some(channel.id.get()))?;
     let commands: Vec<String> = data.games_commands.iter()
-        .filter(|name| !matches!(name.as_str(), "words" | "rocket"))
+        .filter(|name| !matches!(name.as_str(), "words" | "rocket" | "roulette" | "slots"))
         .map(|name| format!("/{name}")).collect();
     say(ctx, format!(
         "✅ Теперь эти команды работают только в <#{}>:\n{}\nЧтобы снова разрешить их везде — вызови /games_channel без канала.",
@@ -131,7 +131,7 @@ pub async fn report_error(http: &serenity::Http, data: &Data, guild: Option<sere
     }
 }
 
-/// Варны участника (их выдаёт бот по просьбе модератора)
+/// Посмотреть варны участника
 #[poise::command(slash_command, guild_only, ephemeral, rename = "warns")]
 pub async fn show_warns(
     ctx: Context<'_>,

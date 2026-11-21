@@ -1,14 +1,16 @@
-//! Европейская рулетка с одним общим раундом на канал.
+//! Европейская рулетка с одним общим раундом на сервер.
 
-use crate::reply::{user_name, whisper};
-use crate::text::money_text;
-use crate::{wagers, Context, Error, Shared};
+use crate::{
+    db::{Database, Wallet},
+    economy::MAX_BET,
+    wagers, Data,
+};
 use poise::serenity_prelude as s;
 use rand::Rng;
-use std::collections::{BTreeMap, HashMap};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
-use std::time::Duration;
-use tokio::time::Instant;
+use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(15);
 const MAX_ROUND: Duration = Duration::from_secs(60);
@@ -44,11 +46,11 @@ enum Space {
 impl Space {
     fn parse(text: &str) -> Option<(Self, String)> {
         let text = text.trim().to_lowercase().replace('–', "-");
-        if let Some(&(_, label, space)) = GROUPS
+        if let Some(&(key, _, space)) = GROUPS
             .iter()
-            .find(|(key, label, _)| *key == text || label.to_lowercase() == text)
+            .find(|(key, label, _)| *key == text || label.to_lowercase().replace('–', "-") == text)
         {
-            return Some((space, label.into()));
+            return Some((space, key.into()));
         }
         let number = text.parse::<u8>().ok()?;
         (number <= 36 && number.to_string() == text).then_some((Self::Number(number), text))
@@ -81,174 +83,354 @@ impl Space {
 struct Bet {
     ticket: u64,
     user: u64,
+    name: String,
     amount: i64,
+    key: String,
     space: Space,
+    request_id: String,
 }
 
 struct Round {
-    id: u64,
     started: Instant,
     deadline: Instant,
     bets: Vec<Bet>,
+    refund_pending: bool,
+}
+
+struct Completed {
+    id: u64,
+    number: Option<u8>,
+    bets: Vec<Bet>,
+}
+
+struct Table {
+    // Shared by clients who saw an idle table and clients who saw it open.
+    round_id: u64,
+    round: Option<Round>,
+    last_result: Option<Completed>,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            round_id: new_id(),
+            round: None,
+            last_result: None,
+        }
+    }
+}
+
+fn new_id() -> u64 {
+    rand::random::<u64>() | (1 << 63)
+}
+
+fn own_bets(bets: &[Bet], user: u64) -> Vec<Value> {
+    bets.iter()
+        .filter(|bet| bet.user == user)
+        .map(|bet| json!({"request_id": bet.request_id, "space": bet.key, "amount": bet.amount}))
+        .collect()
+}
+
+impl Completed {
+    fn snapshot(&self, user: u64) -> Value {
+        let mut totals = BTreeMap::new();
+        for bet in &self.bets {
+            let net = self
+                .number
+                .map_or(0, |number| bet.amount * (bet.space.multiplier(number) - 1));
+            let (name, total) = totals.entry(bet.user).or_insert((bet.name.as_str(), 0));
+            *name = &bet.name;
+            *total += net;
+        }
+        let mut players: Vec<_> = totals.into_iter().collect();
+        players.sort_by_key(|&(user, (_, net))| (std::cmp::Reverse(net), user));
+        json!({
+            "id": self.id.to_string(),
+            "number": self.number,
+            "refunded": self.number.is_none(),
+            "your_bets": own_bets(&self.bets, user),
+            "players": players.into_iter().map(|(id, (name, net))| json!({
+                "id": id.to_string(), "name": name, "net": net,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl Table {
+    fn maintain(&mut self, db: &Database, now: Instant) {
+        let Some(round) = self.round.as_mut().filter(|round| now >= round.deadline) else {
+            return;
+        };
+        // Choose the result only once betting has closed, under the same lock as placement.
+        let mut number = None;
+        if !round.refund_pending {
+            let drawn = rand::rng().random_range(0..=36);
+            let payouts: Vec<_> = round
+                .bets
+                .iter()
+                .map(|bet| (bet.ticket, bet.amount * bet.space.multiplier(drawn)))
+                .collect();
+            match wagers::settle(db, self.round_id, &payouts) {
+                Ok(()) => number = Some(drawn),
+                Err(error) => {
+                    eprintln!(
+                        "Mini App roulette {}: settlement failed: {error}",
+                        self.round_id
+                    );
+                    round.refund_pending = true;
+                }
+            }
+        }
+        if round.refund_pending {
+            if let Err(error) = wagers::refund(db, Some(self.round_id)) {
+                eprintln!(
+                    "Mini App roulette {}: refund failed: {error}",
+                    self.round_id
+                );
+                return;
+            }
+        }
+        let round = self.round.take().unwrap();
+        self.last_result = Some(Completed {
+            id: self.round_id,
+            number,
+            bets: round.bets,
+        });
+        self.round_id = new_id();
+    }
+
+    fn snapshot(
+        &self,
+        user: u64,
+        balance: i64,
+        minimum: i64,
+        now: Instant,
+        bet_error: Option<String>,
+    ) -> Value {
+        let round = self.round.as_ref().map(|round| {
+            json!({
+                "id": self.round_id.to_string(),
+                "remaining_ms": round.deadline.saturating_duration_since(now).as_millis() as u64,
+                "refunding": round.refund_pending,
+                "bet_count": round.bets.len(),
+                "player_count": round.bets.iter().map(|bet| bet.user).collect::<HashSet<_>>().len(),
+                "your_bets": own_bets(&round.bets, user),
+            })
+        });
+        json!({
+            "user_id": user.to_string(),
+            "balance": balance,
+            "min_bet": minimum,
+            "max_bet": MAX_BET,
+            "max_bets": MAX_BETS,
+            "round_id": self.round_id.to_string(),
+            "round": round,
+            "last_result": self.last_result.as_ref().map(|last| last.snapshot(user)),
+            "bet_error": bet_error,
+        })
+    }
+
+    fn accepted(&self, wager: &Wager<'_>, user: u64) -> bool {
+        let bets = if wager.round_id == self.round_id {
+            self.round.as_ref().map(|round| &round.bets)
+        } else {
+            self.last_result
+                .as_ref()
+                .filter(|last| last.id == wager.round_id)
+                .map(|last| &last.bets)
+        };
+        bets.is_some_and(|bets| {
+            bets.iter()
+                .any(|bet| bet.user == user && bet.request_id == wager.request_id)
+        })
+    }
+}
+
+struct Wager<'a> {
+    round_id: u64,
+    request_id: &'a str,
+    bet: &'a str,
+    key: String,
+    space: Space,
+}
+
+impl<'a> Wager<'a> {
+    fn parse(body: &'a Value) -> Result<Self, String> {
+        let round_id = body["round_id"]
+            .as_str()
+            .and_then(|id| id.parse().ok())
+            .ok_or("Нужен номер раунда.")?;
+        let request_id = body["request_id"]
+            .as_str()
+            .filter(|id| {
+                (1..=64).contains(&id.len())
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            })
+            .ok_or("Неверный номер ставки.")?;
+        let bet = body["bet"]
+            .as_str()
+            .filter(|bet| !bet.is_empty() && bet.len() <= 64)
+            .ok_or("Укажите сумму ставки.")?;
+        let (space, key) = body["space"]
+            .as_str()
+            .filter(|space| space.len() <= 64)
+            .and_then(Space::parse)
+            .ok_or("Выберите клетку на столе.")?;
+        Ok(Self {
+            round_id,
+            request_id,
+            bet,
+            key,
+            space,
+        })
+    }
 }
 
 #[derive(Default)]
-pub struct State(Mutex<HashMap<s::ChannelId, Round>>);
+pub struct State(Mutex<HashMap<u64, Table>>);
 
-async fn spaces(_: Context<'_>, partial: &str) -> s::CreateAutocompleteResponse {
-    let partial = partial.trim().to_lowercase();
-    let groups = GROUPS
-        .iter()
-        .map(|(key, label, _)| (key.to_string(), label.to_string()));
-    let numbers = (0..=36).map(|number| (number.to_string(), number.to_string()));
-    let mut matches: Vec<_> = groups
-        .chain(numbers)
-        .filter(|(key, label)| {
-            key.starts_with(&partial) || label.to_lowercase().starts_with(&partial)
-        })
-        .collect();
-    // Discord даёт 25 подсказок; при вводе числа доступны все клетки 0–36.
-    matches.sort_by_key(|(key, _)| key != &partial);
-    s::CreateAutocompleteResponse::new().set_choices(
-        matches
-            .into_iter()
-            .take(25)
-            .map(|(key, label)| s::AutocompleteChoice::new(label, key))
-            .collect(),
-    )
-}
+impl State {
+    fn act(
+        &self,
+        db: &Database,
+        wallet: Wallet<'_>,
+        minimum: i64,
+        action: &str,
+        body: &Value,
+        clock: impl Fn() -> Instant,
+    ) -> rusqlite::Result<Result<Value, String>> {
+        let wager = match action {
+            "state" => None,
+            "bet" => match Wager::parse(body) {
+                Ok(wager) => Some(wager),
+                Err(error) => return Ok(Err(error)),
+            },
+            _ => return Ok(Err("Неизвестное действие рулетки.".into())),
+        };
+        let minimum = minimum.max(1);
+        let mut tables = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let table = tables.entry(wallet.guild).or_default();
+        table.maintain(db, clock());
 
-/// Ставка в общем раунде рулетки. Выбери цвет, группу или число от 0 до 36
-#[poise::command(slash_command, guild_only)]
-pub async fn roulette(
-    ctx: Context<'_>,
-    #[description = "Сумма монет или all"] bet: String,
-    #[description = "Цвет, группа, колонка или число 0–36"]
-    #[autocomplete = "spaces"]
-    space: String,
-) -> Result<(), Error> {
-    let Some((space, label)) = Space::parse(&space) else {
-        return whisper(
-            ctx,
-            "Выбери ставку из подсказок или введи число от 0 до 36.",
-        )
-        .await;
-    };
-    let data = ctx.data();
-    let guild = ctx.guild_id().unwrap().get();
-    let user = ctx.author().id.get();
-    let channel = ctx.channel_id();
-    let ticket = ctx.id();
-    data.db.wallet(
-        guild,
-        user,
-        &user_name(ctx.author()),
-        data.economy.start_balance,
-    )?;
-    let placed = {
-        let mut rounds = data
-            .roulette
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let now = Instant::now();
-        match rounds.get(&channel) {
-            Some(round) if round.deadline <= now => {
-                Err("Раунд уже закрыт, подожди результата.".to_string())
-            }
-            Some(round) if round.bets.len() >= MAX_BETS => {
-                Err("В этом раунде уже 50 ставок.".to_string())
-            }
-            active => {
-                let id = active.map_or(ticket, |round| round.id);
-                wagers::place(
-                    &data.db,
-                    id,
-                    ticket,
-                    guild,
-                    user,
-                    &bet,
-                    data.economy.min_bet,
-                )?
-                .map(|amount| {
-                    let round = rounds.entry(channel).or_insert_with(|| Round {
-                        id,
+        let mut bet_error = None;
+        let balance = if let Some(wager) = wager.filter(|wager| !table.accepted(wager, wallet.user))
+        {
+            let (balance, placed) = db.transaction(|tx| {
+                let (balance, _) = wallet.open(tx)?;
+                // Check the deadline after acquiring SQLite, which can block behind other games.
+                let now = clock();
+                let round_id = table.round_id;
+                if wager.round_id != round_id || table.round.as_ref().is_some_and(|round| now >= round.deadline) {
+                    return Ok((balance, Err("Раунд уже закрыт." .into())));
+                }
+                if table.round.as_ref().is_some_and(|round| round.bets.len() >= MAX_BETS) {
+                    return Ok((balance, Err("В этом раунде уже 50 ставок.".into())));
+                }
+                let ticket = if table.round.is_none() {
+                    let in_use = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM game_wagers WHERE round_id = ?1 OR ticket = ?1)",
+                        [round_id as i64],
+                        |row| row.get::<_, bool>(0),
+                    )?;
+                    if in_use {
+                        return Ok((balance, Err("Не удалось открыть раунд. Обновите игру.".into())));
+                    }
+                    round_id
+                } else {
+                    new_id()
+                };
+                match wagers::place_on(tx, round_id, ticket, wallet.guild, wallet.user, wager.bet, minimum)? {
+                    Ok(amount) => Ok((balance - amount, Ok((now, Bet {
+                        ticket,
+                        user: wallet.user,
+                        name: wallet.name.to_owned(),
+                        amount,
+                        key: wager.key,
+                        space: wager.space,
+                        request_id: wager.request_id.to_owned(),
+                    })))),
+                    Err(error) => Ok((balance, Err(error))),
+                }
+            })?;
+            match placed {
+                Ok((now, bet)) => {
+                    let round = table.round.get_or_insert_with(|| Round {
                         started: now,
                         deadline: now + WAIT,
                         bets: Vec::new(),
-                    });
-                    round.bets.push(Bet {
-                        ticket,
-                        user,
-                        amount,
-                        space,
+                        refund_pending: false,
                     });
                     round.deadline = (now + WAIT).min(round.started + MAX_ROUND);
-                    (
-                        round.id,
-                        amount,
-                        round.deadline.saturating_duration_since(now).as_secs(),
-                    )
-                })
+                    round.bets.push(bet);
+                }
+                Err(error) => bet_error = Some(error),
             }
+            balance
+        } else {
+            wallet.open(&db.lock())?.0
+        };
+
+        // A wager rejection carries an authoritative snapshot. Transport failures can
+        // then be retried with the same request ID without guessing whether it was debited.
+        Ok(Ok(table.snapshot(
+            wallet.user,
+            balance,
+            minimum,
+            clock(),
+            bet_error,
+        )))
+    }
+
+    fn sweep(&self, db: &Database, now: Instant) {
+        let mut tables = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        for table in tables.values_mut() {
+            table.maintain(db, now);
         }
-    };
-    let (id, amount, remaining) = match placed {
-        Ok(placed) => placed,
-        Err(error) => return whisper(ctx, error).await,
-    };
-    let first = ticket == id;
-    if first {
-        tokio::spawn(finish_round(
-            ctx.serenity_context().http.clone(),
-            data.clone(),
-            channel,
-            id,
-        ));
     }
-    let title = if first {
-        "🎡 Рулетка открыта"
-    } else {
-        "🎡 Ставка принята"
-    };
-    let details = format!("<@{user}> поставил **{}** на **{label}**.\nОсталось **{remaining} сек.** на момент ставки.", money_text(amount));
-    let embed = s::CreateEmbed::new()
-        .title(title)
-        .description(details)
-        .color(0x6366F1)
-        .footer(s::CreateEmbedFooter::new(
-            "/roulette — присоединиться · 15 сек. после последней ставки, максимум минута",
-        ));
-    let mut reply = poise::CreateReply::default()
-        .embed(embed)
-        .ephemeral(!first)
-        .allowed_mentions(s::CreateAllowedMentions::new());
-    if first {
-        reply = reply.components(vec![s::CreateActionRow::Buttons(vec![
-            s::CreateButton::new(HELP_BUTTON)
-                .label("Правила")
-                .style(s::ButtonStyle::Secondary),
-        ])]);
-    }
-    ctx.send(reply).await?;
-    Ok(())
 }
 
+pub fn handle(
+    data: &Data,
+    guild: u64,
+    user: u64,
+    name: &str,
+    action: &str,
+    body: &Value,
+) -> rusqlite::Result<Result<Value, String>> {
+    data.roulette.act(
+        &data.db,
+        Wallet {
+            guild,
+            user,
+            name,
+            start: data.economy.start_balance,
+        },
+        data.economy.min_bet,
+        action,
+        body,
+        Instant::now,
+    )
+}
+
+pub fn sweep(data: &Data) {
+    data.roulette.sweep(&data.db, Instant::now());
+}
+
+/// Route the rules button on historical Discord messages to the Activity.
 pub async fn pressed(ctx: &s::Context, press: &s::ComponentInteraction) -> Result<bool, s::Error> {
     if press.data.custom_id != HELP_BUTTON {
         return Ok(false);
     }
-    let text = "Ставь через `/roulette bet:100 space:red` или используй `all`.\n\n\
-        **×2** — цвет, чётность, 1–18 или 19–36.\n\
-        **×3** — дюжина или колонка.\n\
-        **×36** — точное число от 0 до 36. Зеро выигрывает только по ставке на 0.\n\n\
-        Выплаты включают ставку. Каждый принятый взнос оставляет до 15 секунд для новых ставок. Весь раунд длится не больше минуты.";
     press
         .create_response(
             ctx,
             s::CreateInteractionResponse::Message(
                 s::CreateInteractionResponseMessage::new()
-                    .content(text)
+                    .content(
+                        "Рулетка теперь в мини-приложении. Откройте /games и выберите «Рулетка».",
+                    )
                     .ephemeral(true),
             ),
         )
@@ -256,100 +438,174 @@ pub async fn pressed(ctx: &s::Context, press: &s::ComponentInteraction) -> Resul
     Ok(true)
 }
 
-async fn finish_round(http: std::sync::Arc<s::Http>, data: Shared, channel: s::ChannelId, id: u64) {
-    let number = rand::rng().random_range(0..=36);
-    let mut retry = false;
-    let embed = loop {
-        if retry {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        let deadline = {
-            let rounds = data
-                .roulette
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let Some(round) = rounds.get(&channel).filter(|round| round.id == id) else {
-                return;
-            };
-            round.deadline
-        };
-        tokio::time::sleep_until(deadline).await;
-        let mut rounds = data
-            .roulette
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(round) = rounds.get(&channel).filter(|round| round.id == id) else {
-            return;
-        };
-        if Instant::now() < round.deadline {
-            continue;
-        }
-        let payouts: Vec<_> = round
-            .bets
-            .iter()
-            .map(|bet| (bet.ticket, bet.amount * bet.space.multiplier(number)))
-            .collect();
-        let embed = match wagers::settle(&data.db, id, &payouts) {
-            Ok(()) => result(number, round, &payouts),
-            Err(error) => {
-                eprintln!("Рулетка {id}: расчёт ставок не удался: {error}");
-                match wagers::refund(&data.db, Some(id)) {
-                    Ok(_) => s::CreateEmbed::new()
-                        .title("Раунд отменён")
-                        .description("Ставки возвращены."),
-                    Err(error) => {
-                        eprintln!("Рулетка {id}: возврат ставок не удался: {error}");
-                        retry = true;
-                        continue;
-                    }
-                }
-            }
-        };
-        rounds.remove(&channel);
-        break embed;
-    };
-    let message = s::CreateMessage::new()
-        .embed(embed)
-        .allowed_mentions(s::CreateAllowedMentions::new());
-    if let Err(error) = channel.send_message(&http, message).await {
-        eprintln!("Рулетка {id}: не удалось отправить итог: {error}");
-    }
-}
-
-fn result(number: u8, round: &Round, payouts: &[(u64, i64)]) -> s::CreateEmbed {
-    let (icon, color, label) = match number {
-        0 => ("🟢", 0x16A34A, "зелёное"),
-        number if RED.contains(&number) => ("🔴", 0xDC2626, "красное"),
-        _ => ("⚫", 0x52525B, "чёрное"),
-    };
-    let mut nets: BTreeMap<u64, i64> = BTreeMap::new();
-    for (bet, &(_, payout)) in round.bets.iter().zip(payouts) {
-        *nets.entry(bet.user).or_default() += payout - bet.amount;
-    }
-    let mut nets: Vec<_> = nets.into_iter().collect();
-    nets.sort_by_key(|&(user, net)| (std::cmp::Reverse(net), user));
-    let lines = nets
-        .into_iter()
-        .map(|(user, net)| {
-            let sign = if net > 0 { "+" } else { "" };
-            format!("<@{user}> · **{sign}{}**", money_text(net))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    s::CreateEmbed::new()
-        .title(format!("{icon} {number} · {label}"))
-        .color(color)
-        .description(format!("**Итоги рулетки**\n{lines}"))
-        .footer(s::CreateEmbedFooter::new(
-            "В итогах показано изменение баланса с учётом ставок.",
-        ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fixture {
+        state: State,
+        db: crate::db::Database,
+        now: Instant,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                state: State::default(),
+                db: crate::db::Database::in_memory().unwrap(),
+                now: Instant::now(),
+            }
+        }
+
+        fn call(&self, user: u64, seconds: u64, action: &str, body: Value) -> Value {
+            self.state
+                .act(
+                    &self.db,
+                    crate::db::Wallet {
+                        guild: 10,
+                        user,
+                        name: "Игрок",
+                        start: 500,
+                    },
+                    10,
+                    action,
+                    &body,
+                    || self.now + Duration::from_secs(seconds),
+                )
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn shared_round_extends_to_hard_cap_and_rejects_stale_wagers() {
+        let f = Fixture::new();
+        let idle = f.call(1, 0, "state", serde_json::json!({}));
+        for (index, seconds) in [0, 14, 28, 42, 56].into_iter().enumerate() {
+            let body = serde_json::json!({
+                "round_id": idle["round_id"], "request_id": index.to_string(),
+                "bet": "10", "space": "red",
+            });
+            let state = f.call((index % 2 + 1) as u64, seconds, "bet", body);
+            assert!(state["bet_error"].is_null());
+            assert!(state["last_result"].is_null());
+            assert!(state["round"].get("number").is_none());
+            assert_eq!(state["round"]["bet_count"], index + 1);
+            assert_eq!(
+                state["round"]["remaining_ms"],
+                if seconds == 56 { 4000 } else { 15000 }
+            );
+        }
+        let late = f.call(
+            2,
+            60,
+            "bet",
+            serde_json::json!({
+                "round_id": idle["round_id"], "request_id": "late", "bet": "10", "space": "red",
+            }),
+        );
+        assert!(late["bet_error"].is_string());
+        assert_ne!(late["round_id"], idle["round_id"]);
+        assert!(late["round"].is_null());
+        assert!(late["last_result"]["number"].as_u64().unwrap() <= 36);
+        assert_eq!(late["last_result"]["players"].as_array().unwrap().len(), 2);
+        assert_eq!(wagers::refund(&f.db, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_retry_debits_once_and_replays_after_settlement() {
+        let f = Fixture::new();
+        let idle = f.call(1, 0, "state", serde_json::json!({}));
+        let body = serde_json::json!({
+            "round_id": idle["round_id"], "request_id": "retry", "bet": "all", "space": "0",
+        });
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| f.call(1, 0, "bet", body.clone()));
+            let second = f.call(1, 0, "bet", body.clone());
+            for state in [first.join().unwrap(), second] {
+                assert_eq!(state["balance"], 0);
+                assert_eq!(state["round"]["bet_count"], 1);
+                assert_eq!(state["round"]["your_bets"][0]["request_id"], "retry");
+            }
+        });
+        f.state.sweep(&f.db, f.now + Duration::from_secs(15));
+        let settled = f.call(1, 15, "bet", body);
+        let number = settled["last_result"]["number"].as_u64().unwrap();
+        let balance = if number == 0 { 18000 } else { 0 };
+        assert!(settled["bet_error"].is_null());
+        assert_eq!(settled["balance"], balance);
+        assert_eq!(settled["last_result"]["players"][0]["net"], balance - 500);
+        assert_eq!(
+            settled["last_result"]["your_bets"][0]["request_id"],
+            "retry"
+        );
+        assert!(settled["round"].is_null());
+        assert_eq!(wagers::refund(&f.db, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_settlement_locks_the_round_until_every_wager_is_refunded() {
+        let f = Fixture::new();
+        let idle = f.call(1, 0, "state", json!({}));
+        for space in ["0", "red", "black"] {
+            let state = f.call(
+                1,
+                0,
+                "bet",
+                json!({"round_id": idle["round_id"], "request_id": space, "bet": "10", "space": space}),
+            );
+            assert!(state["bet_error"].is_null());
+        }
+        let set_balance = |balance: i64| {
+            f.db.lock()
+                .execute(
+                    "UPDATE economy SET balance = ?1 WHERE guild_id = 10 AND user_id = 1",
+                    [balance],
+                )
+                .unwrap();
+        };
+        // Every possible outcome owes this wallet a payout, which cannot fit.
+        set_balance(i64::MAX);
+        let pending = f.call(1, 15, "state", json!({}));
+        assert_eq!(pending["round"]["refunding"], true);
+        assert_eq!(pending["round"]["remaining_ms"], 0);
+        assert!(pending["last_result"].is_null());
+        let rejected = f.call(
+            2,
+            16,
+            "bet",
+            json!({"round_id": idle["round_id"], "request_id": "closed", "bet": "10", "space": "0"}),
+        );
+        assert!(rejected["bet_error"].is_string());
+        assert_eq!(rejected["balance"], 500);
+
+        set_balance(470);
+        let now = f.now + Duration::from_secs(17);
+        f.state.sweep(&f.db, now);
+        f.state.sweep(&f.db, now);
+        let settled = f.call(1, 17, "state", json!({}));
+        assert_eq!(settled["balance"], 500);
+        assert!(settled["round"].is_null());
+        assert_eq!(settled["last_result"]["refunded"], true);
+        assert!(settled["last_result"]["number"].is_null());
+        assert_eq!(settled["last_result"]["players"][0]["net"], 0);
+        assert_eq!(wagers::refund(&f.db, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn rejected_wagers_do_not_extend_the_window() {
+        let f = Fixture::new();
+        let idle = f.call(1, 0, "state", json!({}));
+        let wager = |request_id: &str, bet: &str| json!({"round_id": idle["round_id"], "request_id": request_id, "bet": bet, "space": "0"});
+        let opened = f.call(1, 0, "bet", wager("first", "10"));
+        assert_eq!(opened["round"]["remaining_ms"], 15000);
+        let failed = f.call(2, 14, "bet", wager("insufficient", "510"));
+        assert!(failed["bet_error"].is_string());
+        assert_eq!(failed["balance"], 500);
+        assert_eq!(failed["round"]["your_bets"], json!([]));
+        assert_eq!(failed["round"]["bet_count"], 1);
+        assert_eq!(failed["round"]["remaining_ms"], 1000);
+    }
 
     #[test]
     fn european_wheel_payouts_and_zero() {

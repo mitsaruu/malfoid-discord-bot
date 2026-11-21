@@ -174,19 +174,27 @@ fn settle_bet(
     minimum: i64,
     multiplier: i64,
 ) -> rusqlite::Result<Result<(i64, i64), String>> {
-    database.transaction(|tx| {
-        let (balance, _) = wallet.open(tx)?;
-        let bet = match parse_bet(input, balance, minimum) {
-            Ok(bet) => bet,
-            Err(reason) => return Ok(Err(reason)),
-        };
-        if balance < bet {
-            return Ok(Err(insufficient_money(balance, bet, "ставка")));
-        }
-        let net = (multiplier - 1) * bet; // ограниченные таблицей игры множители и MAX_BET
-        let new_balance = db::change_balance(tx, wallet.guild, wallet.user, net)?;
-        Ok(Ok((bet, new_balance)))
-    })
+    database.transaction(|tx| settle_bet_on(tx, wallet, input, minimum, multiplier))
+}
+
+pub(crate) fn settle_bet_on(
+    tx: &rusqlite::Transaction<'_>,
+    wallet: Wallet<'_>,
+    input: &str,
+    minimum: i64,
+    multiplier: i64,
+) -> rusqlite::Result<Result<(i64, i64), String>> {
+    let (balance, _) = wallet.open(tx)?;
+    let bet = match parse_bet(input, balance, minimum) {
+        Ok(bet) => bet,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if balance < bet {
+        return Ok(Err(insufficient_money(balance, bet, "ставка")));
+    }
+    let net = (multiplier - 1) * bet; // ограниченные таблицей игры множители и MAX_BET
+    let new_balance = db::change_balance(tx, wallet.guild, wallet.user, net)?;
+    Ok(Ok((bet, new_balance)))
 }
 
 /// Посмотреть баланс монет
@@ -308,6 +316,24 @@ pub enum CoinSide {
     Tails,
 }
 
+impl CoinSide {
+    pub(crate) fn roll() -> Self {
+        if rand::random() { Self::Heads } else { Self::Tails }
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self { Self::Heads => "heads", Self::Tails => "tails" }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        match key { "heads" => Some(Self::Heads), "tails" => Some(Self::Tails), _ => None }
+    }
+
+    pub(crate) fn payout_multiplier(self, result: Self) -> i64 {
+        if self == result { 2 } else { 0 }
+    }
+}
+
 /// Подбросить монету на ставку (угадал — ставка удваивается)
 #[poise::command(slash_command, guild_only)]
 pub async fn coinflip(
@@ -317,9 +343,9 @@ pub async fn coinflip(
 ) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let (start, name) = (data.economy.start_balance, display_name(ctx).await);
-    let result = if rand::rng().random_bool(0.5) { CoinSide::Heads } else { CoinSide::Tails };
+    let result = CoinSide::roll();
     let wallet = Wallet { guild, user, name: &name, start };
-    let multiplier = if result == side { 2 } else { 0 };
+    let multiplier = side.payout_multiplier(result);
     let (bet, new_balance) = match settle_bet(&data.db, wallet, &bet, data.economy.min_bet, multiplier)? {
         Ok(result) => result,
         Err(problem) => return whisper(ctx, problem).await,
@@ -334,93 +360,9 @@ pub async fn coinflip(
     say(ctx, format!("{text}\nБаланс: {}", money_text(new_balance))).await
 }
 
-// Слоты: символ, «вес» (чем больше, тем чаще выпадает) и выплата за три одинаковых (во сколько раз
-// умножается ставка). Два одинаковых символа — ставка возвращается. В среднем игрок получает обратно около 93%.
-const SLOTS: [(&str, u32, i64); 6] =
-    [("🍒", 30, 5), ("🍋", 25, 8), ("🍇", 20, 12), ("🔔", 12, 25), ("💎", 8, 50), ("7️⃣", 5, 100)];
-
-/// Символ на барабане по случайному числу от 0 до суммы весов.
-pub fn slot_symbol(mut roll: u32) -> usize {
-    for (index, (_, weight, _)) in SLOTS.iter().enumerate() {
-        if roll < *weight {
-            return index;
-        }
-        roll -= weight;
-    }
-    SLOTS.len() - 1
-}
-
-/// Во сколько раз умножается ставка: три одинаковых — по таблице, два одинаковых — 1 (возврат), иначе 0.
-pub fn slots_multiplier(reels: [usize; 3]) -> i64 {
-    if reels[0] == reels[1] && reels[1] == reels[2] {
-        SLOTS[reels[0]].2
-    } else if reels[0] == reels[1] || reels[1] == reels[2] || reels[0] == reels[2] {
-        1
-    } else {
-        0
-    }
-}
-
-/// Сыграть в слоты на монеты
-#[poise::command(slash_command, guild_only)]
-pub async fn slots(
-    ctx: Context<'_>,
-    #[description = "Сколько монет поставить или all — все монеты"] bet: String,
-) -> Result<(), Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let (start, name) = (data.economy.start_balance, display_name(ctx).await);
-    let reels = {
-        let total: u32 = SLOTS.iter().map(|(_, weight, _)| weight).sum();
-        let mut rng = rand::rng();
-        [0; 3].map(|_| slot_symbol(rng.random_range(0..total)))
-    };
-    let multiplier = slots_multiplier(reels);
-    let wallet = Wallet { guild, user, name: &name, start };
-    let (bet, new_balance) = match settle_bet(&data.db, wallet, &bet, data.economy.min_bet, multiplier)? {
-        Ok(result) => result,
-        Err(problem) => return whisper(ctx, problem).await,
-    };
-    let payout = bet * multiplier;
-    let outcome = if multiplier > 1 {
-        format!("🎉 Три {}! Выигрыш ×{multiplier}: **+{}**", SLOTS[reels[0]].0, money_text(payout - bet))
-    } else if multiplier == 1 {
-        "😌 Два одинаковых — ставка возвращается.".to_string()
-    } else {
-        format!("😔 Мимо. Проигрыш: {}.", money_text(bet))
-    };
-    let shown = reels.map(|index| SLOTS[index].0).join(" ");
-    let paytable = SLOTS.iter().map(|(symbol, _, payout)| format!("{symbol}×{payout}")).collect::<Vec<_>>().join(" ");
-    // "-# " — мелкий серый текст в Discord
-    say(ctx, format!(
-        "🎰 <@{user}>\n# {shown}\n{outcome}\nБаланс: {}\n-# Три одинаковых: {paytable} · два одинаковых — возврат ставки",
-        money_text(new_balance))).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slot_machine() {
-        assert_eq!([slot_symbol(0), slot_symbol(29), slot_symbol(30), slot_symbol(54), slot_symbol(55), slot_symbol(99)],
-                   [0, 0, 1, 1, 2, 5]);
-        assert_eq!(slots_multiplier([5, 5, 5]), 100);
-        assert_eq!(slots_multiplier([0, 0, 0]), 5);
-        assert_eq!(slots_multiplier([0, 3, 0]), 1);
-        assert_eq!(slots_multiplier([0, 1, 2]), 0);
-        // В среднем автомат возвращает около 93% ставок — как в bot.py
-        let total: u32 = SLOTS.iter().map(|(_, weight, _)| weight).sum();
-        let mut returned = 0.0;
-        for a in 0..total {
-            for b in 0..total {
-                for c in 0..total {
-                    returned += slots_multiplier([slot_symbol(a), slot_symbol(b), slot_symbol(c)]) as f64;
-                }
-            }
-        }
-        let average = returned / (total as f64).powi(3);
-        assert!((0.90..0.96).contains(&average), "возврат {average}");
-    }
 
     fn settings() -> EconomySettings {
         EconomySettings::load(&crate::config::Settings::default())

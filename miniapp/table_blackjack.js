@@ -14,6 +14,8 @@
   let serial = 0;
   let timer;
   let snapshot = null;
+  let renderedSnapshot = null;
+  let handsKey;
   let busy = false;
   let syncError = "";
   let actionError = "";
@@ -104,9 +106,10 @@
   );
   root.replaceChildren(header, modes, felt, dock, feedback, rules);
 
-  function cardsFor(hand) {
+  function cardsFor(hand, animationFor, delay = 0) {
     const display = element("div", "", "casino-cards");
-    for (const card of hand.cards) {
+    let animated = 0;
+    for (const [index, card] of hand.cards.entries()) {
       const chip = element("span", card ?? "", "casino-card");
       if (card === null) {
         chip.classList.add("casino-card--back");
@@ -115,12 +118,17 @@
       } else {
         chip.dataset.suit = suits[card.slice(-1)];
       }
+      const animation = animationFor(index, card);
+      if (animation) {
+        chip.classList.add(animation);
+        chip.style.setProperty("--casino-deal-delay", `${delay + animated++ * 55}ms`);
+      }
       display.append(chip);
     }
     return display;
   }
 
-  function playerPanel(player, table, user) {
+  function playerPanel(player, table, user, priorPlayer, animate, delay) {
     const section = element("section", "", "casino-seat blackjack-seat");
     section.classList.toggle("casino-seat--own", player.id === user);
     section.classList.toggle("casino-seat--active", player.hands.some((hand) => hand.active));
@@ -130,13 +138,46 @@
       section.append(element("p", "Ставка " + amounts.format(player.bet) + " • " +
         (player.id === table.host_id ? "Открывает раздачу" : "Готов к раздаче")));
     }
+    const priorHands = priorPlayer?.hands ?? [];
+    const priorLengths = priorHands.map((hand) => hand.cards.length);
+    if (player.hands.length === priorHands.length + 1) {
+      const activeIndex = priorHands.findIndex((hand) => hand.active);
+      const cards = priorHands[activeIndex]?.cards;
+      if (cards?.length === 2 && player.hands[activeIndex].cards[0] === cards[0] &&
+          player.hands[activeIndex + 1].cards[0] === cards[1]) {
+        priorLengths.splice(activeIndex, 1, 1, 1);
+      }
+    }
+    const split = priorLengths.length > 0 && priorLengths.length < player.hands.length;
+    const heldCards = new Map();
+    if (split) {
+      // When a poll skips the split turn, reserve the carried first cards
+      // before matching the rest of the hand against the previous snapshot.
+      for (const hand of priorHands) {
+        for (const card of hand.cards) heldCards.set(card, (heldCards.get(card) ?? 0) + 1);
+      }
+      for (const { cards: [first] } of player.hands) {
+        heldCards.set(first, (heldCards.get(first) ?? 0) - 1);
+      }
+    }
     player.hands.forEach((hand, index) => {
       const handPanel = element("div", "", "blackjack-hand");
       handPanel.classList.toggle("blackjack-hand--active", hand.active);
       const title = player.hands.length > 1 ? "Рука " + (index + 1) + " · " : "";
       const active = hand.active ? " • Ход на этой руке" : "";
       handPanel.append(element("p", title + "Очки " + hand.total + " • Ставка " + amounts.format(hand.bet) + active));
-      handPanel.append(cardsFor(hand));
+      handPanel.append(cardsFor(hand, (cardIndex, card) => {
+        if (!animate) return;
+        if (split) {
+          if (cardIndex === 0) return;
+          const held = heldCards.get(card) ?? 0;
+          if (held > 0) {
+            heldCards.set(card, held - 1);
+            return;
+          }
+        } else if (cardIndex < (priorLengths[index] ?? 0)) return;
+        return "casino-card--dealt";
+      }, delay));
       if (hand.outcome) {
         const net = hand.payout - hand.bet;
         const result = net > 0 ? "+" + amounts.format(net) : amounts.format(net);
@@ -145,6 +186,34 @@
       section.append(handPanel);
     });
     return section;
+  }
+
+  function renderHands(table, you, ownSeat) {
+    const previous = renderedSnapshot;
+    renderedSnapshot = snapshot;
+    const key = table ? JSON.stringify([table.id, table.phase, table.host_id, table.dealer, table.players, you]) : "";
+    if (key === handsKey) return;
+    handsKey = key;
+    const prior = previous?.table?.id === table?.id ? previous?.table : null;
+    const animate = previous !== null;
+
+    if (table?.dealer) {
+      const priorCards = prior?.dealer?.cards ?? [];
+      dealerCards.replaceChildren(cardsFor(table.dealer, (index, card) => {
+        if (!animate) return;
+        if (index >= priorCards.length) return "casino-card--dealt";
+        if (priorCards[index] === null && card !== null) return "casino-card--turned";
+      }), element("p", "Очки " + table.dealer.total));
+    } else {
+      dealerCards.replaceChildren(emptyHand);
+    }
+
+    const roster = ownSeat && table.phase !== "lobby"
+      ? [ownSeat, ...table.players.filter((player) => player !== ownSeat)]
+      : table?.players ?? [];
+    players.replaceChildren(...roster.map((player, index) => playerPanel(
+      player, table, you, prior?.players.find((seat) => seat.id === player.id), animate, Math.min(index, 4) * 18,
+    )));
   }
 
   function statusText(table, you, seated) {
@@ -201,18 +270,10 @@
     start.hidden = table?.host_id !== you;
     start.disabled = !editable || !actions.includes("start");
     leave.disabled = !editable || !actions.includes("leave");
-    if (table?.dealer) {
-      dealerCards.replaceChildren(cardsFor(table.dealer), element("p", "Очки " + table.dealer.total));
-    } else {
-      dealerCards.replaceChildren(emptyHand);
-    }
     moveBar.hidden = table?.phase !== "playing" || !ownSeat;
     dock.hidden = betForm.hidden && lobbyActions.hidden && moveBar.hidden;
     for (const { action, control } of moves) control.disabled = !editable || !actions.includes(action);
-    const roster = ownSeat && table.phase !== "lobby"
-      ? [ownSeat, ...table.players.filter((player) => player !== ownSeat)]
-      : table?.players ?? [];
-    players.replaceChildren(...roster.map((player) => playerPanel(player, table, you)));
+    renderHands(table, you, ownSeat);
   }
 
   function accept(data) {

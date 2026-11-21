@@ -1,4 +1,4 @@
-//! Варны и тайм-ауты по явной просьбе модератора и при достижении порога варнов.
+//! Варны за оскорбления бота, варны и тайм-ауты по просьбе модератора и по порогам варнов.
 
 use crate::admin::report_error;
 use crate::ai::minutes_text;
@@ -225,6 +225,48 @@ pub async fn give_warn(ctx: &serenity::Context, data: &Data, guild: serenity::Gu
     }
 }
 
+/// Записывает варн за оскорбление бота без применения порога тайм-аута.
+pub async fn warn_for_insult(
+    http: &serenity::Http,
+    data: &Data,
+    guild: Option<serenity::GuildId>,
+    user: &serenity::User,
+    channel: serenity::ChannelId,
+    bot: serenity::UserId,
+) {
+    let Some(guild) = guild else { return };
+    if user.bot {
+        return;
+    }
+
+    let now = db::now();
+    let reason = "Серьёзное оскорбление бота";
+    let count = match data.db.add_warn(guild.get(), user.id.get(), bot.get(), reason, now) {
+        Ok(count) => count,
+        Err(error) => {
+            report_error(http, data, Some(guild), "Варн за оскорбление бота", &error.to_string()).await;
+            return;
+        }
+    };
+    // Время последней грубости нужно для вариантов автоответов в чате.
+    let reset_after = data.ai.rude.strike_reset as f64 * 60.0;
+    match data.db.add_rude_strike(guild.get(), user.id.get(), now, reset_after) {
+        Ok(strikes) => println!("Грубость к боту: пользователь={} сервер={guild} подряд={strikes}", user.id),
+        Err(error) => eprintln!("Не удалось обновить счётчик грубости {} на сервере {guild}: {error}", user.id),
+    }
+
+    let text = format!("⚠️ <@{}> получает варн №{count}: {reason}.", user.id);
+    let announced = if data.ai.rude.announce {
+        let message = serenity::CreateMessage::new().content(&text).allowed_mentions(serenity::CreateAllowedMentions::new());
+        channel.send_message(http, message).await.is_ok()
+    } else {
+        false
+    };
+    if !announced || data.db.log_channel(guild.get()).ok().flatten() != Some(channel.get()) {
+        send_log(http, data, guild, &format!("{text} Канал: <#{channel}>")).await;
+    }
+}
+
 pub struct Requester<'a> {
     pub ctx: &'a serenity::Context,
     pub guild: serenity::GuildId,
@@ -289,7 +331,7 @@ pub async fn run_action(data: &Data, requester: &Requester<'_>, action: Action) 
 }
 
 /// Пишет в канал логов сервера (если он выбран). Без пингов.
-pub async fn send_log(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId, text: &str) {
+pub async fn send_log(ctx: &impl serenity::CacheHttp, data: &Data, guild: serenity::GuildId, text: &str) {
     let Ok(Some(channel)) = data.db.log_channel(guild.get()) else { return };
     for part in crate::ai::split_message(text, 1900) {
         let message = serenity::CreateMessage::new().content(part).allowed_mentions(serenity::CreateAllowedMentions::new());
@@ -303,6 +345,31 @@ pub async fn send_log(ctx: &serenity::Context, data: &Data, guild: serenity::Gui
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bot_insults_add_persistent_warnings_at_timeout_thresholds() {
+        let settings = crate::config::Settings::parse(
+            "[moderation]\nwarn_punishments = 1: 60\nannounce_warnings = off\n",
+        );
+        let data = Data::new(db::Database::in_memory().unwrap(), &settings, Default::default(), false);
+        let http = serenity::Http::new("test-token");
+        let guild = serenity::GuildId::new(7);
+        let channel = serenity::ChannelId::new(42);
+        let bot = serenity::UserId::new(99);
+        let mut user = serenity::User::default();
+        user.id = serenity::UserId::new(1);
+
+        warn_for_insult(&http, &data, Some(guild), &user, channel, bot).await;
+        data.db.reset_rude_strikes(guild.get(), user.id.get()).unwrap();
+        warn_for_insult(&http, &data, Some(guild), &user, channel, bot).await;
+
+        let (rows, total) = data.db.warns(guild.get(), user.id.get()).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            rows.iter().map(|(giver, reason, _)| (*giver, reason.as_str())).collect::<Vec<_>>(),
+            [(99, "Серьёзное оскорбление бота"); 2],
+        );
+    }
 
     #[test]
     fn warn_punishments() {

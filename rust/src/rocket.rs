@@ -12,8 +12,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 const COUNTDOWN: Duration = Duration::from_secs(3);
-const MAX: u32 = 1000;
+const MAX_WAGER_CRASH: u32 = 1000;
 const DOUBLE_SECONDS: f64 = 6.0;
+const CINEMATIC_DOUBLE_SECONDS: f64 = 0.6;
 const RESULT_WINDOW: Duration = Duration::from_secs(12 * 3600);
 
 type Player = (u64, u64); // сервер, игрок
@@ -33,6 +34,7 @@ struct Flight {
     id: u64,
     stake: i64,
     crash_at: u32,
+    cinematic_peak: Option<u32>,
     auto: Option<u32>,
     launch: Instant,
     outcome: Option<Outcome>,
@@ -69,7 +71,17 @@ pub fn start_cleanup(data: Shared) {
 }
 
 fn crash_point(random: u32) -> u32 {
-    (97_000_000 / random).clamp(100, MAX)
+    (97_000_000 / random).clamp(100, MAX_WAGER_CRASH)
+}
+
+fn cinematic_peak(roll: u32) -> Option<u32> {
+    // Independent of the wager crash. Of paid flights, 0.9% reach 100× and 0.1% reach
+    // 1,000×. At 600 ms per doubling, even 1× to 1,000× adds less than six seconds.
+    match roll {
+        1 => Some(100_000),
+        2..=10 => Some(10_000),
+        _ => None,
+    }
 }
 
 fn flight_time(multiplier: u32) -> Duration {
@@ -94,12 +106,23 @@ fn parse_auto(raw: &str) -> Option<u32> {
         _ => fraction.parse::<u32>().ok()?,
     };
     let value = whole.parse::<u32>().ok()? * 100 + decimals;
-    (101..MAX).contains(&value).then_some(value)
+    (101..MAX_WAGER_CRASH).contains(&value).then_some(value)
 }
 
 impl Flight {
+    fn end_multiplier(&self) -> u32 {
+        if matches!(self.outcome, Some(Outcome::Paid { .. })) {
+            self.cinematic_peak.unwrap_or(self.crash_at)
+        } else {
+            self.crash_at
+        }
+    }
+
     fn crash_time(&self) -> Instant {
-        self.launch + flight_time(self.crash_at)
+        let ratio = f64::from(self.end_multiplier()) / f64::from(self.crash_at);
+        self.launch
+            + flight_time(self.crash_at)
+            + Duration::from_secs_f64(ratio.log2() * CINEMATIC_DOUBLE_SECONDS)
     }
 
     fn automatic_cashout(&self) -> Option<(Instant, u32)> {
@@ -126,7 +149,7 @@ impl Flight {
         }
     }
 
-    fn live_multiplier(&self, now: Instant) -> u32 {
+    fn payout_multiplier(&self, now: Instant) -> u32 {
         let elapsed = now.saturating_duration_since(self.launch).as_secs_f64();
         ((100.0 * (elapsed / DOUBLE_SECONDS).exp2()) as u32)
             .min(self.crash_at.saturating_sub(1))
@@ -168,11 +191,24 @@ impl Flight {
         } else {
             (at - self.launch).as_millis() as i64
         };
+        let original_duration = flight_time(self.crash_at);
+        let cinematic_elapsed = (self.end_multiplier() > self.crash_at)
+            .then(|| at.checked_duration_since(self.launch + original_duration))
+            .flatten();
         let (status, multiplier) = match self.finished_at {
             Some(_) if self.outcome == Some(Outcome::Refunded) => ("refunded", 100),
-            Some(_) => ("crashed", self.crash_at),
+            Some(_) => ("crashed", self.end_multiplier()),
             None if at < self.launch => ("countdown", 100),
-            None => ("flying", self.live_multiplier(at)),
+            None => (
+                "flying",
+                if let Some(elapsed) = cinematic_elapsed {
+                    let factor = f64::from(self.crash_at)
+                        * (elapsed.as_secs_f64() / CINEMATIC_DOUBLE_SECONDS).exp2();
+                    (factor as u32).min(self.end_multiplier() - 1)
+                } else {
+                    self.payout_multiplier(at)
+                },
+            ),
         };
         let (cashout_multiplier, payout, automatic) = match self.outcome {
             Some(Outcome::Paid {
@@ -184,7 +220,8 @@ impl Flight {
         };
         json!({ "id": self.id.to_string(), "status": status, "stake": self.stake, "elapsed_ms": elapsed_ms,
                 "multiplier": multiplier, "auto": self.auto, "cashout_multiplier": cashout_multiplier,
-                "payout": payout, "automatic": automatic })
+                "payout": payout, "automatic": automatic,
+                "cinematic_from_ms": cinematic_elapsed.map(|_| original_duration.as_millis() as u64) })
     }
 }
 
@@ -282,6 +319,7 @@ pub fn start(
         id,
         stake,
         crash_at: crash_point(rand::rng().random_range(1..=1_000_000)),
+        cinematic_peak: cinematic_peak(rand::rng().random_range(1..=1000)),
         auto,
         launch: now + COUNTDOWN,
         outcome: None,
@@ -331,7 +369,7 @@ pub fn cash_out(data: &Data, player: Player, id: u64) -> rusqlite::Result<Result
         if now < flight.launch {
             return Ok(Err("Ракета ещё не стартовала.".into()));
         }
-        let outcome = flight.payout(flight.live_multiplier(now), false);
+        let outcome = flight.payout(flight.payout_multiplier(now), false);
         flight.settle(data, outcome)?;
     }
     Ok(Ok(result(data, player, Some(flight), now)?))
@@ -358,8 +396,73 @@ pub async fn pressed(ctx: &s::Context, press: &s::ComponentInteraction) -> bool 
 mod tests {
     use super::*;
 
+    #[test]
+    fn cinematic_roll_has_two_rare_tiers() {
+        assert_eq!(cinematic_peak(1), Some(100_000));
+        assert_eq!(cinematic_peak(2), Some(10_000));
+        assert_eq!(cinematic_peak(10), Some(10_000));
+        assert_eq!(cinematic_peak(11), None);
+        assert_eq!(cinematic_peak(1000), None);
+    }
+
+    #[test]
+    fn cinematic_peak_is_revealed_only_after_a_paid_flight_finishes() {
+        let data = Data::new(
+            crate::db::Database::in_memory().unwrap(),
+            &crate::config::Settings::default(),
+            Default::default(),
+            false,
+        );
+        let player = (1, 2);
+        data.db.wallet(1, 2, "pilot", 500).unwrap();
+        wagers::place(&data.db, 5, 5, 1, 2, "100", 10)
+            .unwrap()
+            .unwrap();
+        let launch = Instant::now() - Duration::from_secs(30);
+        let mut flight = Flight {
+            id: 5,
+            stake: 100,
+            crash_at: 400,
+            cinematic_peak: Some(100_000),
+            auto: Some(200),
+            launch,
+            outcome: None,
+            finished_at: None,
+        };
+        let before = flight.snapshot(launch + Duration::from_secs(5));
+        assert_eq!(before["multiplier"], 178);
+        assert_eq!(before["payout"], Value::Null);
+        assert_eq!(before["cinematic_from_ms"], Value::Null);
+
+        // A late auto deadline still settles at 2× before evaluating the crash.
+        let during = launch + Duration::from_millis(12_600);
+        flight.advance(&data, during).unwrap();
+        let resumed = result(&data, player, Some(&flight), during).unwrap();
+        assert_eq!(resumed["flight"]["status"], "flying");
+        assert_eq!(resumed["flight"]["multiplier"], 800);
+        assert_eq!(resumed["flight"]["cinematic_from_ms"], 12_000);
+        assert_eq!(resumed["flight"]["payout"], 200);
+        assert_eq!(resumed["flight"]["cashout_multiplier"], 200);
+        assert_eq!(resumed["balance"], 600);
+        let end = flight.next_deadline().unwrap();
+        assert!(end < launch + Duration::from_secs(18));
+        let almost = end - Duration::from_nanos(1);
+        flight.advance(&data, almost).unwrap();
+        assert_eq!(flight.snapshot(almost)["status"], "flying");
+        assert_eq!(flight.snapshot(almost)["multiplier"], 99_999);
+
+        flight.advance(&data, end).unwrap();
+        let crashed = result(&data, player, Some(&flight), end).unwrap();
+        assert_eq!(crashed["flight"]["status"], "crashed");
+        assert_eq!(crashed["flight"]["multiplier"], 100_000);
+        assert_eq!(crashed["flight"]["cashout_multiplier"], 200);
+        assert_eq!(crashed["flight"]["payout"], 200);
+        assert_eq!(crashed["balance"], 600);
+        assert!(flight.next_deadline().is_none());
+    }
+
     #[tokio::test]
-    async fn manual_payout_keeps_flight_active_and_fixed_through_crash() {
+    async fn manual_payout_keeps_cinematic_flight_active_and_fixed_through_crash() {
         let settings = crate::config::Settings::default();
         let data = std::sync::Arc::new(Data::new(
             crate::db::Database::in_memory().unwrap(),
@@ -378,6 +481,7 @@ mod tests {
                 id: 5,
                 stake: 100,
                 crash_at: 300,
+                cinematic_peak: Some(100_000),
                 auto: Some(200),
                 launch: Instant::now(),
                 outcome: None,
@@ -397,24 +501,27 @@ mod tests {
             .unwrap()
             .is_err());
 
-        // Move the existing flight past the auto target, then past the crash.
+        // The wager would have crashed at 3×, but the paid flight is still active.
         data.rocket.flights().get_mut(&player).unwrap().launch =
-            Instant::now() - Duration::from_secs(8);
+            Instant::now() - Duration::from_secs(12);
         let resumed = read(&data, player).unwrap();
         assert_eq!(resumed["flight"]["status"], "flying");
-        assert!(resumed["flight"]["multiplier"].as_u64().unwrap() >= 250);
-        assert!(resumed["flight"]["multiplier"].as_u64().unwrap() < 300);
+        assert!(resumed["flight"]["multiplier"].as_u64().unwrap() > 1000);
+        assert!(resumed["flight"]["multiplier"].as_u64().unwrap() < 100_000);
         assert_eq!(resumed["flight"]["cashout_multiplier"], cashout_multiplier);
+        assert!(start(&data, player, "pilot", "100", None, Some(5))
+            .unwrap()
+            .is_err());
         let repeated = cash_out(&data, player, 5).unwrap().unwrap();
         assert_eq!(repeated["flight"]["payout"], cashout_multiplier);
         assert_eq!(repeated["flight"]["automatic"], false);
         assert_eq!(repeated["balance"], paid_balance);
 
         data.rocket.flights().get_mut(&player).unwrap().launch =
-            Instant::now() - Duration::from_secs(12);
+            Instant::now() - Duration::from_secs(16);
         let crashed = cash_out(&data, player, 5).unwrap().unwrap();
         assert_eq!(crashed["flight"]["status"], "crashed");
-        assert_eq!(crashed["flight"]["multiplier"], 300);
+        assert_eq!(crashed["flight"]["multiplier"], 100_000);
         assert_eq!(crashed["flight"]["cashout_multiplier"], cashout_multiplier);
         assert_eq!(crashed["flight"]["payout"], cashout_multiplier);
         assert_eq!(crashed["balance"], paid_balance);
@@ -449,6 +556,7 @@ mod tests {
                 id,
                 stake: 100,
                 crash_at: 200,
+                cinematic_peak: Some(10_000),
                 auto: Some(target),
                 launch,
                 outcome: None,
@@ -458,11 +566,57 @@ mod tests {
             run_flight(data.clone(), player, id).await;
             let snapshot = cash_out(&data, player, id).unwrap().unwrap();
             assert_eq!(snapshot["flight"]["status"], "crashed");
-            assert_eq!(snapshot["flight"]["multiplier"], 200);
+            assert_eq!(
+                snapshot["flight"]["multiplier"],
+                if expected > 0 { 10_000 } else { 200 }
+            );
             assert_eq!(snapshot["flight"]["payout"].as_i64().unwrap_or(0), expected);
             assert_eq!(snapshot["flight"]["automatic"], expected > 0);
         }
         assert_eq!(data.db.wallet(1, 2, "pilot", 500).unwrap().0, 350);
+    }
+
+    #[tokio::test]
+    async fn failed_cinematic_cashout_refunds_the_stake_and_ends_the_flight() {
+        let data = std::sync::Arc::new(Data::new(
+            crate::db::Database::in_memory().unwrap(),
+            &crate::config::Settings::default(),
+            Default::default(),
+            false,
+        ));
+        let player = (1, 2);
+        data.db.wallet(1, 2, "pilot", 500).unwrap();
+        wagers::place(&data.db, 5, 5, 1, 2, "100", 10)
+            .unwrap()
+            .unwrap();
+        data.db
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_rocket_payout BEFORE UPDATE OF balance ON economy
+             WHEN NEW.balance > 500 BEGIN SELECT RAISE(ABORT, 'test payout failure'); END;",
+            )
+            .unwrap();
+        data.rocket.flights().insert(
+            player,
+            Flight {
+                id: 5,
+                stake: 100,
+                crash_at: 300,
+                cinematic_peak: Some(100_000),
+                auto: Some(200),
+                launch: Instant::now() - Duration::from_secs(8),
+                outcome: None,
+                finished_at: None,
+            },
+        );
+
+        run_flight(data.clone(), player, 5).await;
+        let restored = read(&data, player).unwrap();
+        assert_eq!(restored["balance"], 500);
+        assert_eq!(restored["flight"]["status"], "refunded");
+        assert_eq!(restored["flight"]["payout"], Value::Null);
+        assert_eq!(restored["flight"]["cinematic_from_ms"], Value::Null);
+        assert_eq!(wagers::refund(&data.db, Some(5)).unwrap(), 0);
     }
 
     #[test]
@@ -484,6 +638,7 @@ mod tests {
                 id: 5,
                 stake: 100,
                 crash_at: 300,
+                cinematic_peak: None,
                 auto: Some(200),
                 launch: Instant::now() - Duration::from_secs(8),
                 outcome: None,

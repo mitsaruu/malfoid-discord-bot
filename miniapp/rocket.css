@@ -27,6 +27,7 @@ body[data-game="rocket"] #game-switch [aria-pressed="true"] {
 }
 
 .rocket[data-phase="paid"] { --rocket-accent: #8ff4ca; }
+.rocket[data-phase="flying"][data-cinematic="true"] { --rocket-accent: #f5cd91; }
 .rocket[data-phase="crashed"] { --rocket-accent: #ffac94; }
 .rocket[data-phase="refunded"] { --rocket-accent: #ffd690; }
 

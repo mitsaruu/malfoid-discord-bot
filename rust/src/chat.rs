@@ -455,7 +455,7 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
         return;
     };
     if !message.author.bot && ai::directed_insult(data, &question).await {
-        ai::punish_rudeness(ctx, data, Some(guild), &message.author, message.channel_id).await;
+        moderation::warn_for_insult(&ctx.http, data, Some(guild), &message.author, message.channel_id, bot).await;
         return;
     }
     let moderation = match moderation::requested_action(&question, replied.map(|post| post.author.id.get()), bot.get()) {

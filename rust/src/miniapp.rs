@@ -129,9 +129,9 @@ async fn index(State(app): State<App>) -> Response {
 /// Разрешённые файлы интерфейса.
 async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Response {
     match name.as_str() {
-        "style.css" | "rocket.css" | "casino.css" =>
+        "style.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" =>
             file(&app, &name, "text/css; charset=utf-8").await,
-        "app.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" =>
+        "app.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -304,7 +304,7 @@ async fn casino_action(
     Json(body): Json<Value>,
 ) -> Reply {
     let rule = match game.as_str() {
-        "mines" | "poker" | "slots" | "blackjack" => game.as_str(),
+        "mines" | "poker" | "slots" | "blackjack" | "roulette" | "coinflip" => game.as_str(),
         _ => return Err(StatusCode::NOT_FOUND.into_response()),
     };
     if action.len() > 24 || !body.is_object() {
@@ -327,6 +327,7 @@ async fn casino_action(
         match game.as_str() {
             "poker" => crate::poker::handle(&data, guild, user, name, &action, &body),
             "blackjack" => crate::table_blackjack::handle(&data, guild, user, name, &action, &body),
+            "roulette" => Ok(crate::roulette::handle(&data, guild, user, name, &action, &body)?),
             _ => crate::casino_solo::handle(&data, guild, user, name, &game, &action, &body),
         }
     }).await.map_err(failed)?.map_err(failed)?;
@@ -345,6 +346,7 @@ fn start_game_cleanup(data: Shared) {
                 crate::poker::sweep(&data);
                 crate::table_blackjack::sweep(&data);
                 crate::casino_solo::sweep(&data);
+                crate::roulette::sweep(&data);
             }).await {
                 eprintln!("Mini App: {error}");
             }

@@ -1,0 +1,229 @@
+body[data-game="roulette"] {
+  display: flow-root;
+  min-height: 100dvh;
+  height: auto;
+}
+
+#roulette.casino {
+  width: min(1120px, calc(100% - 24px));
+  padding: clamp(10px, 2vw, 23px);
+}
+
+.roulette-view {
+  --roulette-muted: #a7b6c8;
+  --roulette-edge: #34445a;
+  --roulette-accent: #a2edca;
+  --roulette-ink: #edf4fb;
+  width: min(100%, 1120px);
+  margin-inline: auto;
+  color: var(--roulette-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.roulette-view :where(h1, h2, p, ul) { margin: 0; }
+.roulette-view > * + * { margin-top: 14px; }
+.roulette-view h1 { font-size: clamp(1.45rem, 4vw, 2.15rem); letter-spacing: -.035em; }
+.roulette-view h2 { font-size: 1rem; }
+.roulette-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+}
+.roulette-header p { color: var(--roulette-muted); font-size: .82rem; }
+.roulette-wallet {
+  padding: 6px 10px;
+  border: 1px solid var(--roulette-edge);
+  border-radius: 8px;
+  background: #111b29;
+  font-size: .82rem;
+}
+.roulette-wallet:empty { display: none; }
+
+.roulette-layout {
+  display: grid;
+  grid-template-columns: minmax(0, .66fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+.roulette-wheel-panel, .roulette-table, .roulette-panel {
+  min-width: 0;
+  border: 1px solid var(--roulette-edge);
+  border-radius: 14px;
+  background: #192433;
+  padding: clamp(12px, 2vw, 18px);
+}
+.roulette-wheel-panel {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  background: radial-gradient(ellipse at 50% 35%, #263a38, #151e2a 74%);
+}
+.roulette-wheel-frame {
+  position: relative;
+  width: min(100%, 430px);
+  aspect-ratio: 1;
+}
+.roulette-wheel {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 50%;
+  filter: drop-shadow(0 6px 10px #0e1419b0);
+}
+.roulette-pointer {
+  position: absolute;
+  z-index: 1;
+  left: 50%;
+  top: 5.2%;
+  width: 3.2%;
+  aspect-ratio: 1;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 24%, #fffdf7, #f3e4c4 48%, #9a7a55 100%);
+  box-shadow: 0 2px 6px #000b;
+}
+.roulette-readout {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 9px;
+  color: var(--roulette-muted);
+  font-size: .82rem;
+}
+.roulette-result-number {
+  min-width: 2rem;
+  padding: 2px 5px;
+  border: 1px solid #ffffff3b;
+  border-radius: 6px;
+  color: #fff;
+  text-align: center;
+  font-size: 1.15rem;
+}
+.roulette-table {
+  --roulette-felt: #164b3c;
+  display: grid;
+  gap: 10px;
+  border-color: #3d7462;
+  background: radial-gradient(ellipse at 60% 0, #205d4b, var(--roulette-felt) 88%);
+}
+.roulette-table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  min-height: 42px;
+  gap: 12px;
+}
+.roulette-table-header strong { font-size: .96rem; }
+.roulette-table-header p, .roulette-own { color: #c1e1d3; font-size: .8rem; }
+.roulette-clock {
+  padding: 4px 8px;
+  border: 1px solid #7bc2a5a0;
+  border-radius: 6px;
+  color: #edfff6;
+  font-size: .9rem;
+  font-weight: 750;
+}
+.roulette-clock:empty, .roulette-own:empty, .roulette-feedback:empty { display: none; }
+.roulette-board {
+  display: grid;
+  grid-template-columns: repeat(13, minmax(0, 1fr)) minmax(41px, 1.35fr);
+  gap: 3px;
+}
+.roulette-view .roulette-cell {
+  grid-column: var(--column);
+  grid-row: var(--row);
+  position: relative;
+  min-width: 0;
+  min-height: 40px;
+  padding: 4px 0;
+  border: 1px solid #b2dfce70;
+  border-radius: 4px;
+  background-color: #103f33;
+  color: #fff;
+  font-size: clamp(.65rem, 1.14vw, .81rem);
+  font-weight: 700;
+  overflow-wrap: normal;
+}
+.roulette-view .roulette-cell--number, .roulette-view .roulette-cell--zero { font-size: .87rem; }
+.roulette-view [data-tone="red"] { background-color: #9c2c3c; }
+.roulette-view [data-tone="black"] { background-color: #242831; }
+.roulette-view [data-tone="green"] { background-color: #135c43; }
+.roulette-view .roulette-cell:not(:disabled):hover { border-color: #e6fff6; }
+.roulette-view .roulette-cell[aria-pressed="true"] {
+  border-color: #fee7a1;
+  box-shadow: inset 0 0 0 1px #fee7a1;
+}
+.roulette-cell--wagered::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 5px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: #fee7a1;
+}
+
+.roulette-form { display: grid; gap: 7px; }
+.roulette-selection { font-size: .85rem; font-weight: 700; }
+.roulette-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 6px;
+}
+.roulette-actions label {
+  display: grid;
+  gap: 4px;
+  color: #c1e1d3;
+  font-size: .79rem;
+}
+.roulette-actions :is(input, button) {
+  min-height: 42px;
+  padding: 6px 9px;
+  border: 1px solid #8cc9b58e;
+  border-radius: 7px;
+  color: var(--roulette-ink);
+  background: #12392e;
+  font: inherit;
+  font-size: .84rem;
+}
+.roulette-actions input { width: 12ch; user-select: text; }
+.roulette-actions button { font-weight: 700; }
+.roulette-actions button:disabled { opacity: .55; cursor: default; }
+.roulette-actions .roulette-submit { background: var(--roulette-accent); color: #132d25; }
+.roulette-view :focus-visible { outline: 2px solid #fee7a1; outline-offset: 2px; z-index: 1; }
+.roulette-feedback { font-size: .86rem; color: #e0fff0; }
+.roulette-feedback[data-tone="error"] { color: #ffd1ce; }
+
+.roulette-panel summary { cursor: pointer; font-weight: 700; }
+.roulette-panel p { margin-top: 7px; color: var(--roulette-muted); font-size: .85rem; }
+.roulette-results { list-style: none; padding: 0; margin-top: 6px; }
+.roulette-results li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid #ffffff16;
+  overflow-wrap: anywhere;
+}
+.roulette-results li:last-child { border-bottom: 0; }
+.roulette-results [data-net="win"] { color: var(--roulette-accent); }
+.roulette-results [data-net="loss"] { color: #ffb8b2; }
+
+@media (max-width: 870px) {
+  .roulette-layout { grid-template-columns: 1fr; }
+  .roulette-wheel-frame { width: min(100%, 340px, 66vw); }
+}
+
+@media (max-width: 560px) {
+  .roulette-board { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .roulette-view .roulette-cell {
+    grid-column: var(--mobile-column);
+    grid-row: var(--mobile-row);
+    min-height: 38px;
+    font-size: .76rem;
+  }
+}
