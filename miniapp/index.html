@@ -22,27 +22,43 @@
     <footer class="splash-footer">The BakaSoft Solution Games</footer>
   </div>
 
-  <header class="game-lobby" id="game-lobby" hidden>
-    <h1 tabindex="-1">Игры Malfoid</h1>
-  </header>
+  <div class="activity-shell" id="activity-shell" hidden>
+    <aside class="activity-sidebar" aria-label="Меню Malfoid" lang="ru">
+      <div class="activity-brand"><span class="brand-mark" aria-hidden="true">M</span>Malfoid</div>
+      <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru">
+        <button type="button" data-game="lobby" aria-controls="game-lobby" aria-pressed="false"><span aria-hidden="true">▦</span>Все игры</button>
+        <button type="button" data-game="words" aria-controls="app" aria-pressed="false"><span aria-hidden="true">Aa</span>Слово дня</button>
+        <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false"><span aria-hidden="true">↗</span>Ракетка</button>
+        <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false"><span aria-hidden="true">◇</span>Минное поле</button>
+        <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false"><span aria-hidden="true">♠</span>Покер</button>
+        <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false"><span aria-hidden="true">▥</span>Слоты</button>
+        <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false"><span aria-hidden="true">♣</span>Блэкджек</button>
+        <button type="button" data-game="roulette" aria-controls="roulette" aria-pressed="false"><span aria-hidden="true">◎</span>Рулетка</button>
+        <button type="button" data-game="coinflip" aria-controls="coinflip" aria-pressed="false"><span aria-hidden="true">◐</span>Орёл или решка</button>
+      </nav>
+      <div class="game-audio" id="game-audio" role="group" aria-label="Звук игр и меню">
+        <button id="game-audio-toggle" type="button" aria-label="Звук игр и меню" aria-pressed="false">Звук</button>
+        <input id="game-audio-volume" aria-label="Громкость" type="range" min="0" max="100" value="50">
+      </div>
+    </aside>
 
-  <div class="game-audio" id="game-audio" role="group" aria-label="Звук игр и меню" hidden>
-    <button id="game-audio-toggle" type="button" aria-label="Звук игр и меню" aria-pressed="false">Звук</button>
-    <label for="game-audio-volume">Громкость</label>
-    <input id="game-audio-volume" type="range" min="0" max="100" value="50">
-  </div>
-
-  <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru" hidden>
-    <button type="button" data-game="lobby" aria-controls="game-lobby">Все игры</button>
-    <button type="button" data-game="words" aria-controls="app" aria-pressed="false"><span>Слово дня</span></button>
-    <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false"><span>Ракетка</span></button>
-    <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false"><span>Минное поле</span></button>
-    <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false"><span>Покер</span></button>
-    <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false"><span>Слоты</span></button>
-    <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false"><span>Блэкджек</span></button>
-    <button type="button" data-game="roulette" aria-controls="roulette" aria-pressed="false"><span>Рулетка</span></button>
-    <button type="button" data-game="coinflip" aria-controls="coinflip" aria-pressed="false"><span>Орёл или решка</span></button>
-  </nav>
+    <div class="activity-content">
+      <main class="game-lobby" id="game-lobby" hidden>
+        <h1 tabindex="-1">Все игры</h1>
+        <div class="game-catalog">
+          <button type="button" class="game-card game-card-feature" data-game="rocket">
+            <span class="game-cover" aria-hidden="true"></span>
+            <span class="game-card-info"><strong>Ракетка</strong><small>Заберите монеты, пока растёт коэффициент.</small><span class="play-label">Играть <span aria-hidden="true">↗</span></span></span>
+          </button>
+          <button type="button" class="game-card" data-game="words"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Слово дня</strong><small>Русский и немецкий</small></span></button>
+          <button type="button" class="game-card" data-game="poker"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Покер</strong><small>Техасский холдем</small></span></button>
+          <button type="button" class="game-card" data-game="mines"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Минное поле</strong><small>Откройте безопасные клетки</small></span></button>
+          <button type="button" class="game-card" data-game="slots"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Слоты</strong><small>Пять барабанов</small></span></button>
+          <button type="button" class="game-card" data-game="blackjack"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Блэкджек</strong><small>В одиночку и онлайн</small></span></button>
+          <button type="button" class="game-card" data-game="roulette"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Рулетка</strong><small>Европейское колесо</small></span></button>
+          <button type="button" class="game-card" data-game="coinflip"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Орёл или решка</strong><small>Выберите сторону монеты</small></span></button>
+        </div>
+      </main>
 
   <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
   <aside class="players" id="players" aria-label="Игроки" hidden></aside>
@@ -136,6 +152,8 @@
   <main class="casino" id="blackjack" aria-label="Блэкджек" lang="ru" hidden></main>
   <main class="casino" id="roulette" aria-label="Рулетка" lang="ru" hidden></main>
   <main class="casino" id="coinflip" aria-label="Орёл или решка" lang="ru" hidden></main>
+    </div>
+  </div>
 
   <div class="help" id="help" hidden>
     <div class="help-card">

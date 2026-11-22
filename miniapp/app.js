@@ -47,6 +47,7 @@ const casinoViews = new Map();
 
 const gameSwitch = document.getElementById("game-switch");
 const gameLobby = document.getElementById("game-lobby");
+const gameLinks = [...gameSwitch.querySelectorAll("button"), ...gameLobby.querySelectorAll("button[data-game]")];
 const wordsRetry = document.getElementById("words-retry");
 
 // ---------- Связь с Discord (минимальный Embedded App SDK) ----------
@@ -85,7 +86,7 @@ window.addEventListener("message", (event) => {
     }
     else if (activeGame === "words") setStatus(reason, "error");
     else gameLobby.querySelector("h1").textContent = reason;
-    for (const button of gameSwitch.querySelectorAll("button")) button.disabled = true;
+    for (const button of gameLinks) button.disabled = true;
     return;
   }
   if (opcode !== OP.FRAME || !data) return;
@@ -545,10 +546,19 @@ function openGame(game) {
   }
 }
 
-for (const button of gameSwitch.querySelectorAll("button")) {
+for (const button of gameLinks) {
   button.addEventListener("click", () => {
+    if (activeGame === button.dataset.game) return;
     openGame(button.dataset.game);
-    if (button.dataset.game === "lobby") gameLobby.querySelector("h1").focus();
+    const navButton = gameSwitch.querySelector('[aria-pressed="true"]');
+    if (gameSwitch.scrollWidth > gameSwitch.clientWidth) {
+      navButton.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+    const heading = document.getElementById(navButton.getAttribute("aria-controls")).querySelector("h1");
+    if (heading) {
+      heading.tabIndex = -1;
+      heading.focus();
+    }
   });
 }
 wordsRetry.addEventListener("click", () => {
@@ -583,8 +593,7 @@ async function start() {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
       }));
     }
-    gameSwitch.hidden = false;
-    document.getElementById("game-audio").hidden = false;
+    document.getElementById("activity-shell").hidden = false;
     openGame(login.game === "words" ? "words" : "lobby");
     hideSplash();
     setInterval(() => {

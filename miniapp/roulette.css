@@ -1,19 +1,8 @@
-body[data-game="roulette"] {
-  display: flow-root;
-  min-height: 100dvh;
-  height: auto;
-}
-
-#roulette.casino {
-  width: min(1120px, calc(100% - 24px));
-  padding: clamp(10px, 2vw, 23px);
-}
-
 .roulette-view {
-  --roulette-muted: #a7b6c8;
-  --roulette-edge: #34445a;
-  --roulette-accent: #a2edca;
-  --roulette-ink: #edf4fb;
+  --roulette-muted: var(--muted);
+  --roulette-edge: var(--line);
+  --roulette-accent: var(--mint);
+  --roulette-ink: var(--text);
   width: min(100%, 1120px);
   margin-inline: auto;
   color: var(--roulette-ink);
@@ -36,7 +25,7 @@ body[data-game="roulette"] {
   padding: 6px 10px;
   border: 1px solid var(--roulette-edge);
   border-radius: 8px;
-  background: #111b29;
+  background: var(--inset);
   font-size: .82rem;
 }
 .roulette-wallet:empty { display: none; }
@@ -51,14 +40,14 @@ body[data-game="roulette"] {
   min-width: 0;
   border: 1px solid var(--roulette-edge);
   border-radius: 14px;
-  background: #192433;
+  background: var(--surface);
   padding: clamp(12px, 2vw, 18px);
 }
 .roulette-wheel-panel {
   display: grid;
   justify-items: center;
   gap: 8px;
-  background: radial-gradient(ellipse at 50% 35%, #263a38, #151e2a 74%);
+  background: radial-gradient(ellipse at 50% 30%, #28382f, var(--surface) 76%);
 }
 .roulette-wheel-frame {
   position: relative;
@@ -193,7 +182,7 @@ body[data-game="roulette"] {
 .roulette-actions button { font-weight: 700; }
 .roulette-actions button:disabled { opacity: .55; cursor: default; }
 .roulette-actions .roulette-submit { background: var(--roulette-accent); color: #132d25; }
-.roulette-view :focus-visible { outline: 2px solid #fee7a1; outline-offset: 2px; z-index: 1; }
+.roulette-view :focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; z-index: 1; }
 .roulette-feedback { font-size: .86rem; color: #e0fff0; }
 .roulette-feedback[data-tone="error"] { color: #ffd1ce; }
 

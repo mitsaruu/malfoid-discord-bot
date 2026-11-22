@@ -1,4 +1,3 @@
-#coinflip { --accent: #f0d496; }
 .coinflip-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
@@ -11,9 +10,9 @@
   place-items: center;
   padding: 48px 18px 22px;
   perspective: 700px;
-  border: 1px solid #554b45;
+  border: 1px solid var(--line);
   border-radius: 16px;
-  background: radial-gradient(ellipse at 50% 36%, #39382f, #171d29 72%);
+  background: radial-gradient(ellipse at 50% 36%, #343227, var(--surface) 72%);
   overflow: hidden;
 }
 .coinflip-coin {

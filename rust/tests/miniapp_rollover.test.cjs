@@ -125,7 +125,7 @@ test('switching games hides the previous view and stops refreshing word data', a
   });
   vm.runInContext(polling, context);
   vm.runInContext(app.slice(app.indexOf('const casinoTitles'), app.indexOf('const casinoViews')), context);
-  vm.runInContext(app.slice(app.indexOf('function openGame('), app.indexOf('\nfor (const button of gameSwitch', app.indexOf('function openGame('))), context);
+  vm.runInContext(app.slice(app.indexOf('function openGame('), app.indexOf('\nfor (const button of gameLinks', app.indexOf('function openGame('))), context);
   await vm.runInContext('refreshPlayers()', context);
   vm.runInContext('openGame("rocket"); openGame("roulette"); openGame("coinflip"); openGame("rocket");', context);
   await vm.runInContext('refreshPlayers()', context);
