@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 
 const source = () => readFileSync(join(__dirname, 'audio.js'), 'utf8');
 
-function fixture(saved) {
+function fixture(saved, fetchAmbient) {
   const listeners = new Map();
   const events = [];
   const targets = [];
@@ -26,6 +26,7 @@ function fixture(saved) {
     currentTime = 3;
     sampleRate = 8000;
     resume() { this.state = 'running'; return Promise.resolve(); }
+    decodeAudioData(bytes) { return Promise.resolve(bytes); }
     createGain() { return node(); }
     createBuffer(_, length) {
       const channel = new Float32Array(length);
@@ -43,7 +44,7 @@ function fixture(saved) {
     addEventListener: (name, callback) => listeners.set(name, callback) };
   const window = { AudioContext };
   runInNewContext(source(), {
-    window, document, performance: { now: () => 100 },
+    window, document, fetch: fetchAmbient, performance: { now: () => 100 },
     localStorage: { getItem: () => state, setItem: (_, value) => { state = value; } },
   });
   return { audio: window.GameAudio, listeners, events, targets, document, toggle, volume, saved: () => JSON.parse(state) };
@@ -128,6 +129,45 @@ test('menu waits for audio unlock, plays the intro once and crossfades a single 
   assert.notEqual(bed.stopAt, 0);
   f.audio.setLobby(true);
   assert.ok(f.targets.at(-1)[0] > 0);
+  assert.equal(f.events.length, 2);
+});
+
+test('menu loads and loops the supplied track once, even if it arrives during a game', async () => {
+  const requested = [];
+  let respond;
+  const f = fixture(undefined, (url) => {
+    requested.push(url);
+    return new Promise(resolve => { respond = resolve; });
+  });
+  const track = { duration: 60 };
+  f.audio.setLobby(true);
+  f.audio.menuReady();
+  await f.listeners.get('click')({ isTrusted: true, target: { closest: () => null } });
+  assert.deepEqual(requested, ['static/menu-ambient.mp3']);
+  assert.equal(f.events.length, 1);
+  f.audio.setLobby(false);
+  respond({ ok: true, arrayBuffer: async () => track });
+  await new Promise(setImmediate);
+  assert.equal(f.events.length, 1);
+  f.audio.setLobby(true);
+  assert.ok(f.events[1].loop);
+  assert.equal(f.events[1].buffer, track);
+  assert.equal(requested.length, 1);
+});
+
+test('menu keeps its synthesized loop when the supplied track is unavailable', async () => {
+  let requests = 0;
+  const f = fixture(undefined, async () => { requests++; return { ok: false }; });
+  f.audio.setLobby(true);
+  f.audio.menuReady();
+  await f.listeners.get('click')({ isTrusted: true, target: { closest: () => null } });
+  await new Promise(setImmediate);
+  const bed = f.events[1];
+  assert.ok(bed.loop);
+  assert.equal(bed.buffer.duration, 16);
+  f.audio.setLobby(false);
+  f.audio.setLobby(true);
+  assert.equal(requests, 1);
   assert.equal(f.events.length, 2);
 });
 

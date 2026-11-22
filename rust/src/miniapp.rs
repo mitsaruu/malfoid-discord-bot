@@ -134,6 +134,7 @@ async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Respon
         "app.js" | "audio.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         "lobby-games.webp" => file(&app, &name, "image/webp").await,
+        "menu-ambient.mp3" => file(&app, &name, "audio/mpeg").await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }

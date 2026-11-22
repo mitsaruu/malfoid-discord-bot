@@ -13,6 +13,7 @@
   let mix;
   let master;
   let ambience;
+  let ambientLoading;
   let introEndsAt = 0;
   let introduced = false;
   let inLobby = false;
@@ -184,6 +185,19 @@
     return clips.get(name);
   }
 
+  async function loadAmbience() {
+    ambientLoading = true;
+    try {
+      const response = await fetch("static/menu-ambient.mp3");
+      if (!response.ok) return;
+      clips.set("menu.ambient", await context.decodeAudioData(await response.arrayBuffer()));
+    } catch { /* The synthesized ambience keeps working if the track cannot load. */ }
+    finally {
+      ambientLoading = false;
+      refreshLobby();
+    }
+  }
+
   function canPlay() {
     return enabled && volume > 0 && !document.hidden && context?.state === "running";
   }
@@ -291,6 +305,8 @@
   }
 
   function refreshLobby() {
+    if (inLobby && menuAvailable && context && enabled && volume > 0 && !document.hidden &&
+        ambientLoading === undefined && typeof fetch === "function") void loadAmbience();
     if (!inLobby || !menuAvailable || !canPlay()) {
       if (ambience) retarget(ambience, 0, .20);
       return;
@@ -299,6 +315,7 @@
       introduced = true;
       introEndsAt = context.currentTime + clipFor("menu.ready").duration;
     }
+    if (ambientLoading) return;
     if (!ambience) ambience = startSound("menu.ambient", Math.max(context.currentTime, introEndsAt), true, 0);
     retarget(ambience, 1, .45);
   }
