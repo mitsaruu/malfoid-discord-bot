@@ -63,14 +63,13 @@ const discordOrigins = new Set([
   "https://staging.discord.co", "https://pax.discord.com", location.origin, "null",
 ]);
 const referrerOrigin = document.referrer ? new URL(document.referrer).origin : null;
-const handshakeTarget = referrerOrigin !== "null" && discordOrigins.has(referrerOrigin) ? referrerOrigin : "*";
-let discordOrigin = "*";
+// READY can arrive through the native bridge. Its origin is not the RPC destination.
+const discordTarget = referrerOrigin !== "null" && discordOrigins.has(referrerOrigin) ? referrerOrigin : "*";
 const pending = new Map();
 let onReady = null;
 
 window.addEventListener("message", (event) => {
   if (event.source !== discordWindow || !discordOrigins.has(event.origin) || !Array.isArray(event.data)) return;
-  if (discordOrigin !== "*" && discordOrigin !== event.origin) return;
   const [opcode, data] = event.data;
   if (opcode === OP.CLOSE) {
     const reason = "Discord закрыл соединение" + (data?.message ? ": " + data.message : ".");
@@ -95,10 +94,7 @@ window.addEventListener("message", (event) => {
   }
   if (opcode !== OP.FRAME || !data) return;
   if (data.cmd === "DISPATCH") {
-    if (data.evt === "READY" && onReady) {
-      discordOrigin = event.origin;
-      onReady();
-    }
+    if (data.evt === "READY") onReady?.();
     return;
   }
   const waiter = pending.get(data.nonce);
@@ -118,7 +114,7 @@ function discordCommand(cmd, args) {
     }, 15000);
     pending.set(nonce, { cmd, resolve, reject, timer });
     try {
-      discordWindow.postMessage([OP.FRAME, { cmd, args, nonce }], discordOrigin === "null" ? "*" : discordOrigin);
+      discordWindow.postMessage([OP.FRAME, { cmd, args, nonce }], discordTarget);
     } catch (error) {
       clearTimeout(timer);
       pending.delete(nonce);
@@ -145,7 +141,7 @@ function connectToDiscord(clientId) {
     if (params.get("platform") === "desktop" || mobileVersion >= MOBILE_SDK_VERSION_MINIMUM) {
       handshake.sdk_version = EMBEDDED_SDK_VERSION;
     }
-    discordWindow.postMessage([OP.HANDSHAKE, handshake], handshakeTarget);
+    discordWindow.postMessage([OP.HANDSHAKE, handshake], discordTarget);
   });
 }
 

@@ -32,7 +32,7 @@ test('an unanswered Discord command times out and removes its waiter', async () 
   let timer;
   const context = vm.createContext({
     crypto: { randomUUID: () => 'test-nonce' }, pending: new Map(),
-    discordWindow: { postMessage() {} }, discordOrigin: 'https://discord.com', OP: { FRAME: 1 },
+    discordWindow: { postMessage() {} }, discordTarget: 'https://discord.com', OP: { FRAME: 1 },
     setTimeout: callback => { timer = callback; }, clearTimeout() {},
   });
   vm.runInContext(app.slice(app.indexOf('function discordCommand('), app.indexOf('function connectToDiscord(')), context);
@@ -68,6 +68,35 @@ for (const [platform, version, expectedSdk] of [
     await connected;
   });
 }
+
+test('authorization keeps using the handshake target and accepts a matching native reply', async () => {
+  let receive;
+  const sent = [];
+  const origin = 'https://discord.com';
+  const activityOrigin = 'https://123.discordsays.com';
+  const parent = { postMessage: (data, target) => sent.push({ data, target }) };
+  const context = vm.createContext({
+    URL, window: { parent, addEventListener: (_, listener) => { receive = listener; } },
+    location: { origin: activityOrigin }, document: { referrer: `${origin}/` },
+    params: new Map([['platform', 'mobile'], ['frame_id', 'frame']]),
+    setTimeout: () => 1, clearTimeout() {}, crypto: { randomUUID: () => 'auth-nonce' },
+  });
+  vm.runInContext(app.slice(app.indexOf('const OP ='), app.indexOf('// ---------- Запросы к серверу бота')), context);
+  const connected = vm.runInContext('connectToDiscord("123")', context);
+  receive({ source: parent, origin: activityOrigin, data: [1, { cmd: 'DISPATCH', evt: 'READY' }] });
+  await connected;
+  const authorization = vm.runInContext('discordCommand("AUTHORIZE", {})', context);
+  assert.deepEqual(sent.map(message => message.target), [origin, origin]);
+
+  const reply = [1, { cmd: 'AUTHORIZE', nonce: 'auth-nonce', data: { code: 'valid-code' } }];
+  receive({ source: {}, origin, data: reply });
+  receive({ source: parent, origin: 'https://foreign.example', data: reply });
+  receive({ source: parent, origin, data: [1, { ...reply[1], nonce: 'other' }] });
+  assert.equal(vm.runInContext('pending.size', context), 1);
+  receive({ source: parent, origin: 'null', data: reply });
+  assert.equal(vm.runInContext('pending.size', context), 0);
+  assert.deepEqual(await authorization, { code: 'valid-code' });
+});
 function fixture(api) {
   const calls = [];
   const context = vm.createContext({
