@@ -76,6 +76,8 @@
   root.replaceChildren(header, panel, rules);
 
   let visible = false;
+  let pageSuspended = false;
+  let audioVisit = 0;
   let busy = false;
   let ready = false;
   let snapshot = null;
@@ -226,8 +228,12 @@
     track.replaceChildren(...icons.map((icon) => element("span", "slots-symbol", icon)));
   }
 
+  function canAnimate() {
+    return visible && !pageSuspended && !document.hidden && !reducedMotion.matches;
+  }
+
   function startAnimation() {
-    if (reducedMotion.matches || typeof reels[0].strip.animate !== "function" || !snapshot.symbols.length) return;
+    if (!canAnimate() || typeof reels[0].strip.animate !== "function" || !snapshot.symbols.length) return;
     const icons = snapshot.symbols.map(({ icon }) => icon);
     const gap = parseFloat(window.getComputedStyle(reels[0].strip).rowGap) || 0;
     for (const [column, reel] of reels.entries()) {
@@ -248,10 +254,10 @@
       for (const cell of reel.cells) cell.style.visibility = "hidden";
       motion.animation = moveTrack(track, gap, 0, icons.length, { duration, iterations: Infinity });
     }
+    stopSpinSound = window.GameAudio?.startLoop?.("slots.spin");
   }
 
   async function settleReels(data) {
-    if (!data.spin) return;
     await Promise.all([...motions].map(async ([column, motion]) => {
       try {
         const { track, gap, iconAt, length } = motion;
@@ -269,7 +275,7 @@
           fill: "both",
         });
         await motion.animation.finished;
-        if (motions.get(column) !== motion || document.hidden) return;
+        if (motions.get(column) !== motion || !canAnimate()) return;
         paintReel(data, column, false);
         window.GameAudio?.play?.("slots.stop");
       } catch {
@@ -284,9 +290,16 @@
     if (event.matches) stopAnimation();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopAnimation();
+    if (!document.hidden) return;
+    audioVisit++;
+    stopAnimation();
   });
-  window.addEventListener("pagehide", stopAnimation);
+  window.addEventListener("pagehide", () => {
+    pageSuspended = true;
+    audioVisit++;
+    stopAnimation();
+  });
+  window.addEventListener("pageshow", () => { pageSuspended = false; });
 
   async function sync() {
     if (!visible || busy || reading) return;
@@ -310,22 +323,26 @@
   }
 
   async function play() {
-    if (!visible || document.hidden || !ready || busy) return;
+    if (!visible || pageSuspended || document.hidden || !ready || busy) return;
+    const visit = audioVisit;
     const expected = snapshot.spin?.id ?? null;
     busy = true;
     selectedLine = null;
     message = "";
     render();
     try {
-      stopSpinSound = window.GameAudio?.startLoop?.("slots.spin");
       startAnimation();
     } catch {
       stopAnimation();
     }
+    let won = false;
     try {
       const result = await request("spin", { bet: bet.value, expected_round: expected });
-      await settleReels(result);
+      const id = result.spin?.id;
+      const newResult = typeof id === "string" && id !== expected;
+      if (newResult) await settleReels(result);
       accept(result);
+      won = newResult && result.spin.wins.length > 0;
     } catch (error) {
       stopAnimation();
       ready = false;
@@ -340,6 +357,7 @@
       stopAnimation();
       busy = false;
       if (visible) render();
+      if (won && visible && visit === audioVisit) window.GameAudio?.play?.("slots.win");
     }
   }
 
@@ -366,6 +384,7 @@
     },
     hide() {
       visible = false;
+      audioVisit++;
       reading = null;
       stopAnimation();
     },

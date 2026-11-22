@@ -467,6 +467,12 @@ function createRocketView(request) {
   let transition = null;
   let flightMotion = null;
   let crashApproach = null;
+  let audioVisible = false;
+  let audioNeedsBaseline = true;
+  let cachedAudioSnapshot = null;
+  let audioRound = null;
+  let stopFlightSound = null;
+  let flightIntensity = -1;
   let fieldError = "";
   let connectionError = "";
 
@@ -521,6 +527,56 @@ function createRocketView(request) {
     if (shown && !document.hidden && frame === null) frame = requestAnimationFrame(paint);
   }
 
+  function stopFlightLoop() {
+    stopFlightSound?.();
+    stopFlightSound = null;
+    flightIntensity = -1;
+  }
+
+  function paintAudio(flight, status, time, elapsed) {
+    if (!audioVisible || !canAutoStart() || current.needsSync || current.snapshot === cachedAudioSnapshot || !flight) {
+      stopFlightLoop();
+      return;
+    }
+
+    const paid = flight.stake != null && flight.payout != null && flight.status !== "refunded";
+    const pulse = status === "countdown" ? Math.ceil(time) : 0;
+    if (audioNeedsBaseline || audioRound?.id !== flight.id) {
+      stopFlightLoop();
+      const previousPulse = audioRound?.id === flight.id ? audioRound.pulse : 4;
+      const resumedCountdown = cachedAudioSnapshot?.flight.id === flight.id && status === "countdown";
+      audioRound = { id: flight.id, status, paid, pulse: resumedCountdown ? Math.min(pulse, previousPulse) : previousPulse };
+      audioNeedsBaseline = false;
+    }
+
+    if (status === "countdown" && pulse < audioRound.pulse) {
+      audioRound.pulse = pulse;
+      // Skip a late beat so it cannot bunch up with the next one.
+      if (pulse > 0 && time >= pulse - .5) window.GameAudio?.play("rocket.count");
+    }
+    if (status === "flying" && audioRound.status === "countdown") window.GameAudio?.play("rocket.launch");
+    if (paid && !audioRound.paid) {
+      audioRound.paid = true;
+      window.GameAudio?.play("rocket.cashout");
+    }
+
+    if (status === "flying") {
+      stopFlightSound ??= window.GameAudio?.startLoop("rocket.flight");
+      // Ramp over eight seconds of painted flight, in half-second steps.
+      const intensity = Math.min(1, Math.floor(Math.max(0, elapsed) / ROCKET_POLL_MS) / 16);
+      if (stopFlightSound && intensity > flightIntensity) {
+        stopFlightSound.setIntensity?.(intensity);
+        flightIntensity = intensity;
+      }
+    } else {
+      stopFlightLoop();
+      if (status === "crashed" && (audioRound.status === "flying" || audioRound.status === "countdown")) {
+        window.GameAudio?.play("rocket.crash");
+      }
+    }
+    audioRound.status = status;
+  }
+
   function paint(timestamp) {
     frame = null;
     if (!shown || document.hidden) return;
@@ -559,7 +615,9 @@ function createRocketView(request) {
     if (status === "countdown" && launchIn === 0 && action.getAttribute("aria-disabled") === "false") {
       renderControls(timestamp);
     }
-    draw(approaching ? "flying" : status, visual, flight?.cinematic_from_ms, timestamp, transition, !running);
+    const displayedStatus = approaching ? "flying" : status;
+    draw(displayedStatus, visual, flight?.cinematic_from_ms, timestamp, transition, !running);
+    paintAudio(flight, displayedStatus, time, visual.elapsed);
     if (running && (status === "flying" || launchIn > 0 ||
         (transition !== null && timestamp - transition < ROCKET_BURST_MS))) invalidate();
   }
@@ -769,6 +827,9 @@ function createRocketView(request) {
   });
 
   function suspend() {
+    audioVisible = false;
+    audioNeedsBaseline = true;
+    stopFlightLoop();
     feed.hide();
     cancelAnimationFrame(frame);
     frame = null;
@@ -778,7 +839,13 @@ function createRocketView(request) {
   }
 
   function resume() {
-    if (shown && !document.hidden && !connectionError) feed.show();
+    if (shown && !document.hidden && !connectionError) {
+      if (!audioVisible) {
+        audioVisible = true;
+        cachedAudioSnapshot = current.snapshot;
+      }
+      feed.show();
+    }
     invalidate();
   }
 
@@ -790,6 +857,8 @@ function createRocketView(request) {
   window.addEventListener("pagehide", suspend);
   window.addEventListener("pageshow", resume);
   window.addEventListener("offline", () => {
+    cachedAudioSnapshot = current.snapshot;
+    stopFlightLoop();
     feed.stopRepeat("connection");
     renderControls();
   });

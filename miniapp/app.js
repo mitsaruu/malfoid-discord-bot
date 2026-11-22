@@ -76,6 +76,7 @@ window.addEventListener("message", (event) => {
     pending.clear();
     session = null;
     window.GameAudio?.stopGame();
+    window.GameAudio?.setLobby(false);
     if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
     else if (casinoViews.has(activeGame)) {
       casinoViews.get(activeGame).hide();
@@ -169,7 +170,10 @@ function loadingFailed(text) {
 
 function hideSplash() {
   document.getElementById("progress").style.width = "100%";
-  setTimeout(() => document.getElementById("splash").classList.add("hide"), 350);
+  setTimeout(() => {
+    document.getElementById("splash").classList.add("hide");
+    if (session) window.GameAudio?.menuReady();
+  }, 350);
 }
 
 // ---------- Отрисовка ----------
@@ -493,6 +497,7 @@ function openGame(game) {
   casinoViews.get(activeGame)?.hide();
   activeGame = game;
   document.body.dataset.game = game;
+  window.GameAudio?.setLobby(game === "lobby");
   const words = game === "words";
   gameLobby.hidden = game !== "lobby";
   document.getElementById("app").hidden = !words;

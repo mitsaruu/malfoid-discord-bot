@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(15);
 const MAX_ROUND: Duration = Duration::from_secs(60);
+const MIN_BET: i64 = 1;
 const MAX_BETS: usize = 50;
 const HELP_BUTTON: &str = "roulette:help";
 const RED: [u8; 18] = [
@@ -203,7 +204,6 @@ impl Table {
         &self,
         user: u64,
         balance: i64,
-        minimum: i64,
         now: Instant,
         bet_error: Option<String>,
     ) -> Value {
@@ -220,7 +220,7 @@ impl Table {
         json!({
             "user_id": user.to_string(),
             "balance": balance,
-            "min_bet": minimum,
+            "min_bet": MIN_BET,
             "max_bet": MAX_BET,
             "max_bets": MAX_BETS,
             "round_id": self.round_id.to_string(),
@@ -296,7 +296,6 @@ impl State {
         &self,
         db: &Database,
         wallet: Wallet<'_>,
-        minimum: i64,
         action: &str,
         body: &Value,
         clock: impl Fn() -> Instant,
@@ -309,7 +308,6 @@ impl State {
             },
             _ => return Ok(Err("Неизвестное действие рулетки.".into())),
         };
-        let minimum = minimum.max(1);
         let mut tables = self.0.lock().unwrap_or_else(|error| error.into_inner());
         let table = tables.entry(wallet.guild).or_default();
         table.maintain(db, clock());
@@ -341,7 +339,7 @@ impl State {
                 } else {
                     new_id()
                 };
-                match wagers::place_on(tx, round_id, ticket, wallet.guild, wallet.user, wager.bet, minimum)? {
+                match wagers::place_on(tx, round_id, ticket, wallet.guild, wallet.user, wager.bet, MIN_BET)? {
                     Ok(amount) => Ok((balance - amount, Ok((now, Bet {
                         ticket,
                         user: wallet.user,
@@ -377,7 +375,6 @@ impl State {
         Ok(Ok(table.snapshot(
             wallet.user,
             balance,
-            minimum,
             clock(),
             bet_error,
         )))
@@ -407,7 +404,6 @@ pub fn handle(
             name,
             start: data.economy.start_balance,
         },
-        data.economy.min_bet,
         action,
         body,
         Instant::now,
@@ -446,7 +442,6 @@ mod tests {
         state: State,
         db: crate::db::Database,
         now: Instant,
-        minimum: i64,
     }
 
     impl Fixture {
@@ -455,7 +450,6 @@ mod tests {
                 state: State::default(),
                 db: crate::db::Database::in_memory().unwrap(),
                 now: Instant::now(),
-                minimum: 10,
             }
         }
 
@@ -469,7 +463,6 @@ mod tests {
                         name: "Игрок",
                         start: 500,
                     },
-                    self.minimum,
                     action,
                     &body,
                     || self.now + Duration::from_secs(seconds),
@@ -481,8 +474,9 @@ mod tests {
 
     #[test]
     fn one_coin_opens_a_round_and_settles_once() {
-        let f = Fixture { minimum: 1, ..Fixture::new() };
+        let f = Fixture::new();
         let idle = f.call(1, 0, "state", json!({}));
+        assert_eq!(idle["min_bet"], 1);
         let body = json!({
             "round_id": idle["round_id"], "request_id": "one", "bet": "1", "space": "0",
         });
@@ -510,7 +504,7 @@ mod tests {
 
     #[test]
     fn wagers_below_one_do_not_open_a_round() {
-        let f = Fixture { minimum: 1, ..Fixture::new() };
+        let f = Fixture::new();
         let idle = f.call(1, 0, "state", json!({}));
         for bet in ["0", "-1"] {
             let rejected = f.call(1, 0, "bet", json!({

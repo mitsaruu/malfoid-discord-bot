@@ -10,6 +10,7 @@
   const suits = { "♥": "hearts", "♦": "diamonds", "♠": "spades", "♣": "clubs" };
   const moveLabels = { hit: "Ещё карту", stand: "Хватит", double: "Удвоить", split: "Разделить" };
   const motion = matchMedia("(prefers-reduced-motion: reduce)");
+  const turnDuration = 225; // casino-turn-card duration
   let mode = "online";
   let visible = false;
   let serial = 0;
@@ -19,7 +20,8 @@
   let busy = false;
   let syncError = "";
   let actionError = "";
-  let audibleDeals = new WeakSet();
+  let audioSnapshot;
+  let audibleCards = new WeakMap();
 
   function element(tag, text = "", className = "") {
     const node = document.createElement(tag);
@@ -112,15 +114,30 @@
   root.replaceChildren(header, modes, felt, dock, feedback, rules);
 
   felt.addEventListener("animationstart", (event) => {
-    if (event.animationName !== "casino-deal" && event.animationName !== "casino-turn-card") return;
-    if (!audibleDeals.delete(event.target)) return;
-    if (visible && !document.hidden && event.target.isConnected) window.GameAudio?.play("cards.deal");
+    const card = event.target;
+    if (!visible || document.hidden || !card.isConnected) return;
+    if (event.animationName === "casino-deal" && audibleCards.get(card) === "dealing") {
+      audibleCards.set(card, "landing");
+      window.GameAudio?.play("cards.deal");
+    } else if (event.animationName === "casino-turn-card" && audibleCards.get(card) === "turning") {
+      audibleCards.delete(card);
+      window.GameAudio?.play("cards.flip", turnDuration / 2);
+    }
+  });
+  felt.addEventListener("animationend", (event) => {
+    const card = event.target;
+    if (event.animationName !== "casino-deal" || audibleCards.get(card) !== "landing") return;
+    audibleCards.delete(card);
+    if (visible && !document.hidden && card.isConnected) window.GameAudio?.play("cards.place");
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) audibleDeals = new WeakSet();
+    if (document.hidden) {
+      audioSnapshot = undefined;
+      audibleCards = new WeakMap();
+    }
   });
   motion.addEventListener("change", (event) => {
-    if (event.matches) audibleDeals = new WeakSet();
+    if (event.matches) audibleCards = new WeakMap();
   });
 
   function cardsFor(hand, prepareCard) {
@@ -200,23 +217,31 @@
     return section;
   }
 
-  function animateDeal(cards, turned, playerDraws) {
-    if ((!cards.length && !turned) || !visible || document.hidden) return;
+  function playInstantDeal(delay) {
+    window.GameAudio?.play("cards.deal", delay);
+    window.GameAudio?.play("cards.place", delay + 25);
+    return delay + 25;
+  }
+
+  function animateDeal(cards, turned, playerDraws, audible) {
+    if ((!cards.length && !turned) || !visible || document.hidden) return 0;
     if (motion.matches) {
-      const count = cards.length + (turned ? 1 : 0);
-      for (let index = 0; index < count; index++) {
-        window.GameAudio?.play("cards.deal", index * 40);
-      }
-      return;
+      if (!audible) return 0;
+      if (!turned) return playInstantDeal(0);
+      const flipDelay = playerDraws ? playInstantDeal(0) + 25 : 0;
+      window.GameAudio?.play("cards.flip", flipDelay);
+      return cards.length > playerDraws ? playInstantDeal(flipDelay + 35) : flipDelay + 25;
     }
     const stagger = Math.min(90, 650 / Math.max(1, cards.length - 1));
     const turnDelay = playerDraws ? (playerDraws - 1) * stagger + 180 : 0;
+    let finish = 0;
     if (turned) {
       turned.style.setProperty("--casino-deal-delay", `${turnDelay}ms`);
-      audibleDeals.add(turned);
+      if (audible) audibleCards.set(turned, "turning");
       turned.classList.add("casino-card--turned");
+      finish = turnDelay + turnDuration;
     }
-    if (!cards.length) return;
+    if (!cards.length) return finish;
     const origin = deck.getBoundingClientRect();
     const destinations = cards.map((card) => card.getBoundingClientRect());
     cards.forEach((card, index) => {
@@ -225,14 +250,16 @@
       card.style.setProperty("--casino-deal-x", `${origin.left - target.left + (origin.width - target.width) / 2}px`);
       card.style.setProperty("--casino-deal-y", `${origin.top - target.top + (origin.height - target.height) / 2}px`);
       card.style.setProperty("--casino-deal-delay", `${delay}ms`);
-      audibleDeals.add(card);
+      if (audible) audibleCards.set(card, "dealing");
       card.classList.add("casino-card--dealt");
+      finish = Math.max(finish, delay + 320); // casino-deal duration
     });
+    return finish;
   }
 
-  function renderHands(table, you, ownSeat, previous, action) {
+  function renderHands(table, you, ownSeat, previous, action, audible) {
     const key = table ? JSON.stringify([table.id, table.phase, table.host_id, table.dealer, table.players, you]) : "";
-    if (key === handsKey) return;
+    if (key === handsKey) return 0;
     handsKey = key;
     const prior = table && previous?.table?.id === table.id ? previous.table : null;
     const opening = table?.dealer && (prior?.phase === "lobby" || (mode === "solo" && action === "join" && previous && !prior));
@@ -265,7 +292,7 @@
       dealerCards.replaceChildren(emptyHand);
     }
 
-    animateDeal([...passes.flat(), ...playerDeals, ...dealerDeals], turned, playerDeals.length);
+    return animateDeal([...passes.flat(), ...playerDeals, ...dealerDeals], turned, playerDeals.length, audible);
   }
 
   function statusText(table, you, seated) {
@@ -285,7 +312,7 @@
     return current ? "Ходит " + current.name : "Ход дилера.";
   }
 
-  function render(previous, action) {
+  function render(previous, action, audible) {
     const table = snapshot?.table;
     const you = snapshot?.user_id;
     const actions = snapshot?.actions ?? [];
@@ -325,7 +352,46 @@
     moveBar.hidden = table?.phase !== "playing" || !ownSeat;
     dock.hidden = betForm.hidden && lobbyActions.hidden && moveBar.hidden;
     for (const { action, control } of moves) control.disabled = !editable || !actions.includes(action);
-    renderHands(table, you, ownSeat, previous, action);
+    return renderHands(table, you, ownSeat, previous, action, audible);
+  }
+
+  function confirmWagerAndGetResultSound(prior) {
+    const table = snapshot.table;
+    if (!table || table.refunded || table.phase === "refunding") return;
+    const sameRound = prior.table?.id === table.id;
+    const ownSeat = table.players.find((player) => player.id === snapshot.user_id);
+    const priorOwnSeat = sameRound && prior.table.players.some((player) => player.id === snapshot.user_id);
+    const newSoloRound = mode === "solo" && !sameRound;
+    const joinConfirmed = ownSeat?.bet > 0 && !priorOwnSeat && (table.phase === "lobby" || newSoloRound);
+    // Double and split add to the total at risk even when the response pays out.
+    const totalBet = (player) => player?.hands.reduce((sum, hand) => sum + hand.bet, 0);
+    const wagerConfirmed = sameRound && prior.table.phase === "playing" &&
+      table.players.some((player) => totalBet(player) >
+        totalBet(prior.table.players.find((seat) => seat.id === player.id)));
+    if (joinConfirmed || wagerConfirmed) window.GameAudio?.play("cards.bet");
+
+    const justSettled = sameRound ? prior.table.phase === "playing" || prior.table.phase === "lobby"
+      : newSoloRound;
+    if (table.phase !== "result" || !justSettled || !ownSeat?.hands.length ||
+        !ownSeat.hands.every((hand) => hand.outcome && Number.isFinite(hand.payout) && Number.isFinite(hand.bet))) return;
+    const net = ownSeat.hands.reduce((sum, hand) => sum + hand.payout - hand.bet, 0);
+    return net > 0 ? "round.win" : net < 0 ? "round.loss" : "round.push";
+  }
+
+  function renderResponse(previous, action) {
+    const prior = audioSnapshot;
+    // The first visible snapshot sets the baseline and does not replay past events.
+    audioSnapshot = document.hidden ? undefined : snapshot;
+    const audible = Boolean(prior && audioSnapshot);
+    const resultSound = audible && confirmWagerAndGetResultSound(prior);
+    const dealDuration = render(previous, action, audible);
+    // Recoveries render without motion, but the displayed dealer card can still turn face-up.
+    const table = snapshot.table;
+    const priorTable = prior?.table;
+    const reveal = audible && !previous && priorTable?.id === table?.id &&
+      priorTable?.dealer?.cards[1] === null && Boolean(table?.dealer?.cards[1]);
+    if (reveal) window.GameAudio?.play("cards.flip");
+    if (resultSound) window.GameAudio?.play(resultSound, dealDuration || reveal ? dealDuration + 40 : 0);
   }
 
   function accept(data) {
@@ -351,7 +417,8 @@
       if (token === serial) syncError = error.message || "Не удалось обновить стол.";
     } finally {
       if (visible && token === serial) {
-        render(previous);
+        if (previous !== undefined) renderResponse(previous);
+        else render();
         timer = setTimeout(refresh, snapshot?.table ? 1000 : 1900);
       }
     }
@@ -374,7 +441,8 @@
     } finally {
       busy = false;
       if (visible) {
-        render(previous, action);
+        if (previous !== undefined && token === serial) renderResponse(previous, action);
+        else render();
         void refresh();
       }
     }
@@ -383,6 +451,8 @@
   function selectMode(next) {
     if (mode === next) return;
     window.GameAudio?.stopGame?.();
+    audioSnapshot = undefined;
+    audibleCards = new WeakMap();
     mode = next;
     snapshot = null;
     syncError = actionError = "";
@@ -401,7 +471,8 @@
     },
     hide() {
       visible = false;
-      audibleDeals = new WeakSet();
+      audioSnapshot = undefined;
+      audibleCards = new WeakMap();
       serial++;
       clearTimeout(timer);
     },

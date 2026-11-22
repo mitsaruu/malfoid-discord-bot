@@ -168,26 +168,42 @@
   let deadline = 0;
   let tableKey;
   let raiseKey;
-  let audibleDeals = new WeakSet();
+  let audioState;
+  let audibleDeals = new WeakMap();
 
   felt.addEventListener("animationstart", (event) => {
-    if (event.animationName !== "casino-deal" || !audibleDeals.delete(event.target)) return;
-    if (visible && !document.hidden && event.target.isConnected) window.GameAudio?.play("cards.deal");
+    const card = event.target;
+    if (event.animationName !== "casino-deal" || audibleDeals.get(card) !== false ||
+        !visible || document.hidden || !card.isConnected) return;
+    audibleDeals.set(card, true);
+    window.GameAudio?.play("cards.deal");
+  });
+  felt.addEventListener("animationend", (event) => {
+    const card = event.target;
+    if (event.animationName !== "casino-deal" || !audibleDeals.get(card)) return;
+    audibleDeals.delete(card);
+    if (visible && !document.hidden && card.isConnected) window.GameAudio?.play("cards.place");
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) audibleDeals = new WeakSet();
+    if (document.hidden) {
+      audioState = undefined;
+      audibleDeals = new WeakMap();
+    }
   });
   motion.addEventListener("change", (event) => {
-    if (event.matches) audibleDeals = new WeakSet();
+    if (event.matches) audibleDeals = new WeakMap();
   });
 
-  function animateDeal(cards, reveals) {
-    if (!visible || document.hidden) return;
-    const instantCards = reveals + (motion.matches ? cards.length : 0);
-    for (let index = 0; index < instantCards; index++) {
-      window.GameAudio?.play("cards.deal", index * 40);
+  function animateDeal(cards, audible) {
+    if (!visible || document.hidden) return 0;
+    if (!cards.length) return 0;
+    if (motion.matches) {
+      if (audible) {
+        window.GameAudio?.play("cards.deal");
+        window.GameAudio?.play("cards.place", 25);
+      }
+      return 25;
     }
-    if (!cards.length || motion.matches) return;
     const origin = deck.getBoundingClientRect();
     const destinations = cards.map((card) => card.getBoundingClientRect());
     const stagger = Math.min(90, 650 / Math.max(1, cards.length - 1));
@@ -196,16 +212,17 @@
       card.style.setProperty("--casino-deal-x", `${origin.left - target.left + (origin.width - target.width) / 2}px`);
       card.style.setProperty("--casino-deal-y", `${origin.top - target.top + (origin.height - target.height) / 2}px`);
       card.style.setProperty("--casino-deal-delay", `${index * stagger}ms`);
-      audibleDeals.add(card);
+      if (audible) audibleDeals.set(card, false);
       card.classList.add("casino-card--dealt");
     });
+    return (cards.length - 1) * stagger + 320; // casino-deal duration
   }
 
-  function renderTable(table, previous, action) {
+  function renderTable(table, previous, action, audible) {
     const tableData = { ...table };
     delete tableData.remaining_ms;
     const key = table ? JSON.stringify(tableData) : state ? mode : "loading";
-    if (key === tableKey) return;
+    if (key === tableKey) return 0;
     tableKey = key;
     board.replaceChildren();
     seats.replaceChildren();
@@ -224,7 +241,6 @@
     const boardStart = newHand ? 0 : continuing ? priorTable.board.length : Infinity;
     const boardDeals = [];
     const holeDeals = [];
-    let reveals = 0;
     board.append(makeCards(Array.from({ length: 5 }, (_, i) => table?.board?.[i]), {
       community: true,
       queueDeal(card, index) {
@@ -233,7 +249,7 @@
     }));
     if (!table) {
       status.textContent = state ? (mode === "online" ? "Свободный стол" : "Тренировка") : "Загрузка…";
-      return;
+      return 0;
     }
 
     switch (table.status) {
@@ -269,7 +285,6 @@
       const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
       player.append(node("p", `${stack} ${amount(seat.stack)} ${chips}`, "casino-seat-stack"));
       if (seat.cards || (!own && table.status === "playing" && !seat.folded)) {
-        if (continuing && seat.cards && !priorTable.seats[i]?.cards) reveals += seat.cards.length;
         // Deal clockwise from the next seat after the dealer, one card per pass.
         const order = (i - table.dealer - 1 + table.seats.length) % table.seats.length;
         player.append(makeCards(seat.cards, {
@@ -302,7 +317,7 @@
         results.append(node("p", `${i === 0 ? "Основной банк" : `Побочный банк ${i}`} · ${amount(pot.amount)} · ${winners}`));
       }
     }
-    animateDeal([...holeDeals.filter(Boolean), ...boardDeals], reveals);
+    return animateDeal([...holeDeals.filter(Boolean), ...boardDeals], audible);
   }
 
   function renderClock() {
@@ -314,7 +329,7 @@
     setText(clock, `${label} · ${seconds} с`);
   }
 
-  function render(previousState, action) {
+  function render(previousState, action, audible) {
     const online = mode === "online";
     const table = state?.table;
     const lobby = table?.status === "lobby";
@@ -330,7 +345,7 @@
       ? state ? `Кошелёк сервера · ${amount(state.balance)} монет` : ""
       : state ? `Тренировочные фишки · по ${amount(state.training_stack)} при пополнении` : "";
     setText(account, summary + blinds);
-    renderTable(table, previousState, action);
+    const dealDuration = renderTable(table, previousState, action, audible);
     renderClock();
 
     joinForm.hidden = !online || !state || (table && !finished && (!lobby || seated));
@@ -376,12 +391,48 @@
       const prior = state.previous;
       setText(previous, `Предыдущая раздача · В кошелёк начислено ${amount(prior.seats[prior.you].stack)} монет`);
     }
+    return dealDuration;
+  }
+
+  function confirmWagerAndGetResultSound(prior, next) {
+    const table = next.table;
+    const priorTable = prior.table;
+    const sameHand = priorTable && table?.id === priorTable.id;
+    // A new lobby can replace the finished hand between polls.
+    const settled = sameHand ? table : next.previous;
+    const sameSettledHand = priorTable && settled?.id === priorTable.id;
+    const ownSeat = table?.seats[table.you];
+    const buyInConfirmed = mode === "online" && table?.status === "lobby" &&
+      ownSeat?.stack > 0 && (!sameHand || priorTable.you == null);
+    const wagerConfirmed = priorTable?.status === "playing" && sameSettledHand &&
+      settled.seats.some((seat, index) => seat.committed > priorTable.seats[index]?.committed);
+    if (buyInConfirmed || wagerConfirmed) window.GameAudio?.play("cards.bet");
+
+    const newSoloHand = mode === "solo" && !sameHand;
+    const result = newSoloHand ? table : sameSettledHand && settled;
+    if (result?.status !== "finished" || (!newSoloHand && priorTable.status === "finished")) return;
+    const seat = result.seats[result.you];
+    if (!seat || ![seat.won, seat.returned, seat.committed].every(Number.isFinite)) return;
+    const net = seat.won + seat.returned - seat.committed;
+    return net > 0 ? "round.win" : net < 0 ? "round.loss" : "round.push";
   }
 
   function receive(next, previousState, action) {
+    const prior = audioState;
+    // The first visible snapshot sets the baseline and does not replay past events.
+    audioState = document.hidden ? undefined : next;
+    const audible = Boolean(prior && audioState);
     state = next;
     deadline = performance.now() + (state.table?.remaining_ms || 0);
-    render(previousState, action);
+    const resultSound = audible && confirmWagerAndGetResultSound(prior, next);
+    const table = next.table;
+    const priorTable = prior?.table;
+    const reveal = audible && priorTable?.status === "playing" && table?.id === priorTable.id &&
+      priorTable.seats.some((seat, index) => index !== priorTable.you && !seat.cards &&
+        !seat.folded && table.seats[index]?.cards);
+    const dealDuration = render(previousState, action, audible);
+    if (reveal) window.GameAudio?.play("cards.flip");
+    if (resultSound) window.GameAudio?.play(resultSound, dealDuration || reveal ? dealDuration + 40 : 0);
   }
 
   async function poll() {
@@ -443,7 +494,8 @@
 
   function reset() {
     generation++;
-    audibleDeals = new WeakSet();
+    audioState = undefined;
+    audibleDeals = new WeakMap();
     pendingPoll = null;
     pendingAction = null;
     pollError = false;

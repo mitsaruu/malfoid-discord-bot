@@ -113,7 +113,7 @@
     setText(countdown, `До авторасчёта ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`);
   }
 
-  function render(hitCell, confirmedCell) {
+  function render(confirmedCell) {
     const round = snapshot?.round;
     const active = round?.status === "active";
     const blocked = pending || !ready;
@@ -151,13 +151,13 @@
       tile.disabled = blocked || !active || state !== "hidden";
       if (tile.dataset.state !== state) {
         const newlyOpened = tile.dataset.state === "hidden";
-        tile.classList.toggle("mines-tile--exploded", index === hitCell && state === "hit");
+        tile.classList.toggle("mines-tile--exploded", index === confirmedCell && state === "hit");
         tile.dataset.state = state;
         tile.setAttribute("aria-label", `Ряд ${Math.floor(index / 5) + 1}, клетка ${index % 5 + 1}, ${description}`);
         setText(tile, icon);
         if (newlyOpened && index === confirmedCell && !document.hidden) {
           if (state === "safe") window.GameAudio?.play("mines.safe");
-          else if (index === hitCell) window.GameAudio?.play("mines.blast");
+          else if (state === "hit") window.GameAudio?.play("mines.blast");
         }
       }
     }
@@ -198,15 +198,8 @@
     pending = true;
     actionError = "";
     render();
-    let hitCell;
-    let confirmedCell;
     try {
-      const result = await request(action, fields);
-      accept(result);
-      if (action === "reveal" && result.round?.id === fields.round_id) {
-        confirmedCell = fields.cell;
-        if (result.round.status === "lost" && result.round.cells[confirmedCell] === "hit") hitCell = confirmedCell;
-      }
+      accept(await request(action, fields));
     } catch (error) {
       actionError = error.message || "Не удалось подтвердить ход.";
       ready = false;
@@ -218,7 +211,16 @@
     } finally {
       pending = false;
       if (visible) {
-        render(hitCell, current === view ? confirmedCell : undefined);
+        const round = snapshot?.round;
+        let confirmedCell;
+        if (current === view && action === "reveal" && round?.id === fields.round_id) {
+          const revealed = round.cells[fields.cell];
+          if (revealed === "safe" || revealed === "hit") {
+            confirmedCell = fields.cell;
+            actionError = "";
+          }
+        }
+        render(confirmedCell);
         schedule();
       }
     }

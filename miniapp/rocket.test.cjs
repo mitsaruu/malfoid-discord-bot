@@ -146,6 +146,209 @@ function viewFixture(reducedMotion = false) {
   };
 }
 
+function recordRocketAudio(view, withIntensity = true) {
+  const sounds = [];
+  const intensity = [];
+  view.window.GameAudio = {
+    play(name, delay = 0) { sounds.push([name, delay]); },
+    startLoop(name) {
+      sounds.push([name, 'start']);
+      const stop = () => sounds.push([name, 'stop']);
+      if (withIntensity) stop.setIntensity = (value) => intensity.push(value);
+      return stop;
+    },
+  };
+  return { sounds, intensity };
+}
+
+test('Rocket plays three identical pulses on the displayed countdown', async () => {
+  const f = viewFixture();
+  const { sounds } = recordRocketAudio(f);
+  f.view.show();
+  const countdown = (remaining) => snapshot(emptyRound('current', 'countdown', { next_launch_ms: remaining }));
+  await f.reply(f.requests[0], countdown(3100));
+  f.frame();
+  assert.deepEqual(sounds, []);
+  f.frame(100);
+  f.frame(200);
+  assert.equal(f.elements.get('rocket-time').textContent, '2,9 с');
+  assert.deepEqual(sounds, [['rocket.count', 0]]);
+  await f.poll(countdown(2700));
+  f.frame(700);
+  f.frame(1700);
+  f.frame(2700);
+  assert.deepEqual(sounds, Array.from({ length: 3 }, () => ['rocket.count', 0]));
+});
+
+test('Rocket skips missed countdown pulses and ignores clock corrections within the same round', async () => {
+  const f = viewFixture();
+  const { sounds } = recordRocketAudio(f);
+  f.view.show();
+  const countdown = (remaining) => snapshot(emptyRound('current', 'countdown', { next_launch_ms: remaining }));
+  await f.reply(f.requests[0], countdown(3800));
+  f.frame();
+  f.frame(2900);
+  assert.deepEqual(sounds, [['rocket.count', 0]]);
+  await f.poll(countdown(2200));
+  f.frame();
+  f.frame(2000);
+  assert.deepEqual(sounds, [['rocket.count', 0]]);
+});
+
+test('a late countdown frame leaves the next pulse on its own', async () => {
+  const f = viewFixture();
+  const { sounds } = recordRocketAudio(f);
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'countdown', { next_launch_ms: 3100 })));
+  f.frame();
+  f.frame(1090); // 2.1 is too late for the 3-second pulse.
+  assert.deepEqual(sounds, []);
+  f.frame(1100);
+  assert.deepEqual(sounds, [['rocket.count', 0]]);
+});
+
+test('the spectator flight loop follows the rendered launch and crash burst', async () => {
+  const f = viewFixture();
+  const { sounds, intensity } = recordRocketAudio(f);
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'countdown', { next_launch_ms: 3900 })));
+  f.frame();
+  await f.poll(snapshot(emptyRound('current', 'flying', { elapsed_ms: 200, multiplier: 105 })));
+  assert.deepEqual(sounds, []);
+  f.frame();
+  const flying = [['rocket.launch', 0], ['rocket.flight', 'start']];
+  assert.deepEqual(sounds, flying);
+  await f.poll(snapshot(emptyRound('current', 'flying', { elapsed_ms: 1050, multiplier: 130 })));
+  for (let elapsed = 0; elapsed <= 600; elapsed += 16) f.frame(elapsed);
+  assert.deepEqual(sounds, flying);
+  assert.ok(intensity.length > 1 && intensity.length < 8);
+  assert.ok(intensity.every((value, i) => value >= 0 && value <= 1 && (!i || value > intensity[i - 1])));
+
+  const crash = snapshot(emptyRound('current', 'crashed', { elapsed_ms: 1100, multiplier: 132, next_launch_ms: 2000 }));
+  await f.poll(crash);
+  f.frame();
+  f.frame(100);
+  assert.equal(f.drawing.marker, undefined);
+  assert.deepEqual(sounds, flying);
+  f.frame(160);
+  assert.ok(f.drawing.burst);
+  const finished = [...flying, ['rocket.flight', 'stop'], ['rocket.crash', 0]];
+  assert.deepEqual(sounds, finished);
+  await f.poll(crash);
+  f.frame();
+  assert.deepEqual(sounds, finished);
+});
+
+test('the first displayed crash sounds once when the server skips a very short flight', async () => {
+  const f = viewFixture(true);
+  const { sounds } = recordRocketAudio(f);
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'countdown', { next_launch_ms: 3800 })));
+  f.frame();
+  await f.poll(snapshot(emptyRound('current', 'crashed', { elapsed_ms: 0 })));
+  assert.deepEqual(sounds, []);
+  f.frame();
+  assert.ok(f.drawing.marker);
+  assert.deepEqual(sounds, [['rocket.crash', 0]]);
+});
+
+for (const automatic of [false, true]) {
+  test('Rocket plays a confirmed ' + (automatic ? 'automatic' : 'manual') + ' cashout once', async () => {
+    const f = viewFixture(true);
+    const { sounds } = recordRocketAudio(f, false);
+    f.view.show();
+    await f.reply(f.requests[0], snapshot(flight('flying')));
+    f.frame();
+    const playing = [['rocket.flight', 'start']];
+    assert.deepEqual(sounds, playing);
+    const paid = { payout: 110, cashout_multiplier: 110, automatic };
+    if (automatic) {
+      await f.poll(snapshot(flight('flying', paid), 510));
+    } else {
+      f.elements.get('rocket-form').dispatchEvent(new Event('submit', { cancelable: true }));
+      const cashout = f.requests.at(-1);
+      assert.equal(cashout.path, 'api/rocket/cashout');
+      f.frame();
+      assert.deepEqual(sounds, playing);
+      await f.reply(cashout, snapshot(flight('flying', paid), 510));
+    }
+    f.frame();
+    await f.poll(snapshot(flight('crashed', paid), 510));
+    f.frame();
+    await f.poll(snapshot(flight('crashed', paid), 510));
+    f.frame();
+    assert.deepEqual(sounds, [...playing, ['rocket.cashout', 0], ['rocket.flight', 'stop'], ['rocket.crash', 0]]);
+  });
+}
+
+test('a resumed Rocket view starts the current flight loop without replaying hidden cues', async () => {
+  const f = viewFixture();
+  const { sounds } = recordRocketAudio(f);
+  const visibility = (hidden) => {
+    f.document.hidden = hidden;
+    f.document.dispatchEvent(new Event('visibilitychange'));
+  };
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('countdown', { next_launch_ms: 2600 })));
+  f.frame();
+  visibility(true);
+  visibility(false);
+  f.frame();
+  await f.reply(f.requests.at(-1), snapshot(flight('countdown', { next_launch_ms: 2400 })));
+  f.frame();
+  assert.deepEqual(sounds, [['rocket.count', 0]]);
+  visibility(true);
+  visibility(false);
+  const paid = { payout: 110, cashout_multiplier: 110, automatic: true };
+  await f.reply(f.requests.at(-1), snapshot(flight('flying', paid), 510));
+  f.frame();
+  assert.deepEqual(sounds, [['rocket.count', 0], ['rocket.flight', 'start']]);
+  visibility(true);
+  assert.deepEqual(sounds, [['rocket.count', 0], ['rocket.flight', 'start'], ['rocket.flight', 'stop']]);
+  visibility(false);
+  f.frame();
+  await f.reply(f.requests.at(-1), snapshot(flight('crashed', paid), 510));
+  f.frame();
+  assert.deepEqual(sounds, [['rocket.count', 0], ['rocket.flight', 'start'], ['rocket.flight', 'stop']]);
+});
+
+test('a clock correction after returning to Rocket cannot replay a pulse from that round', async () => {
+  const f = viewFixture();
+  const { sounds } = recordRocketAudio(f);
+  const countdown = (remaining) => snapshot(emptyRound('current', 'countdown', { next_launch_ms: remaining }));
+  f.view.show();
+  await f.reply(f.requests[0], countdown(2000));
+  f.frame();
+  f.frame(1000);
+  f.view.hide();
+  f.view.show();
+  await f.reply(f.requests.at(-1), countdown(2000));
+  f.frame();
+  f.frame(1000);
+  assert.deepEqual(sounds, [['rocket.count', 0], ['rocket.count', 0]]);
+});
+
+test('Rocket stops a flight loop when the view is left, the page is left, or the connection closes', async () => {
+  for (const suspend of [
+    (f) => f.view.hide(),
+    (f) => f.window.dispatchEvent(new Event('pagehide')),
+    (f) => f.view.disconnect('Disconnected'),
+    (f) => {
+      f.navigator.onLine = false;
+      f.window.dispatchEvent(new Event('offline'));
+    },
+  ]) {
+    const f = viewFixture();
+    const { sounds } = recordRocketAudio(f, false);
+    f.view.show();
+    await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying')));
+    f.frame();
+    suspend(f);
+    if (f.hasFrame()) f.frame();
+    assert.deepEqual(sounds, [['rocket.flight', 'start'], ['rocket.flight', 'stop']]);
+  }
+});
+
 test('a spectator can opt into AutoBet using the form before making any wager', async () => {
   const f = viewFixture();
   f.view.show();

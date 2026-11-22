@@ -14,6 +14,8 @@
   const pocketRadius = 34.2;
   const pocketInterval = 1000;
   const spinDuration = 2800;
+  const tickSpacing = 75;
+  const outcomeDelay = 180;
   const launchAngle = pocketAngle * .65;
   const easeOut = (progress) => 1 - (1 - progress) ** 3;
 
@@ -79,6 +81,7 @@
   let animationFrame = null;
   let idle = null;
   let spin = null;
+  let lastTickAt = -Infinity;
 
   function addCell(key, label, column, row, mobileColumn, mobileRow, color = "", type = "group") {
     const control = element("button", label, "roulette-cell roulette-cell--" + type);
@@ -241,10 +244,17 @@
     }));
   }
 
-  function rotateWheel(angle) {
+  function rotateWheel(angle, now) {
     if (angle === rotation) return;
+    const previousPocket = Math.floor(rotation / pocketAngle + 1e-9);
     rotation = angle;
     wheel.style.transform = "rotate(" + angle + "deg)";
+    // Sample the painted angle and drop crossings that are too close or share a frame.
+    if (now !== undefined && now - lastTickAt >= tickSpacing &&
+        Math.floor(angle / pocketAngle + 1e-9) > previousPocket) {
+      lastTickAt = now;
+      window.GameAudio?.play?.("roulette.tick");
+    }
   }
 
   function placeBall(angle, radius) {
@@ -283,7 +293,13 @@
     rotateWheel(winningRotation(result));
     placeBall(0, pocketRadius);
     displayResult(result);
-    if (audible) window.GameAudio?.play?.("roulette.land");
+    if (audible) {
+      window.GameAudio?.play?.("roulette.land");
+      const net = result.players?.find((player) => player.id === state?.user_id)?.net;
+      if (Number.isFinite(net) && net !== 0) {
+        window.GameAudio?.play?.(net > 0 ? "roulette.win" : "roulette.loss", outcomeDelay);
+      }
+    }
     startIdleWheel();
   }
 
@@ -309,7 +325,7 @@
       const turn = easeOut(progress);
       const launch = easeOut(Math.min(1, progress / .11));
       const drop = Math.max(0, (progress - .82) / .18) ** 2;
-      rotateWheel(from + (to - from) * turn);
+      rotateWheel(from + (to - from) * turn, now);
       placeBall(launchAngle + (-3 * 360 - launchAngle) * turn,
         launchRadius + (trackRadius - launchRadius) * launch + (pocketRadius - trackRadius) * drop);
     } else {
@@ -317,11 +333,8 @@
       const position = elapsed / pocketInterval;
       const pocket = Math.floor(position);
       const angle = idle.from + (reduceMotion.matches ? pocket : position) * pocketAngle;
-      rotateWheel(angle);
-      if (pocket > idle.pocket) {
-        ball.hidden = true;
-        window.GameAudio?.play?.("roulette.tick");
-      }
+      rotateWheel(angle, now);
+      if (pocket > idle.pocket) ball.hidden = true;
       if (!ball.hidden) placeBall(angle - winningRotation(shownResult), pocketRadius);
       idle.pocket = pocket;
     }
@@ -330,7 +343,7 @@
 
   function updateResult(result, live) {
     if (!result || result.id === shownResult?.id || result.id === spin?.result.id) return;
-    if (result.number === null || !live) {
+    if (result.refunded || result.number === null || !live) {
       if (spin) {
         pauseWheel();
         spin = null;
@@ -450,16 +463,14 @@
     state = data;
     closesAt = performance.now() + (data.round?.remaining_ms ?? 0);
     syncError = "";
-    updateResult(data.last_result, data.last_result?.id === openRound);
-    if (pending) {
-      const source = [data.round, data.last_result].find((round) => round?.id === pending.round_id);
-      const receipt = source?.your_bets.find((bet) => bet.request_id === pending.request_id);
-      if (receipt) {
-        pending = null;
-        feedbackText = source.refunded ? "Ставка возвращена." :
-          "Ставка принята · " + format.format(receipt.amount) + " · " + labels.get(receipt.space);
-        feedbackTone = "ok";
-      }
+    const source = pending && [data.round, data.last_result].find((round) => round?.id === pending.round_id);
+    const receipt = source?.your_bets?.find((bet) => bet.request_id === pending.request_id);
+    updateResult(data.last_result, data.last_result?.id === openRound || (receipt && source === data.last_result));
+    if (receipt) {
+      pending = null;
+      feedbackText = source.refunded ? "Ставка возвращена." :
+        "Ставка принята · " + format.format(receipt.amount) + " · " + labels.get(receipt.space);
+      feedbackTone = "ok";
     }
   }
 

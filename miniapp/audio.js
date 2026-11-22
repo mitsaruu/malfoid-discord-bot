@@ -6,10 +6,18 @@
   const slider = document.getElementById("game-audio-volume");
   const storageKey = "malfoid-game-audio";
   const clips = new Map();
-  const active = new Map();
+  const active = new Set();
+  const loops = new Set();
+  const lastCue = new Map();
   let context;
+  let mix;
   let master;
-  let lastHover = -Infinity;
+  let ambience;
+  let introEndsAt = 0;
+  let introduced = false;
+  let inLobby = false;
+  let menuAvailable = false;
+  let inputWithKeyboard = false;
   let enabled = true;
   let volume = 50;
 
@@ -19,29 +27,45 @@
     if (Number.isFinite(saved?.volume)) volume = Math.max(0, Math.min(100, Math.round(saved.volume)));
   } catch { /* The Activity can run without browser storage. */ }
 
-  function tone(duration, gain, from, to = from, offset = 0) {
-    return { duration, gain, from, to, offset };
-  }
-
-  function noise(duration, gain, cutoff, offset = 0) {
-    return { duration, gain, cutoff, offset };
-  }
-
+  const tone = (duration, gain, from, to = from, offset = 0) => ({ duration, gain, from, to, offset });
+  const noise = (duration, gain, cutoff, offset = 0) => ({ duration, gain, cutoff, offset });
+  const wood = (gain, pitch) => [tone(.067, gain, pitch, pitch * .77), noise(.05, gain * .65, 630)];
+  const warmPair = (lower, higher) => [tone(.22, .105, lower), tone(.28, .09, higher, higher, .105)];
+  const warmChord = (notes, duration, level) => notes.map((frequency, index) =>
+    tone(duration, level, frequency, frequency, index * .026));
   const effects = {
-    "ui.hover": [tone(.035, .14, 820, 650)],
-    "ui.click": [tone(.065, .29, 560, 320), noise(.026, .18, 2200)],
-    "roulette.tick": [noise(.044, .24, 2300), tone(.05, .16, 1050, 880)],
-    "roulette.launch": [noise(.16, .40, 2600), tone(.14, .20, 180, 640), tone(.06, .16, 1130, 680, .12)],
-    "roulette.land": [tone(.1, .32, 470, 240), noise(.075, .38, 2900), tone(.14, .19, 820, 690, .075)],
-    "slots.spin": [noise(.51, .28, 1350), ...Array.from({ length: 6 }, (_, index) =>
-      tone(.064, .14, 290 + index * 19, 180, index * .084))],
-    "slots.stop": [noise(.054, .45, 1700), tone(.102, .36, 245, 103), tone(.07, .14, 660, 540, .032)],
-    "cards.deal": [noise(.097, .47, 3700), noise(.034, .33, 1300, .057), tone(.068, .15, 162, 85, .042)],
-    "mines.safe": [tone(.12, .29, 720, 780), tone(.16, .22, 1070, 1090, .07)],
-    "mines.blast": [noise(.36, .51, 1600), tone(.42, .61, 93, 30), noise(.49, .31, 380, .038)],
-    "coin.launch": [tone(.21, .29, 1600, 1020), tone(.11, .13, 2530, 2000, .023)],
-    "coin.land": [tone(.18, .35, 1550, 1180), tone(.16, .22, 2390, 2160), noise(.083, .28, 4400)],
+    "menu.ready": warmChord([130.81, 164.81, 196, 293.66], .62, .046),
+    "ui.hover": wood(.019, 224),
+    "ui.click": wood(.041, 262),
+    "roulette.tick": wood(.034, 337),
+    "roulette.launch": [noise(.16, .08, 460), tone(.17, .082, 140, 101)],
+    "roulette.land": wood(.085, 245),
+    "roulette.win": warmPair(174.61, 261.63),
+    "roulette.loss": [noise(.22, .058, 420), tone(.20, .050, 149, 139)],
+    "slots.spin": [noise(.55, .077, 540), ...Array.from({ length: 10 }, (_, index) =>
+      tone(.046, .026, 165 + index % 3 * 28, 121, index * .055))],
+    "slots.stop": wood(.065, 183),
+    "slots.win": warmChord([146.83, 220, 293.66], .35, .065),
+    "cards.deal": [noise(.132, .085, 1220), noise(.084, .035, 500)],
+    "cards.place": [noise(.058, .042, 410), tone(.064, .022, 122, 85)],
+    "cards.flip": [noise(.117, .101, 1050), tone(.072, .023, 181, 139, .032)],
+    "cards.bet": [tone(.084, .060, 245, 152), noise(.069, .070, 670), tone(.062, .041, 291, 212, .047)],
+    "round.win": warmChord([130.81, 196, 261.63], .34, .067),
+    "round.loss": [tone(.30, .11, 176, 138)],
+    "round.push": [tone(.24, .085, 164.81)],
+    "mines.safe": [...wood(.066, 271), tone(.195, .066, 329.63, 317, .032)],
+    "mines.blast": [tone(.215, .145, 90, 43), noise(.25, .16, 300)],
+    "coin.launch": [noise(.123, .054, 760), tone(.14, .061, 243, 339)],
+    "coin.land": [...wood(.067, 324), tone(.116, .040, 221, 193, .065)],
+    "rocket.count": [tone(.085, .047, 135)],
+    "rocket.launch": [noise(.36, .12, 405), tone(.325, .102, 65, 96)],
+    "rocket.cashout": warmPair(164.81, 246.94),
+    "rocket.crash": [tone(.205, .14, 89, 49), noise(.22, .13, 345)],
   };
+
+  const quietCues = new Set(["ui.hover", "ui.click", "roulette.tick", "slots.stop",
+    "cards.deal", "cards.place", "cards.flip", "cards.bet", "rocket.count"]);
+  const minGap = { "ui.hover": .045, "ui.click": .040, "roulette.tick": .065 };
 
   function renderSettings() {
     if (toggle) {
@@ -53,7 +77,7 @@
       slider.value = String(volume);
       slider.disabled = !Audio || !enabled;
     }
-    if (master) master.gain.setTargetAtTime(enabled ? volume / 150 : 0, context.currentTime, .02);
+    if (master) master.gain.setTargetAtTime(enabled ? volume / 185 : 0, context.currentTime, .02);
   }
 
   function save() {
@@ -61,82 +85,227 @@
     catch { /* Settings still apply for this visit. */ }
   }
 
-  async function unlock() {
-    if (!Audio || !enabled || document.hidden) return;
+  function prepareAudio() {
+    if (!Audio || context || !enabled || document.hidden) return;
     try {
-      if (!context) {
-        context = new Audio();
-        master = context.createGain();
-        master.connect(context.destination);
-        renderSettings();
+      context = new Audio();
+      master = context.createGain();
+      mix = context.createDynamicsCompressor?.() || master;
+      if (mix !== master) {
+        mix.threshold.value = -23;
+        mix.knee.value = 12;
+        mix.ratio.value = 5;
+        mix.attack.value = .012;
+        mix.release.value = .16;
+        mix.connect(master);
       }
-      if (context.state !== "running") await context.resume();
-    } catch { /* This client did not permit playback yet. */ }
+      master.connect(context.destination);
+      context.addEventListener?.("statechange", refreshAudio);
+      renderSettings();
+    } catch { /* Some clients do not expose usable audio output. */ }
   }
 
-  function clipFor(name) {
-    if (clips.has(name)) return clips.get(name);
-    const layers = effects[name];
+  async function unlock() {
+    prepareAudio();
+    try {
+      if (enabled && !document.hidden && context && context.state !== "running") await context.resume();
+    } catch { /* This client did not permit playback yet. */ }
+    refreshAudio();
+  }
+
+  function periodicBed(name) {
+    const duration = name === "menu.ambient" ? 16 : 3.2;
+    const rate = Math.min(context.sampleRate, 12000);
+    const frames = Math.round(duration * rate);
+    const buffer = context.createBuffer(1, frames, rate);
+    const samples = buffer.getChannelData(0);
+    const menu = name === "menu.ambient";
+    const partials = menu
+      ? [[65.41, .028], [98, .018], [130.81, .019], [164.81, .011], [196, .009],
+        [285.06, .0028], [314.84, .002], [378.31, .002], [451.75, .0014], [516.31, .0011], [614, .001]]
+      : [[57, .025], [82, .016], [126, .012], [173, .010], [228, .006], [283, .005], [368, .003], [449, .002]];
+    // Integer cycles close every partial and its slow modulation at the loop seam.
+    for (const [index, [frequency, gain]] of partials.entries()) {
+      const cycles = Math.round(frequency * duration);
+      const offset = index * 2.39996;
+      for (let frame = 0; frame < frames; frame++) {
+        const phase = 2 * Math.PI * frame / frames;
+        const drift = .87 + .13 * Math.sin(phase * (1 + index % 2) + offset);
+        samples[frame] += Math.sin(cycles * phase + offset + .5 * Math.sin(phase + offset)) * gain * drift;
+      }
+    }
+    const texture = Float32Array.from({ length: frames }, () => Math.random() * 2 - 1);
+    let low = 0;
+    let high = 0;
+    for (let frame = -Math.ceil(rate / 20); frame < frames; frame++) {
+      const sample = texture[(frame + frames) % frames];
+      high += .28 * (sample - high);
+      low += .061 * (sample - low);
+      if (frame >= 0) {
+        const drift = .82 + .18 * Math.sin(2 * Math.PI * frame / frames);
+        samples[frame] += (high - low) * (menu ? .010 : .040) * drift;
+      }
+    }
+    return buffer;
+  }
+
+  function effectBuffer(layers) {
     const rate = context.sampleRate;
     const length = Math.max(...layers.map(({ offset, duration }) => offset + duration));
     const buffer = context.createBuffer(1, Math.ceil(length * rate), rate);
     const samples = buffer.getChannelData(0);
     for (const { offset, duration, gain, cutoff, from, to } of layers) {
       const start = Math.round(offset * rate);
-      const frames = Math.round(duration * rate);
+      const frames = Math.min(samples.length - start, Math.round(duration * rate));
       const filter = cutoff ? 1 - Math.exp(-2 * Math.PI * cutoff / rate) : 0;
+      const attack = rate * Math.min(.031, duration / 4);
       let phase = 0;
       let low = 0;
       for (let frame = 0; frame < frames; frame++) {
         const progress = frame / frames;
-        const fade = Math.min(1, frame / (rate * .004)) * (1 - progress) ** 2;
+        const rise = Math.min(1, frame / attack);
+        const envelope = rise * rise * (1 - progress) ** 2;
         let value;
         if (cutoff) {
-          const white = Math.random() * 2 - 1;
-          low += filter * (white - low);
+          low += filter * (Math.random() * 2 - 1 - low);
           value = low;
         } else {
           phase += 2 * Math.PI * (from + (to - from) * progress) / rate;
           value = Math.sin(phase);
         }
-        samples[start + frame] += value * gain * fade;
+        samples[start + frame] += value * gain * envelope;
       }
     }
-    clips.set(name, buffer);
     return buffer;
   }
 
-  function stop(source) {
-    if (!active.delete(source)) return;
-    source.onended = null;
-    source.stop();
-    source.disconnect();
+  function clipFor(name) {
+    if (!clips.has(name)) clips.set(name, effects[name] ? effectBuffer(effects[name]) : periodicBed(name));
+    return clips.get(name);
+  }
+
+  function canPlay() {
+    return enabled && volume > 0 && !document.hidden && context?.state === "running";
+  }
+
+  function disconnect(voice) {
+    active.delete(voice);
+    voice.source.disconnect();
+    voice.gain.disconnect();
+    voice.filter?.disconnect();
+  }
+
+  function retarget(voice, level, fade) {
+    const now = context.currentTime;
+    voice.gain.gain.cancelScheduledValues(now);
+    voice.gain.gain.setTargetAtTime(level, Math.max(now, voice.start), fade);
+  }
+
+  function stop(voice, fade = 0) {
+    if (!active.has(voice)) return;
+    if (voice === ambience) ambience = undefined;
+    if (fade && voice.start <= context.currentTime) {
+      retarget(voice, 0, fade);
+      voice.source.stop(context.currentTime + 4 * fade);
+    } else {
+      voice.source.onended = null;
+      voice.source.stop();
+      disconnect(voice);
+    }
   }
 
   function stopSounds(includeUi) {
-    for (const [source, name] of active) {
-      if (includeUi || !name.startsWith("ui.")) stop(source);
+    for (const voice of active) {
+      if (includeUi || (voice !== ambience && !voice.name.startsWith("ui."))) stop(voice);
+    }
+    if (includeUi) lastCue.clear();
+  }
+
+  function startSound(name, start, loop, level) {
+    const source = context.createBufferSource();
+    const gain = context.createGain();
+    const buffer = clipFor(name);
+    const filter = name === "rocket.flight" ? context.createBiquadFilter?.() : undefined;
+    const voice = { source, gain, filter, name, start, end: loop ? Infinity : start + buffer.duration };
+    source.buffer = buffer;
+    source.loop = loop;
+    gain.gain.value = loop ? 0 : level;
+    if (filter) {
+      filter.type = "lowpass";
+      filter.frequency.value = 505;
+      source.connect(filter);
+      filter.connect(gain);
+    } else source.connect(gain);
+    gain.connect(mix);
+    source.onended = () => disconnect(voice);
+    active.add(voice);
+    source.start(start);
+    return voice;
+  }
+
+  function play(name, delay = 0) {
+    if (!canPlay() || !Object.hasOwn(effects, name)) return false;
+    const start = context.currentTime + Math.max(0, Number(delay) || 0) / 1000;
+    const gap = minGap[name];
+    if (gap && start - (lastCue.get(name) ?? -Infinity) < gap) return false;
+    let simultaneous = 0;
+    for (const voice of active) {
+      if (!voice.source.loop && voice.start <= start + .015 && voice.end > start) simultaneous++;
+    }
+    if (active.size >= 24 || (quietCues.has(name) && simultaneous >= 4)) return false;
+    startSound(name, start, false, 1 / (1 + simultaneous * .43));
+    if (gap) lastCue.set(name, start);
+    return true;
+  }
+
+  function tuneLoop(loop) {
+    const rocket = loop.name === "rocket.flight";
+    retarget(loop.voice, rocket ? .56 + loop.intensity * .33 : 1, .10);
+    loop.voice.filter?.frequency.setTargetAtTime(505 + loop.intensity * 290, context.currentTime, .14);
+  }
+
+  function refreshLoops() {
+    if (!canPlay()) return;
+    for (const loop of loops) {
+      if (active.has(loop.voice)) continue;
+      loop.voice = startSound(loop.name, context.currentTime, true, 0);
+      tuneLoop(loop);
     }
   }
 
-  function playSound(name, delay, loop) {
-    if (!context || context.state !== "running" || !enabled || !volume || document.hidden || !Object.hasOwn(effects, name)) return;
-    if (active.size >= 24) {
-      const oldestOneShot = [...active.keys()].find((source) => !source.loop);
-      if (oldestOneShot) stop(oldestOneShot);
-      else return;
-    }
-    const source = context.createBufferSource();
-    source.buffer = clipFor(name);
-    source.loop = loop;
-    source.connect(master);
-    source.start(context.currentTime + Math.max(0, Number(delay) || 0) / 1000);
-    active.set(source, name);
-    source.onended = () => {
-      active.delete(source);
-      source.disconnect();
+  function startLoop(name) {
+    if (!["slots.spin", "rocket.flight"].includes(name)) return () => {};
+    const loop = { name, intensity: .25, voice: undefined };
+    loops.add(loop);
+    refreshLoops();
+    const end = () => {
+      loops.delete(loop);
+      if (loop.voice) stop(loop.voice, .035);
     };
-    return () => stop(source);
+    end.setIntensity = (level) => {
+      if (name !== "rocket.flight" || !Number.isFinite(level)) return;
+      loop.intensity = Math.max(0, Math.min(1, level));
+      if (active.has(loop.voice)) tuneLoop(loop);
+    };
+    return end;
+  }
+
+  function refreshLobby() {
+    if (!inLobby || !menuAvailable || !canPlay()) {
+      if (ambience) retarget(ambience, 0, .20);
+      return;
+    }
+    if (!introduced && play("menu.ready")) {
+      introduced = true;
+      introEndsAt = context.currentTime + clipFor("menu.ready").duration;
+    }
+    if (!ambience) ambience = startSound("menu.ambient", Math.max(context.currentTime, introEndsAt), true, 0);
+    retarget(ambience, 1, .45);
+  }
+
+  function refreshAudio() {
+    refreshLobby();
+    refreshLoops();
   }
 
   function buttonAt(target) {
@@ -145,25 +314,45 @@
   }
 
   window.GameAudio = {
-    play: (name, delay = 0) => playSound(name, delay, false),
-    startLoop: (name) => playSound(name, 0, true) ?? (() => {}),
-    stopGame: () => stopSounds(false),
+    play, startLoop,
+    stopGame() { loops.clear(); stopSounds(false); },
+    setLobby(value) { inLobby = value; refreshLobby(); },
+    menuReady() {
+      menuAvailable = true;
+      if (inLobby) prepareAudio();
+      refreshLobby();
+    },
   };
 
   document.addEventListener("click", async (event) => {
     if (!event.isTrusted) return;
     const button = buttonAt(event.target);
     await unlock();
-    if (button && button !== toggle) playSound("ui.click", 0, false);
+    if (button && button !== toggle) play("ui.click");
+  }, true);
+  document.addEventListener("pointerdown", (event) => {
+    if (event.isTrusted) inputWithKeyboard = false;
+  }, true);
+  document.addEventListener("keydown", (event) => {
+    if (!event.isTrusted || !["Tab", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    inputWithKeyboard = true;
+    void unlock();
   }, true);
   document.addEventListener("pointerover", (event) => {
     if (event.pointerType !== "mouse" || !event.isTrusted) return;
     const button = buttonAt(event.target);
     if (!button || (event.relatedTarget?.nodeType && button.contains(event.relatedTarget))) return;
-    const now = performance.now();
-    if (now - lastHover >= 90 && playSound("ui.hover", 0, false)) lastHover = now;
+    play("ui.hover");
   });
-  document.addEventListener("visibilitychange", () => { if (document.hidden) stopSounds(true); });
+  document.addEventListener("focusin", (event) => {
+    if (!inputWithKeyboard || !event.isTrusted) return;
+    const button = buttonAt(event.target);
+    if (button && button !== buttonAt(event.relatedTarget)) play("ui.hover");
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopSounds(true);
+    else refreshAudio();
+  });
 
   toggle?.addEventListener("click", async () => {
     enabled = !enabled;
@@ -172,7 +361,7 @@
     save();
     if (enabled) {
       await unlock();
-      playSound("ui.click", 0, false);
+      play("ui.click");
     }
   });
   slider?.addEventListener("input", () => {
@@ -180,6 +369,7 @@
     if (!volume) stopSounds(true);
     renderSettings();
     save();
+    refreshAudio();
   });
   renderSettings();
 })();
