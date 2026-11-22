@@ -7,6 +7,7 @@
   const royalRanks = ["10", "J", "Q", "K", "A"];
   const moves = { fold: "пас", check: "чек", call: "колл", bet: "ставка", raise: "рейз", all_in: "олл-ин" };
   const fmt = new Intl.NumberFormat("ru-RU");
+  const motion = matchMedia("(prefers-reduced-motion: reduce)");
   const amount = (value) => fmt.format(value);
 
   function node(tag, label, className) {
@@ -167,9 +168,26 @@
   let deadline = 0;
   let tableKey;
   let raiseKey;
+  let audibleDeals = new WeakSet();
 
-  function animateDeal(cards) {
-    if (!cards.length || document.hidden || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  felt.addEventListener("animationstart", (event) => {
+    if (event.animationName !== "casino-deal" || !audibleDeals.delete(event.target)) return;
+    if (visible && !document.hidden && event.target.isConnected) window.GameAudio?.play("cards.deal");
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) audibleDeals = new WeakSet();
+  });
+  motion.addEventListener("change", (event) => {
+    if (event.matches) audibleDeals = new WeakSet();
+  });
+
+  function animateDeal(cards, reveals) {
+    if (!visible || document.hidden) return;
+    const instantCards = reveals + (motion.matches ? cards.length : 0);
+    for (let index = 0; index < instantCards; index++) {
+      window.GameAudio?.play("cards.deal", index * 40);
+    }
+    if (!cards.length || motion.matches) return;
     const origin = deck.getBoundingClientRect();
     const destinations = cards.map((card) => card.getBoundingClientRect());
     const stagger = Math.min(90, 650 / Math.max(1, cards.length - 1));
@@ -178,6 +196,7 @@
       card.style.setProperty("--casino-deal-x", `${origin.left - target.left + (origin.width - target.width) / 2}px`);
       card.style.setProperty("--casino-deal-y", `${origin.top - target.top + (origin.height - target.height) / 2}px`);
       card.style.setProperty("--casino-deal-delay", `${index * stagger}ms`);
+      audibleDeals.add(card);
       card.classList.add("casino-card--dealt");
     });
   }
@@ -205,6 +224,7 @@
     const boardStart = newHand ? 0 : continuing ? priorTable.board.length : Infinity;
     const boardDeals = [];
     const holeDeals = [];
+    let reveals = 0;
     board.append(makeCards(Array.from({ length: 5 }, (_, i) => table?.board?.[i]), {
       community: true,
       queueDeal(card, index) {
@@ -249,6 +269,7 @@
       const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
       player.append(node("p", `${stack} ${amount(seat.stack)} ${chips}`, "casino-seat-stack"));
       if (seat.cards || (!own && table.status === "playing" && !seat.folded)) {
+        if (continuing && seat.cards && !priorTable.seats[i]?.cards) reveals += seat.cards.length;
         // Deal clockwise from the next seat after the dealer, one card per pass.
         const order = (i - table.dealer - 1 + table.seats.length) % table.seats.length;
         player.append(makeCards(seat.cards, {
@@ -281,7 +302,7 @@
         results.append(node("p", `${i === 0 ? "Основной банк" : `Побочный банк ${i}`} · ${amount(pot.amount)} · ${winners}`));
       }
     }
-    animateDeal([...holeDeals.filter(Boolean), ...boardDeals]);
+    animateDeal([...holeDeals.filter(Boolean), ...boardDeals], reveals);
   }
 
   function renderClock() {
@@ -422,6 +443,7 @@
 
   function reset() {
     generation++;
+    audibleDeals = new WeakSet();
     pendingPoll = null;
     pendingAction = null;
     pollError = false;
@@ -432,6 +454,7 @@
 
   function select(next) {
     if (mode === next) return;
+    window.GameAudio?.stopGame?.();
     mode = next;
     reset();
     render();

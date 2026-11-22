@@ -81,6 +81,7 @@
   let snapshot = null;
   let reading = null;
   const motions = new Map();
+  let stopSpinSound;
   let selectedLine = null;
   let lineButtons = [];
   let message = "";
@@ -207,6 +208,9 @@
   }
 
   function stopAnimation() {
+    const stop = stopSpinSound;
+    stopSpinSound = undefined;
+    stop?.();
     for (const column of motions.keys()) removeTrack(column);
   }
 
@@ -236,8 +240,8 @@
         gridAutoRows: `calc((100% - ${2 * gap}px) / 3)`,
       });
       const iconAt = (row) => icons[(row + column * 2) % icons.length];
-      const duration = icons.length * (65 + column * 6);
-      const motion = { reel, track, animation: null, gap, iconAt, duration, length: icons.length };
+      const duration = icons.length * (48 + column * 4);
+      const motion = { reel, track, animation: null, gap, iconAt, length: icons.length };
       motions.set(column, motion);
       fillTrack(track, Array.from({ length: icons.length + 3 }, (_, row) => iconAt(row)));
       reel.strip.append(track);
@@ -250,22 +254,24 @@
     if (!data.spin) return;
     await Promise.all([...motions].map(async ([column, motion]) => {
       try {
-        const { track, gap, iconAt, duration, length } = motion;
+        const { track, gap, iconAt, length } = motion;
         // Keep the visible symbols and their fractional offset when switching to the stop animation.
-        const position = ((motion.animation.currentTime ?? 0) % duration) / duration * length;
+        const position = (motion.animation.effect.getComputedTiming().progress ?? 0) * length;
         const row = Math.floor(position);
-        const steps = 5 + column;
+        const steps = 9 + column * 2;
         const icons = Array.from({ length: steps }, (_, index) => iconAt(row + index));
         for (const resultRow of data.spin.grid) icons.push(data.symbols[resultRow[column]].icon);
         motion.animation.cancel();
         fillTrack(track, icons);
         motion.animation = moveTrack(track, gap, position - row, steps, {
-          duration: 540 + column * 150,
+          duration: 690 + column * 155,
           easing: "cubic-bezier(.25,.4,.55,1)",
           fill: "both",
         });
         await motion.animation.finished;
+        if (motions.get(column) !== motion || document.hidden) return;
         paintReel(data, column, false);
+        window.GameAudio?.play?.("slots.stop");
       } catch {
         // The final render still paints the receipt if animation is canceled or unavailable.
       } finally {
@@ -277,6 +283,10 @@
   reducedMotion.addEventListener("change", (event) => {
     if (event.matches) stopAnimation();
   });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopAnimation();
+  });
+  window.addEventListener("pagehide", stopAnimation);
 
   async function sync() {
     if (!visible || busy || reading) return;
@@ -300,13 +310,14 @@
   }
 
   async function play() {
-    if (!visible || !ready || busy) return;
+    if (!visible || document.hidden || !ready || busy) return;
     const expected = snapshot.spin?.id ?? null;
     busy = true;
     selectedLine = null;
     message = "";
     render();
     try {
+      stopSpinSound = window.GameAudio?.startLoop?.("slots.spin");
       startAnimation();
     } catch {
       stopAnimation();

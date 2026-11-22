@@ -9,6 +9,7 @@
   };
   const suits = { "♥": "hearts", "♦": "diamonds", "♠": "spades", "♣": "clubs" };
   const moveLabels = { hit: "Ещё карту", stand: "Хватит", double: "Удвоить", split: "Разделить" };
+  const motion = matchMedia("(prefers-reduced-motion: reduce)");
   let mode = "online";
   let visible = false;
   let serial = 0;
@@ -18,6 +19,7 @@
   let busy = false;
   let syncError = "";
   let actionError = "";
+  let audibleDeals = new WeakSet();
 
   function element(tag, text = "", className = "") {
     const node = document.createElement(tag);
@@ -109,6 +111,18 @@
   );
   root.replaceChildren(header, modes, felt, dock, feedback, rules);
 
+  felt.addEventListener("animationstart", (event) => {
+    if (event.animationName !== "casino-deal" && event.animationName !== "casino-turn-card") return;
+    if (!audibleDeals.delete(event.target)) return;
+    if (visible && !document.hidden && event.target.isConnected) window.GameAudio?.play("cards.deal");
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) audibleDeals = new WeakSet();
+  });
+  motion.addEventListener("change", (event) => {
+    if (event.matches) audibleDeals = new WeakSet();
+  });
+
   function cardsFor(hand, prepareCard) {
     const display = element("div", "", "casino-cards");
     for (const [index, card] of hand.cards.entries()) {
@@ -187,11 +201,19 @@
   }
 
   function animateDeal(cards, turned, playerDraws) {
-    if ((!cards.length && !turned) || document.hidden || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    if ((!cards.length && !turned) || !visible || document.hidden) return;
+    if (motion.matches) {
+      const count = cards.length + (turned ? 1 : 0);
+      for (let index = 0; index < count; index++) {
+        window.GameAudio?.play("cards.deal", index * 40);
+      }
+      return;
+    }
     const stagger = Math.min(90, 650 / Math.max(1, cards.length - 1));
     const turnDelay = playerDraws ? (playerDraws - 1) * stagger + 180 : 0;
     if (turned) {
       turned.style.setProperty("--casino-deal-delay", `${turnDelay}ms`);
+      audibleDeals.add(turned);
       turned.classList.add("casino-card--turned");
     }
     if (!cards.length) return;
@@ -203,6 +225,7 @@
       card.style.setProperty("--casino-deal-x", `${origin.left - target.left + (origin.width - target.width) / 2}px`);
       card.style.setProperty("--casino-deal-y", `${origin.top - target.top + (origin.height - target.height) / 2}px`);
       card.style.setProperty("--casino-deal-delay", `${delay}ms`);
+      audibleDeals.add(card);
       card.classList.add("casino-card--dealt");
     });
   }
@@ -359,6 +382,7 @@
 
   function selectMode(next) {
     if (mode === next) return;
+    window.GameAudio?.stopGame?.();
     mode = next;
     snapshot = null;
     syncError = actionError = "";
@@ -377,6 +401,7 @@
     },
     hide() {
       visible = false;
+      audibleDeals = new WeakSet();
       serial++;
       clearTimeout(timer);
     },

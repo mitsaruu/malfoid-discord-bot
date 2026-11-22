@@ -75,6 +75,7 @@ window.addEventListener("message", (event) => {
     }
     pending.clear();
     session = null;
+    window.GameAudio?.stopGame();
     if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
     else if (casinoViews.has(activeGame)) {
       casinoViews.get(activeGame).hide();
@@ -418,7 +419,7 @@ async function press(key) {
 }
 
 window.addEventListener("keydown", (event) => {
-  if (activeGame !== "words" || event.target?.closest?.("#game-switch, #words-retry")) return;
+  if (activeGame !== "words" || event.target?.closest?.("#game-switch, #words-retry, #game-audio")) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (!helpEl.hidden) return;
   let key = event.key.toLowerCase();
@@ -487,6 +488,7 @@ async function loadWords() {
 
 function openGame(game) {
   if (game === activeGame) return;
+  window.GameAudio?.stopGame();
   if (activeGame === "rocket") rocket?.hide();
   casinoViews.get(activeGame)?.hide();
   activeGame = game;
@@ -577,6 +579,7 @@ async function start() {
       }));
     }
     gameSwitch.hidden = false;
+    document.getElementById("game-audio").hidden = false;
     openGame(login.game === "words" ? "words" : "lobby");
     hideSplash();
     setInterval(() => {

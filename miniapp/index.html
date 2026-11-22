@@ -26,6 +26,12 @@
     <h1 tabindex="-1">Игры Malfoid</h1>
   </header>
 
+  <div class="game-audio" id="game-audio" role="group" aria-label="Звуковые эффекты" hidden>
+    <button id="game-audio-toggle" type="button" aria-label="Звуковые эффекты" aria-pressed="false">Звук</button>
+    <label for="game-audio-volume">Громкость</label>
+    <input id="game-audio-volume" type="range" min="0" max="100" value="50">
+  </div>
+
   <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru" hidden>
     <button type="button" data-game="lobby" aria-controls="game-lobby">Все игры</button>
     <button type="button" data-game="words" aria-controls="app" aria-pressed="false"><span>Слово дня</span></button>
@@ -144,6 +150,7 @@
       <button class="mode" id="help-close">Понятно</button>
     </div>
   </div>
+  <script src="static/audio.js"></script>
   <script src="static/rocket.js"></script>
   <script src="static/mines.js"></script>
   <script src="static/poker.js"></script>

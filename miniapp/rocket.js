@@ -4,8 +4,8 @@ const ROCKET_POLL_MS = 500;
 const ROCKET_RETRY_POLL_MS = 2400;
 const ROCKET_MAX_REPEAT_ROUNDS = 10;
 // These shape the chart for confirmed samples and match the Rust flight phases.
-const ROCKET_DOUBLE_MS = 6000;
-const ROCKET_CINEMATIC_DOUBLE_MS = 600;
+const ROCKET_DOUBLE_MS = 2700;
+const ROCKET_CINEMATIC_DOUBLE_MS = 250;
 const ROCKET_CRASH_EASE_MS = 160;
 const ROCKET_BURST_MS = 760;
 const ROCKET_STATUS = {

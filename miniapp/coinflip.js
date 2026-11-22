@@ -119,7 +119,10 @@
   }
 
   async function toss(result) {
-    if (motion.matches || typeof coin.animate !== "function") return;
+    let audible = !document.hidden;
+    if (audible) window.GameAudio?.play("coin.launch");
+    if (motion.matches || typeof coin.animate !== "function") return audible;
+    const silenceWhenHidden = () => { if (document.hidden) audible = false; };
     const from = snapshot?.flip?.result === "tails" ? 180 : 0;
     const to = result === "tails" ? 1620 : 1440;
     const spin = coin.animate([
@@ -129,13 +132,16 @@
       { transform: `translateY(0) rotateY(${to}deg)` },
     ], { duration: 920, easing: "ease-out", fill: "forwards" });
     animation = spin;
+    document.addEventListener("visibilitychange", silenceWhenHidden);
     try { await spin.finished; }
     catch { /* Переход на другую вкладку отменяет только анимацию. */ }
     finally {
+      document.removeEventListener("visibilitychange", silenceWhenHidden);
       coin.dataset.face = result;
       spin.cancel();
       animation = null;
     }
+    return audible;
   }
 
   form.addEventListener("submit", async (event) => {
@@ -146,9 +152,10 @@
     error = "";
     const expected = snapshot.flip?.id ?? null;
     render();
+    let audibleLanding = false;
     try {
       const state = await request("flip", { bet: bet.value, side, expected_round: expected });
-      if (visible && view === current) await toss(state.flip.result);
+      if (visible && view === current && state.flip.id !== expected) audibleLanding = await toss(state.flip.result);
       snapshot = state;
     } catch (problem) {
       snapshot = null;
@@ -161,7 +168,10 @@
       }
     } finally {
       pending = false;
-      if (visible) render();
+      if (visible) {
+        render();
+        if (audibleLanding && view === current && !document.hidden) window.GameAudio?.play("coin.land");
+      }
     }
   });
   motion.addEventListener("change", (event) => { if (event.matches) animation?.cancel(); });

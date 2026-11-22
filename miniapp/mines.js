@@ -74,6 +74,7 @@
   root.replaceChildren(header, layout, rules);
 
   let visible = false;
+  let view = 0;
   let pending = false;
   let ready = false;
   let snapshot = null;
@@ -112,7 +113,7 @@
     setText(countdown, `До авторасчёта ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`);
   }
 
-  function render(hitCell) {
+  function render(hitCell, confirmedCell) {
     const round = snapshot?.round;
     const active = round?.status === "active";
     const blocked = pending || !ready;
@@ -149,10 +150,15 @@
       const [icon, description] = tileViews[state];
       tile.disabled = blocked || !active || state !== "hidden";
       if (tile.dataset.state !== state) {
+        const newlyOpened = tile.dataset.state === "hidden";
         tile.classList.toggle("mines-tile--exploded", index === hitCell && state === "hit");
         tile.dataset.state = state;
         tile.setAttribute("aria-label", `Ряд ${Math.floor(index / 5) + 1}, клетка ${index % 5 + 1}, ${description}`);
         setText(tile, icon);
+        if (newlyOpened && index === confirmedCell && !document.hidden) {
+          if (state === "safe") window.GameAudio?.play("mines.safe");
+          else if (index === hitCell) window.GameAudio?.play("mines.blast");
+        }
       }
     }
   }
@@ -186,19 +192,21 @@
 
   async function mutate(action, fields) {
     if (!visible || pending || !ready) return;
+    const current = view;
     clearTimeout(poll);
     reading = null;
     pending = true;
     actionError = "";
     render();
     let hitCell;
+    let confirmedCell;
     try {
       const result = await request(action, fields);
-      if (action === "reveal" && result.round?.id === fields.round_id &&
-          result.round.status === "lost" && result.round.cells[fields.cell] === "hit") {
-        hitCell = fields.cell;
-      }
       accept(result);
+      if (action === "reveal" && result.round?.id === fields.round_id) {
+        confirmedCell = fields.cell;
+        if (result.round.status === "lost" && result.round.cells[confirmedCell] === "hit") hitCell = confirmedCell;
+      }
     } catch (error) {
       actionError = error.message || "Не удалось подтвердить ход.";
       ready = false;
@@ -210,7 +218,7 @@
     } finally {
       pending = false;
       if (visible) {
-        render(hitCell);
+        render(hitCell, current === view ? confirmedCell : undefined);
         schedule();
       }
     }
@@ -244,6 +252,7 @@
     },
     hide() {
       visible = false;
+      view++;
       reading = null;
       for (const tile of tiles) tile.classList.remove("mines-tile--exploded");
       clearTimeout(poll);

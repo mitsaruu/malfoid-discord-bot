@@ -41,6 +41,34 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .game-switch button[aria-pressed="true"] { color: var(--text); background: #282a34; border-color: #424553; }
 .game-switch button[data-game="lobby"] { color: #e2d6ff; border-color: #473b57; }
 .game-switch button:focus-visible, .words-retry:focus-visible { outline: 2px solid #bdb2ff; outline-offset: 2px; }
+.game-audio {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: calc(100% - 24px);
+  margin: 8px auto 0;
+  padding: 3px 8px 3px 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #18191e;
+  color: #c5c7d0;
+  font-size: .75rem;
+}
+.game-audio button {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid #434556;
+  border-radius: 6px;
+  background: #262731;
+  color: inherit;
+}
+.game-audio button[aria-pressed="true"] { color: #e2d6ff; border-color: #675785; }
+.game-audio input { width: clamp(50px, 17vw, 104px); margin: 0; accent-color: #c2aafb; }
+.game-audio input:disabled { opacity: .48; }
+.game-audio :focus-visible { outline: 2px solid #bdb2ff; outline-offset: 2px; }
 
 body[data-game="lobby"] {
   display: flow-root;
@@ -57,6 +85,7 @@ body[data-game="lobby"] {
   line-height: 1.08;
   letter-spacing: -.055em;
 }
+body[data-game="lobby"] .game-audio { margin: 0 auto 13px; }
 body[data-game="lobby"] #game-switch {
   display: grid;
   width: min(1000px, calc(100% - 32px));
@@ -111,10 +140,16 @@ body[data-game="lobby"] #game-switch button:hover { border-color: #c3b4ea; }
   body[data-game="lobby"] #game-switch { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+body[data-game="words"] {
+  display: flex;
+  flex-direction: column;
+  height: auto;
+  min-height: 100dvh;
+}
 #app {
-  max-width: 500px;
+  flex: 1;
+  width: min(100%, 500px);
   margin: 0 auto;
-  min-height: calc(100% - 57px);
   padding: 10px 12px 14px;
   display: flex;
   flex-direction: column;
@@ -178,7 +213,7 @@ h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: .04em; }
 
 /* ---------- Игроки (слева сверху) ---------- */
 .players {
-  display: flex; gap: 6px; overflow-x: auto; padding: 8px 12px 0; max-width: 500px; margin: 0 auto;
+  display: flex; gap: 6px; overflow-x: auto; padding: 8px 12px 0; max-width: min(100%, 500px); margin: 0 auto;
   scrollbar-width: none;
 }
 .players:empty { display: none; }

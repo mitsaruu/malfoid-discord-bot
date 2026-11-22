@@ -14,8 +14,10 @@ function snapshot(flight = emptyRound(), balance = 500) {
 }
 
 function flight(status, overrides = {}) {
-  const result = { id: '9223372036854775807', status, stake: 100, elapsed_ms: 0,
-    multiplier: 100, auto: null, payout: null, automatic: false, next_launch_ms: 25000, ...overrides };
+  const elapsed = overrides.elapsed_ms ?? (status === 'countdown' ? -(overrides.next_launch_ms ?? 15000) : 0);
+  const nextLaunch = status === 'countdown' ? -elapsed : 15000 - elapsed;
+  const result = { id: '9223372036854775807', status, stake: 100, elapsed_ms: elapsed,
+    multiplier: 100, auto: null, payout: null, automatic: false, next_launch_ms: nextLaunch, ...overrides };
   return {
     can_bet: status === 'countdown' && result.stake === null,
     can_cashout: status === 'flying' && result.stake !== null && result.payout === null,
@@ -205,9 +207,9 @@ test('a losing player sees the result while the shared cinematic flight continue
   const message = f.elements.get('rocket-message');
   const root = f.elements.get('rocket');
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 4800, multiplier: 174 })));
+  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 2160, multiplier: 174 })));
   assert.equal(action.getAttribute('aria-disabled'), 'false');
-  const cinematic = { elapsed_ms: 6200, multiplier: 251, cinematic_from_ms: 6000 };
+  const cinematic = { elapsed_ms: 2783, multiplier: 251, cinematic_from_ms: 2700 };
   await f.poll(snapshot(flight('flying', { ...cinematic, can_cashout: false })));
   assert.equal(action.getAttribute('aria-disabled'), 'true');
   assert.equal(message.textContent, 'Ставка проиграна');
@@ -239,10 +241,10 @@ test('countdown and crash wait have different clock labels and never open bettin
   const clock = f.elements.get('rocket-time');
   const label = f.elements.get('rocket-time-label');
   f.view.show();
-  await f.reply(f.requests[0], snapshot(emptyRound('current', 'crashed', { elapsed_ms: 3000, next_launch_ms: 5000 })));
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'crashed', { elapsed_ms: 3000 })));
   f.frame();
   assert.equal(label.textContent, 'До следующего старта');
-  assert.equal(clock.textContent, '5,0 с');
+  assert.equal(clock.textContent, '12,0 с');
   assert.equal(action.getAttribute('aria-disabled'), 'true');
   await f.poll(snapshot(emptyRound('next', 'countdown', { next_launch_ms: 240 })));
   f.frame();
@@ -289,7 +291,7 @@ test('cashout requires the server flag, uses the round ID, and is sent once whil
   await f.poll(snapshot(flight('flying', { auto: 150, can_cashout: false })));
   await f.feed.cashout();
   assert.equal(f.requests.length, 2);
-  const flying = flight('flying', { auto: 150, elapsed_ms: 4000, multiplier: 158 });
+  const flying = flight('flying', { auto: 150, elapsed_ms: 1785, multiplier: 158 });
   await f.poll(snapshot(flying));
   assert.equal(f.requests.length, 3, 'an auto target never triggers a client cashout');
   const cashout = f.feed.cashout();
@@ -412,8 +414,8 @@ test('reloading a cashed-out flight shows the fixed payout and keeps launch lock
   const payout = f.elements.get('rocket-payout');
   const liveMultiplier = f.elements.get('rocket-multiplier');
   const clock = f.elements.get('rocket-time');
-  const paid = flight('flying', { multiplier: 210, elapsed_ms: 6500, auto: 175,
-    payout: 175, cashout_multiplier: 175, automatic: true });
+  const payoutDetails = { auto: 175, payout: 175, cashout_multiplier: 175, automatic: true };
+  const paid = flight('flying', { ...payoutDetails, multiplier: 210, elapsed_ms: 2900 });
   f.view.show();
   await f.reply(f.requests[0], snapshot(paid, 575));
   assert.equal(f.settings.hidden, true);
@@ -423,10 +425,10 @@ test('reloading a cashed-out flight shows the fixed payout and keeps launch lock
   assert.equal(f.stop.hidden, true, 'reload never opts back into auto start');
   f.frame();
   f.frame(400);
-  assert.equal(clock.textContent, '6,5 с');
+  assert.equal(clock.textContent, '2,9 с');
   assert.equal(liveMultiplier.textContent, '2,10×');
 
-  await f.poll(snapshot({ ...paid, status: 'crashed', multiplier: 260, elapsed_ms: 8271 }, 575));
+  await f.poll(snapshot(flight('crashed', { ...payoutDetails, multiplier: 260, elapsed_ms: 3721 }), 575));
   f.frame();
   assert.equal(liveMultiplier.textContent, '2,60×');
   assert.equal(f.elements.get('rocket-multiplier-caption').textContent, 'Пик полёта');
@@ -602,10 +604,10 @@ for (const [name, interrupt, resume] of [
 test('animation frames move the ship and curve together without predicting through a sudden crash', async () => {
   const f = viewFixture();
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 1060, multiplier: 113 })));
+  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 480, multiplier: 113 })));
   f.frame();
   const initial = f.drawing.ship;
-  await f.poll(snapshot(flight('flying', { elapsed_ms: 1560, multiplier: 119 })));
+  await f.poll(snapshot(flight('flying', { elapsed_ms: 980, multiplier: 128 })));
   f.frame();
   assert.deepEqual(f.drawing.ship, initial);
   const readout = f.elements.get('rocket-multiplier');
@@ -615,60 +617,63 @@ test('animation frames move the ship and curve together without predicting throu
   const first = f.drawing.ship;
   assert.ok(first[0] > initial[0] && first[1] < initial[1]);
   assert.deepEqual(f.drawing.curve.at(-1), first);
-  assert.equal(readout.textContent, '1,14×', 'rounds the confirmed interpolation down');
+  assert.equal(readout.textContent, '1,16×', 'rounds the confirmed interpolation down');
   f.frame(250);
   assert.ok(f.drawing.ship[0] > first[0] && f.drawing.ship[1] < first[1]);
-  assert.equal(readout.textContent, '1,16×');
+  assert.equal(readout.textContent, '1,20×');
   f.frame(375);
-  assert.equal(readout.textContent, '1,17×');
+  assert.equal(readout.textContent, '1,24×');
   f.frame(500);
   const confirmed = f.drawing.ship;
   f.frame(900); // Delayed crash response.
   assert.deepEqual(f.drawing.ship, confirmed);
-  assert.equal(readout.textContent, '1,19×', 'a stalled poll cannot increase the coefficient');
-  await f.poll(snapshot(flight('crashed', { elapsed_ms: 1578, multiplier: 120 })));
+  assert.equal(readout.textContent, '1,28×', 'a stalled poll cannot increase the coefficient');
+  await f.poll(snapshot(flight('crashed', { elapsed_ms: 991, multiplier: 129 })));
   f.frame(500);
   assert.ok(f.drawing.marker[0] >= confirmed[0] && f.drawing.marker[1] <= confirmed[1]);
   assert.deepEqual(f.drawing.curve.at(-1), f.drawing.marker);
-  assert.equal(readout.textContent, '1,20×');
+  assert.equal(readout.textContent, '1,29×');
 });
 
 test('the live readout displays every confirmed hundredth when frames are frequent enough', async () => {
   const f = viewFixture();
   const readout = f.elements.get('rocket-multiplier');
   f.view.show();
-  await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying', { elapsed_ms: 1060, multiplier: 113 })));
+  await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying', { elapsed_ms: 480, multiplier: 113 })));
   f.frame();
-  await f.poll(snapshot(emptyRound('current', 'flying', { elapsed_ms: 1560, multiplier: 119 })));
+  await f.poll(snapshot(emptyRound('current', 'flying', { elapsed_ms: 980, multiplier: 128 })));
   const shown = new Set();
   for (let elapsed = 0; elapsed <= 528; elapsed += 16) {
     f.frame(elapsed);
     shown.add(readout.textContent);
   }
-  assert.deepEqual([...shown], ['1,13×', '1,14×', '1,15×', '1,16×', '1,17×', '1,18×', '1,19×']);
+  assert.deepEqual([...shown], [
+    '1,13×', '1,14×', '1,15×', '1,16×', '1,17×', '1,18×', '1,19×', '1,20×',
+    '1,21×', '1,22×', '1,23×', '1,24×', '1,25×', '1,26×', '1,27×', '1,28×',
+  ]);
 });
 
 test('fast cinematic frames skip unreachable hundredths while the chart advances to the confirmed sample', async () => {
   const f = viewFixture();
   const readout = f.elements.get('rocket-multiplier');
   f.view.show();
-  const cinematic = { cinematic_from_ms: 9509 };
+  const cinematic = { cinematic_from_ms: 5400 };
   await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying', {
-    ...cinematic, elapsed_ms: 13500, multiplier: 30135,
+    ...cinematic, elapsed_ms: 6850, multiplier: 22286,
   })));
   f.frame();
   await f.poll(snapshot(emptyRound('current', 'flying', {
-    ...cinematic, elapsed_ms: 14000, multiplier: 53696,
+    ...cinematic, elapsed_ms: 7350, multiplier: 89144,
   })));
   f.frame(16);
   const first = f.drawing.ship;
-  assert.equal(readout.textContent, '308,88×');
+  assert.equal(readout.textContent, '244,25×');
   f.frame(32);
-  assert.equal(readout.textContent, '316,42×');
+  assert.equal(readout.textContent, '265,64×');
   assert.ok(f.drawing.ship[0] > first[0] && f.drawing.ship[1] < first[1]);
   assert.deepEqual(f.drawing.curve.at(-1), f.drawing.ship);
   f.frame(850);
-  assert.equal(readout.textContent, '536,96×');
+  assert.equal(readout.textContent, '891,44×');
 });
 
 test('the chart doubling times match both Rust flight phases', () => {
@@ -682,19 +687,19 @@ test('the chart doubling times match both Rust flight phases', () => {
 
 test('reduced motion paints confirmed positions once and reveals the cinematic peak at crash', async () => {
   const f = viewFixture(true);
-  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 9509 };
+  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 5400 };
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 14000, multiplier: 53696 }), 600));
+  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 6850, multiplier: 22286 }), 600));
   f.frame();
   const initial = f.drawing.ship;
   assert.equal(f.hasFrame(), false);
-  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 14500, multiplier: 95675 }), 600));
+  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 7350, multiplier: 89144 }), 600));
   f.frame();
   assert.ok(f.drawing.ship[0] > initial[0] && f.drawing.ship[1] < initial[1]);
   assert.equal(f.hasFrame(), false);
-  assert.equal(f.elements.get('rocket-multiplier').textContent, '956,75×');
+  assert.equal(f.elements.get('rocket-multiplier').textContent, '891,44×');
   assert.equal(f.elements.get('rocket-action').attributes.get('aria-disabled'), 'true');
-  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 14538, multiplier: 100000 }), 600));
+  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 7391, multiplier: 100000 }), 600));
   f.frame();
   assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
   assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');
@@ -705,18 +710,18 @@ test('reduced motion paints confirmed positions once and reveals the cinematic p
 
 test('a confirmed cinematic crash reveals the peak immediately while the ship eases into the burst', async () => {
   const f = viewFixture();
-  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 9509 };
+  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 5400 };
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 13500, multiplier: 30135 }), 600));
+  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 6850, multiplier: 22286 }), 600));
   f.frame();
   const lastPaint = f.drawing.ship;
-  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 14000, multiplier: 53696 }), 600));
+  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 7350, multiplier: 89144 }), 600));
   f.frame();
   assert.deepEqual(f.drawing.ship, lastPaint);
   f.frame(480);
   const beforeCrash = f.drawing.ship;
 
-  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 14538, multiplier: 100000 }), 600));
+  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 7391, multiplier: 100000 }), 600));
   f.frame();
   assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
   assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');

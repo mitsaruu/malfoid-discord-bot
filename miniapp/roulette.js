@@ -12,6 +12,9 @@
   const launchRadius = 49;
   const trackRadius = 45.4;
   const pocketRadius = 34.2;
+  const pocketInterval = 1000;
+  const spinDuration = 2800;
+  const launchAngle = pocketAngle * .65;
   const easeOut = (progress) => 1 - (1 - progress) ** 3;
 
   function element(tag, text = "", className = "") {
@@ -58,6 +61,7 @@
   const labels = new Map();
   let selected = null;
   let visible = false;
+  let pageSuspended = false;
   let generation = 0;
   let pollTimer;
   let tickTimer;
@@ -72,8 +76,8 @@
   let rotation = 0;
   let ballAngle = 0;
   let ballRadius = trackRadius;
-  let animationFrame = 0;
-  let waiting = null;
+  let animationFrame = null;
+  let idle = null;
   let spin = null;
 
   function addCell(key, label, column, row, mobileColumn, mobileRow, color = "", type = "group") {
@@ -238,6 +242,7 @@
   }
 
   function rotateWheel(angle) {
+    if (angle === rotation) return;
     rotation = angle;
     wheel.style.transform = "rotate(" + angle + "deg)";
   }
@@ -252,97 +257,130 @@
     ball.hidden = false;
   }
 
-  function clearMotion() {
-    cancelAnimationFrame(animationFrame);
-    animationFrame = 0;
-    waiting = null;
-    spin = null;
+  function canAnimate() {
+    return visible && !pageSuspended && !document.hidden;
+  }
+
+  function pauseWheel() {
+    if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+    idle = null;
+  }
+
+  function startIdleWheel() {
+    if (!canAnimate() || spin || animationFrame !== null) return;
+    idle = { startedAt: performance.now(), from: rotation, pocket: 0 };
+    animationFrame = requestAnimationFrame(animateWheel);
   }
 
   function winningRotation(result) {
     return (360 - wheelOrder.indexOf(result.number) * pocketAngle) % 360;
   }
 
-  function finishResult(result) {
-    clearMotion();
-    if (result.number === null) {
-      ball.hidden = true;
-    } else {
-      rotateWheel(winningRotation(result));
-      placeBall(0, pocketRadius);
-    }
+  function finishResult(result, audible) {
+    pauseWheel();
+    spin = null;
+    rotateWheel(winningRotation(result));
+    placeBall(0, pocketRadius);
     displayResult(result);
+    if (audible) window.GameAudio?.play?.("roulette.land");
+    startIdleWheel();
   }
 
-  function syncWaitingBall() {
-    if (spin) return;
-    const round = state?.round;
-    if (visible && round && !round.refunding && !reduceMotion.matches) {
-      if (waiting?.id === round.id) return;
-      clearMotion();
-      waiting = { id: round.id, startedAt: performance.now() };
-      placeBall(pocketAngle * .65, launchRadius);
-      animationFrame = requestAnimationFrame(animateBall);
-      return;
-    }
-    clearMotion();
-    if (!round && shownResult?.number != null) placeBall(0, pocketRadius);
-    else ball.hidden = true;
-  }
-
-  function animateBall(now) {
-    animationFrame = 0;
+  function suspendMotion() {
+    pauseWheel();
     if (spin) {
-      const { result, startedAt, from, to, startAngle, endAngle, startRadius } = spin;
-      const progress = Math.min(1, Math.max(0, now - startedAt) / 2800);
+      finishResult(spin.result, false);
+      render();
+    }
+  }
+
+  function animateWheel(now) {
+    animationFrame = null;
+    if (!canAnimate()) return;
+    if (spin) {
+      const { result, startedAt, from, to } = spin;
+      const progress = Math.min(1, Math.max(0, now - startedAt) / spinDuration);
       if (progress === 1) {
-        finishResult(result);
-        syncWaitingBall();
+        finishResult(result, true);
         render();
         return;
       }
       const turn = easeOut(progress);
+      const launch = easeOut(Math.min(1, progress / .11));
       const drop = Math.max(0, (progress - .82) / .18) ** 2;
       rotateWheel(from + (to - from) * turn);
-      placeBall(startAngle + (endAngle - startAngle) * turn, startRadius + (pocketRadius - startRadius) * drop);
-    } else if (waiting) {
-      const elapsed = Math.max(0, now - waiting.startedAt);
-      const launch = easeOut(Math.min(1, elapsed / 300));
-      const pocket = Math.floor(elapsed / 1000);
-      const step = easeOut(Math.max(0, (elapsed % 1000 - 760) / 240));
-      placeBall((.65 * (1 - launch) - pocket - step) * pocketAngle,
-        launchRadius + (trackRadius - launchRadius) * launch);
+      placeBall(launchAngle + (-3 * 360 - launchAngle) * turn,
+        launchRadius + (trackRadius - launchRadius) * launch + (pocketRadius - trackRadius) * drop);
     } else {
-      return;
+      const elapsed = Math.max(0, now - idle.startedAt);
+      const position = elapsed / pocketInterval;
+      const pocket = Math.floor(position);
+      const angle = idle.from + (reduceMotion.matches ? pocket : position) * pocketAngle;
+      rotateWheel(angle);
+      if (pocket > idle.pocket) {
+        ball.hidden = true;
+        window.GameAudio?.play?.("roulette.tick");
+      }
+      if (!ball.hidden) placeBall(angle - winningRotation(shownResult), pocketRadius);
+      idle.pocket = pocket;
     }
-    animationFrame = requestAnimationFrame(animateBall);
+    animationFrame = requestAnimationFrame(animateWheel);
   }
 
-  function updateResult(result, animate) {
+  function updateResult(result, live) {
     if (!result || result.id === shownResult?.id || result.id === spin?.result.id) return;
-    if (result.number === null || !animate || reduceMotion.matches) {
-      finishResult(result);
+    if (result.number === null || !live) {
+      if (spin) {
+        pauseWheel();
+        spin = null;
+        startIdleWheel();
+      }
+      ball.hidden = true;
+      displayResult(result);
       return;
     }
-    clearMotion();
-    const from = rotation % 360;
-    const to = from + (winningRotation(result) - from + 360) % 360 + 3 * 360;
-    const startAngle = ball.hidden ? 0 : ballAngle % 360;
-    const startRadius = ball.hidden ? trackRadius : ballRadius;
-    const endAngle = (Math.ceil(startAngle / 360) - 3) * 360;
-    spin = { result, startedAt: performance.now(), from, to, startAngle, endAngle, startRadius };
+    if (!canAnimate() || reduceMotion.matches) {
+      finishResult(result, canAnimate());
+      return;
+    }
+    // Rotation is the last angle written to the canvas, including a partial idle step.
+    pauseWheel();
+    const from = rotation;
+    const to = from + (winningRotation(result) - from % 360 + 360) % 360 + 3 * 360;
+    placeBall(launchAngle, launchRadius);
+    window.GameAudio?.play?.("roulette.launch");
+    spin = { result, startedAt: performance.now(), from, to };
     resultLabel.textContent = "Колесо вращается";
     resultNumber.textContent = "—";
     delete resultNumber.dataset.tone;
     results.hidden = true;
-    animationFrame = requestAnimationFrame(animateBall);
+    animationFrame = requestAnimationFrame(animateWheel);
   }
 
   reduceMotion.addEventListener("change", () => {
-    if (!visible) return;
-    if (reduceMotion.matches && spin) finishResult(spin.result);
-    syncWaitingBall();
-    render();
+    if (!canAnimate()) return;
+    if (spin) {
+      if (reduceMotion.matches) {
+        finishResult(spin.result, true);
+        render();
+      }
+    } else {
+      pauseWheel();
+      startIdleWheel();
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) suspendMotion();
+    else startIdleWheel();
+  });
+  window.addEventListener("pagehide", () => {
+    pageSuspended = true;
+    suspendMotion();
+  });
+  window.addEventListener("pageshow", () => {
+    pageSuspended = false;
+    startIdleWheel();
   });
 
   function renderFeedback() {
@@ -413,7 +451,6 @@
     closesAt = performance.now() + (data.round?.remaining_ms ?? 0);
     syncError = "";
     updateResult(data.last_result, data.last_result?.id === openRound);
-    syncWaitingBall();
     if (pending) {
       const source = [data.round, data.last_result].find((round) => round?.id === pending.round_id);
       const receipt = source?.your_bets.find((bet) => bet.request_id === pending.request_id);
@@ -492,6 +529,7 @@
       if (visible) return;
       visible = true;
       render();
+      startIdleWheel();
       tickTimer = setInterval(tick, 120);
       void refresh();
     },
@@ -500,8 +538,7 @@
       generation++;
       clearTimeout(pollTimer);
       clearInterval(tickTimer);
-      if (spin) finishResult(spin.result);
-      else clearMotion();
+      suspendMotion();
       ball.hidden = true;
       state = null;
       syncError = "";

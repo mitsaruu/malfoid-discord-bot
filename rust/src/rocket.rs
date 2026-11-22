@@ -11,14 +11,14 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::{sync::Notify, time::Instant};
 
-const ROUND_PERIOD: Duration = Duration::from_secs(30);
+const ROUND_PERIOD: Duration = Duration::from_secs(15);
 const CRASH_HOLD: Duration = Duration::from_millis(900);
 const REFUND_RETRY: Duration = Duration::from_secs(2);
 const RECEIPT_WINDOW: Duration = Duration::from_secs(12 * 3600);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const MAX_WAGER_CRASH: u32 = 1000;
-const DOUBLE_SECONDS: f64 = 6.0;
-const CINEMATIC_DOUBLE_SECONDS: f64 = 0.6;
+const DOUBLE_SECONDS: f64 = 2.7;
+const CINEMATIC_DOUBLE_SECONDS: f64 = 0.25;
 const ACTIVITY_ID: u64 = 1 << 63;
 
 type Player = (u64, u64); // сервер, игрок
@@ -243,9 +243,10 @@ impl Round {
             (at - self.launch).as_millis() as i64
         };
         let outcome = wager.map(|wager| wager.outcome);
-        let cinematic_elapsed = (self.end_multiplier() > self.crash_at)
-            .then(|| at.checked_duration_since(wager_crash))
-            .flatten();
+        // Instant can tolerate tiny reversed durations on Windows. The displayed
+        // phase and cashout gate must both use the same exact deadline comparison.
+        let cinematic_elapsed = (self.end_multiplier() > self.crash_at && at >= wager_crash)
+            .then(|| at - wager_crash);
         let (status, multiplier) = match cinematic_elapsed {
             _ if countdown => ("countdown", 100),
             _ if now >= display_crash => ("crashed", self.end_multiplier()),
@@ -567,7 +568,9 @@ mod tests {
         assert_eq!(first["flight"]["cinematic_from_ms"], Value::Null);
         assert_eq!(first["flight"]["can_bet"], true);
         assert_eq!(first["flight"]["can_cashout"], false);
-        assert!((1..=30_000).contains(&first["flight"]["next_launch_ms"].as_u64().unwrap()));
+        let next_launch_ms = first["flight"]["next_launch_ms"].as_i64().unwrap();
+        assert!((1..=15_000).contains(&next_launch_ms));
+        assert_eq!(first["flight"]["elapsed_ms"], -next_launch_ms);
     }
 
     #[test]
@@ -658,7 +661,7 @@ mod tests {
             assert_eq!(flight["id"], id.to_string());
             assert_eq!(flight["status"], "flying");
             assert_eq!(flight["multiplier"], 399);
-            assert_eq!(flight["next_launch_ms"], 18_001);
+            assert_eq!(flight["next_launch_ms"], 9_601);
             assert_eq!(flight["cinematic_from_ms"], Value::Null);
             assert!(flight.get("crash_at").is_none());
             assert!(flight.get("cinematic_peak").is_none());
@@ -671,18 +674,18 @@ mod tests {
         for player in [PILOT, OTHER, SPECTATOR] {
             let flight = game.snapshot(player, real_crash);
             assert_eq!(flight["multiplier"], 400);
-            assert_eq!(flight["cinematic_from_ms"], 12_000);
+            assert_eq!(flight["cinematic_from_ms"], 5_400);
             assert_eq!(flight["can_cashout"], false);
         }
-        let during = real_crash + Duration::from_millis(600);
+        let during = real_crash + Duration::from_millis(250);
         game.advance(&data, during);
         for player in [PILOT, OTHER, (1, 5), SPECTATOR] {
             let flight = game.snapshot(player, during);
             assert_eq!(flight["id"], id.to_string());
             assert_eq!(flight["status"], "flying");
             assert_eq!(flight["multiplier"], 800);
-            assert_eq!(flight["cinematic_from_ms"], 12_000);
-            assert_eq!(flight["next_launch_ms"], 17_400);
+            assert_eq!(flight["cinematic_from_ms"], 5_400);
+            assert_eq!(flight["next_launch_ms"], 9_350);
             assert_eq!(flight["can_bet"], false);
             assert_eq!(flight["can_cashout"], false);
         }
@@ -705,7 +708,7 @@ mod tests {
             let flight = game.snapshot(player, end);
             assert_eq!(flight["status"], "crashed");
             assert_eq!(flight["multiplier"], 100_000);
-            assert_eq!(flight["cinematic_from_ms"], 12_000);
+            assert_eq!(flight["cinematic_from_ms"], 5_400);
         }
         let hold_end = end + CRASH_HOLD;
         game.advance(&data, hold_end - Duration::from_nanos(1));
@@ -726,14 +729,14 @@ mod tests {
         bet(&data, OTHER, id, None);
         set_round(
             &data,
-            Instant::now() - Duration::from_millis(12_600),
+            Instant::now() - Duration::from_millis(5_650),
             400,
             Some(100_000),
         );
 
         let late = cash_out(&data, OTHER, id).unwrap().unwrap();
         assert_eq!(late["flight"]["status"], "flying");
-        assert_eq!(late["flight"]["cinematic_from_ms"], 12_000);
+        assert_eq!(late["flight"]["cinematic_from_ms"], 5_400);
         assert_eq!(late["flight"]["payout"], Value::Null);
         assert_eq!(late["flight"]["can_cashout"], false);
         assert_eq!(late["balance"], 400);
@@ -748,7 +751,7 @@ mod tests {
         set_round(&data, Instant::now() - Duration::from_secs(1), 300, None);
         let paid = cash_out(&data, PILOT, id).unwrap().unwrap();
 
-        set_round(&data, Instant::now() - Duration::from_secs(14), 300, None);
+        set_round(&data, Instant::now() - Duration::from_secs(6), 300, None);
         let current = read(&data, PILOT).unwrap();
         assert_eq!(current["flight"]["id"], (id + 1).to_string());
         assert_eq!(current["flight"]["stake"], Value::Null);
@@ -785,11 +788,11 @@ mod tests {
         bet(&data, PILOT, id, Some("1.50"));
         bet(&data, OTHER, id, Some("2.00"));
         let mut game = data.rocket.game();
-        let after = launch + ROUND_PERIOD * 3;
+        let after = launch + Duration::from_secs(45);
         game.advance(&data, after);
         assert_eq!(game.round.id, id + 3);
         assert_eq!(game.round.launch, after);
-        assert_eq!(game.snapshot(PILOT, after)["next_launch_ms"], 30_000);
+        assert_eq!(game.snapshot(PILOT, after)["next_launch_ms"], 15_000);
         assert_eq!(balance(&data, PILOT), 550);
         assert_eq!(balance(&data, OTHER), 400);
         assert_eq!(game.receipts.len(), 1);
@@ -810,7 +813,7 @@ mod tests {
 
         set_round(
             &data,
-            Instant::now() - Duration::from_secs(8),
+            Instant::now() - Duration::from_millis(3_600),
             300,
             Some(100_000),
         );
@@ -863,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn cinematic_bands_have_exact_odds_and_leave_at_least_five_seconds_to_bet() {
+    fn cinematic_bands_have_exact_odds() {
         let mut rng = StdRng::seed_from_u64(42);
         let mut peaks = [HashSet::new(), HashSet::new()];
         let mut counts = [0, 0];
@@ -882,18 +885,30 @@ mod tests {
         }
         assert_eq!(counts, [90, 10]);
         assert!(peaks.iter().all(|band| band.len() > 1));
+    }
 
+    #[test]
+    fn longest_flight_and_crash_hold_leave_exact_betting_window() {
         let launch = Instant::now();
-        for crash_at in 100..=MAX_WAGER_CRASH {
-            let round = Round {
+        let longest_flight = (100..=MAX_WAGER_CRASH)
+            // Both bands are bounded by 1200×, and flight time increases with the peak.
+            .map(|crash_at| Round {
                 id: 1,
                 launch,
                 crash_at,
                 cinematic_peak: Some(120_000),
                 has_paid: true,
-            };
-            assert!(round.display_crash() + CRASH_HOLD <= launch + Duration::from_secs(25));
-        }
+            })
+            .map(|round| round.display_crash() - launch)
+            .max()
+            .unwrap();
+        let period = Duration::from_secs(15);
+        assert_eq!(ROUND_PERIOD, period);
+        assert_eq!(longest_flight, Duration::from_nanos(10_695_928_505));
+        assert_eq!(
+            period - longest_flight - CRASH_HOLD,
+            Duration::from_nanos(3_404_071_495)
+        );
     }
 
     async fn eventually(check: impl Fn() -> bool) {
@@ -915,7 +930,7 @@ mod tests {
         // Inspect the stored clock without calling read, which could advance it itself.
         eventually(|| data.rocket.game().round.id == id + 1).await;
         let game = data.rocket.game();
-        assert_eq!(game.round.launch, launch + ROUND_PERIOD);
+        assert_eq!(game.round.launch, launch + Duration::from_secs(15));
         assert!(game.wagers.is_empty());
         assert!(game.receipts.is_empty());
     }

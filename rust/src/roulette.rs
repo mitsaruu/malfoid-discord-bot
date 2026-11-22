@@ -446,6 +446,7 @@ mod tests {
         state: State,
         db: crate::db::Database,
         now: Instant,
+        minimum: i64,
     }
 
     impl Fixture {
@@ -454,6 +455,7 @@ mod tests {
                 state: State::default(),
                 db: crate::db::Database::in_memory().unwrap(),
                 now: Instant::now(),
+                minimum: 10,
             }
         }
 
@@ -467,13 +469,57 @@ mod tests {
                         name: "Игрок",
                         start: 500,
                     },
-                    10,
+                    self.minimum,
                     action,
                     &body,
                     || self.now + Duration::from_secs(seconds),
                 )
                 .unwrap()
                 .unwrap()
+        }
+    }
+
+    #[test]
+    fn one_coin_opens_a_round_and_settles_once() {
+        let f = Fixture { minimum: 1, ..Fixture::new() };
+        let idle = f.call(1, 0, "state", json!({}));
+        let body = json!({
+            "round_id": idle["round_id"], "request_id": "one", "bet": "1", "space": "0",
+        });
+        let placed = f.call(1, 0, "bet", body.clone());
+        assert!(placed["bet_error"].is_null());
+        assert_eq!(placed["min_bet"], 1);
+        assert_eq!(placed["balance"], 499);
+        assert_eq!(placed["round"]["remaining_ms"], 15000);
+        assert_eq!(placed["round"]["your_bets"][0]["amount"], 1);
+        let retry = f.call(1, 1, "bet", body.clone());
+        assert_eq!(retry["round"]["bet_count"], 1);
+        assert_eq!(retry["balance"], 499);
+        assert_eq!(retry["round"]["remaining_ms"], 14000);
+
+        let settled = f.call(1, 15, "bet", body);
+        let number = settled["last_result"]["number"].as_u64().unwrap();
+        assert!(settled["bet_error"].is_null());
+        assert!(settled["round"].is_null());
+        assert_eq!(settled["balance"], if number == 0 { 535 } else { 499 });
+        assert_eq!(
+            settled["last_result"]["players"][0]["net"],
+            if number == 0 { 35 } else { -1 },
+        );
+    }
+
+    #[test]
+    fn wagers_below_one_do_not_open_a_round() {
+        let f = Fixture { minimum: 1, ..Fixture::new() };
+        let idle = f.call(1, 0, "state", json!({}));
+        for bet in ["0", "-1"] {
+            let rejected = f.call(1, 0, "bet", json!({
+                "round_id": idle["round_id"], "request_id": bet, "bet": bet, "space": "red",
+            }));
+            assert!(rejected["bet_error"].is_string());
+            assert_eq!(rejected["balance"], 500);
+            assert_eq!(rejected["round_id"], idle["round_id"]);
+            assert!(rejected["round"].is_null());
         }
     }
 
