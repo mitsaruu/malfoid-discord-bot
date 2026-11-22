@@ -52,15 +52,19 @@ const wordsRetry = document.getElementById("words-retry");
 
 // ---------- Связь с Discord (минимальный Embedded App SDK) ----------
 const OP = { HANDSHAKE: 0, FRAME: 1, CLOSE: 2, HELLO: 3 };
+// Handshake compatibility with the Discord Embedded App SDK 2.5 protocol.
+const EMBEDDED_SDK_VERSION = "2.5.0";
+const MOBILE_SDK_VERSION_MINIMUM = 250;
 const discordWindow = window.parent.opener || window.parent;
 // Match Discord's production Activity origins, including its opaque native bridge.
 const discordOrigins = new Set([
   "https://discord.com", "https://discordapp.com", "https://ptb.discord.com",
   "https://ptb.discordapp.com", "https://canary.discord.com", "https://canary.discordapp.com",
-  "https://staging.discord.co", "https://pax.discord.com", "null",
+  "https://staging.discord.co", "https://pax.discord.com", location.origin, "null",
 ]);
 const referrerOrigin = document.referrer ? new URL(document.referrer).origin : null;
-let discordOrigin = discordOrigins.has(referrerOrigin) ? referrerOrigin : "*";
+const handshakeTarget = referrerOrigin !== "null" && discordOrigins.has(referrerOrigin) ? referrerOrigin : "*";
+let discordOrigin = "*";
 const pending = new Map();
 let onReady = null;
 
@@ -127,16 +131,21 @@ function connectToDiscord(clientId) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       onReady = null;
-      reject(new Error("Discord не ответил"));
+      reject(new Error("Discord не подтвердил запуск Activity. Закрой игру и снова вызови /games."));
     }, 15000);
     onReady = () => {
       clearTimeout(timer);
       onReady = null;
       resolve();
     };
-    discordWindow.postMessage([OP.HANDSHAKE, {
+    const handshake = {
       v: 1, encoding: "json", client_id: clientId, frame_id: params.get("frame_id"),
-    }], discordOrigin);
+    };
+    const mobileVersion = Number.parseInt(params.get("mobile_app_version"), 10);
+    if (params.get("platform") === "desktop" || mobileVersion >= MOBILE_SDK_VERSION_MINIMUM) {
+      handshake.sdk_version = EMBEDDED_SDK_VERSION;
+    }
+    discordWindow.postMessage([OP.HANDSHAKE, handshake], handshakeTarget);
   });
 }
 
@@ -593,7 +602,8 @@ async function start() {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
       }));
     }
-    document.getElementById("activity-shell").hidden = false;
+    gameSwitch.hidden = false;
+    document.getElementById("game-audio").hidden = false;
     openGame(login.game === "words" ? "words" : "lobby");
     hideSplash();
     setInterval(() => {

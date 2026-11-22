@@ -8,6 +8,26 @@ const assert = require('node:assert/strict');
 const app = readFileSync(join(__dirname, '../../miniapp/app.js'), 'utf8');
 const polling = app.slice(app.indexOf('let refreshingPlayers = false;'), app.indexOf('// ---------- Справка ----------'));
 
+test('a cached page without the new shell can still finish opening the lobby', async () => {
+  const gameSwitch = { hidden: true };
+  const audio = { hidden: true };
+  const calls = [];
+  const context = vm.createContext({
+    gameSwitch, document: { getElementById: id => id === 'game-audio' ? audio : null },
+    params: new Map([['frame_id', 'frame']]), crypto: { randomUUID: () => 'nonce' },
+    buildBoard() {}, setLanguage() {}, loading() {}, setInterval() {}, connectToDiscord() {},
+    async discordCommand() { return { code: 'code' }; },
+    async api() { return { session: 'session' }; },
+    loadingFailed(message) { calls.push(message); }, openGame(game) { calls.push(game); },
+    hideSplash() { calls.push('loaded'); }, session: null,
+  });
+  const start = app.slice(app.indexOf('async function start()'), app.lastIndexOf('\nstart();'));
+  await vm.runInContext(`${start}\nstart();`, context);
+  assert.deepEqual(calls, ['lobby', 'loaded']);
+  assert.equal(gameSwitch.hidden, false);
+  assert.equal(audio.hidden, false);
+});
+
 test('an unanswered Discord command times out and removes its waiter', async () => {
   let timer;
   const context = vm.createContext({
@@ -22,6 +42,32 @@ test('an unanswered Discord command times out and removes its waiter', async () 
   await assert.rejects(result, /Discord не ответил/);
   assert.equal(context.pending.size, 0);
 });
+
+for (const [platform, version, expectedSdk] of [
+  ['mobile', '250.1', '2.5.0'], ['mobile', '249.1', undefined], ['desktop', null, '2.5.0'],
+]) {
+  test(`Discord handshake supports ${platform} ${version ?? ''} and receives READY from its bridge`, async () => {
+    let receive;
+    const sent = [];
+    const parent = { postMessage: (data, origin) => sent.push({ data, origin }) };
+    const context = vm.createContext({
+      URL, window: { parent, addEventListener: (_, listener) => { receive = listener; } },
+      location: { origin: 'https://123.discordsays.com' }, document: { referrer: 'https://discord.com/' },
+      params: new Map([['platform', platform], ['mobile_app_version', version], ['frame_id', 'frame']]),
+      setTimeout: () => 1, clearTimeout() {},
+    });
+    vm.runInContext(app.slice(app.indexOf('const OP ='), app.indexOf('// ---------- Запросы к серверу бота')), context);
+    const connected = vm.runInContext('connectToDiscord("123")', context);
+    assert.equal(sent[0].data[1].sdk_version, expectedSdk);
+    const ready = [1, { cmd: 'DISPATCH', evt: 'READY' }];
+    receive({ source: {}, origin: 'https://discord.com', data: ready });
+    assert.equal(vm.runInContext('onReady !== null', context), true);
+    const origin = platform === 'mobile' ? 'null' : 'https://discord.com';
+    receive({ source: parent, origin, data: ready });
+    assert.equal(vm.runInContext('onReady', context), null);
+    await connected;
+  });
+}
 function fixture(api) {
   const calls = [];
   const context = vm.createContext({

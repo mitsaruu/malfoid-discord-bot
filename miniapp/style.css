@@ -35,6 +35,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 [hidden] { display: none !important; }
 
 /* ---------- Навигация и каталог ---------- */
+body:not([data-game]) .activity-shell { display: none; }
 .activity-shell {
   display: grid;
   grid-template-columns: 196px minmax(0, 1fr);
