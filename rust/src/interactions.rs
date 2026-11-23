@@ -28,7 +28,7 @@ fn defer_privately(command: &str) -> Option<bool> {
         return None;
     }
     Some(matches!(command,
-        "help" | "status" | "admin_money" | "music_channel" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
+        "help" | "status" | "music_channel" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
         "patchnotes" | "patchnotes_channel" | "log_channel" | "shop_add" | "shop_remove" | "daily_test"
         | "warns" | "warns_clear"
     ))
@@ -86,7 +86,6 @@ mod tests {
     fn activity_and_private_commands_keep_their_response_type() {
         assert_eq!(defer_privately("games"), None);
         assert_eq!(defer_privately("warns"), Some(true));
-        assert_eq!(defer_privately("admin_money"), Some(true));
         assert_eq!(defer_privately("favorites"), Some(true));
         assert_eq!(defer_privately("history"), Some(true));
         assert_eq!(defer_privately("remind"), Some(true));

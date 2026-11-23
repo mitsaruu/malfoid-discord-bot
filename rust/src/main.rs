@@ -231,9 +231,7 @@ async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
                 let reply = poise::CreateReply::default().content("😵 Что-то пошло не так. Ошибка записана в консоль.").ephemeral(true);
                 let _ = ctx.send(reply).await;
             }
-            if ctx.command().name != "admin_money" {
-                admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
-            }
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
         }
         poise::FrameworkError::ArgumentParse { ctx, .. } => {
             // Например, Discord прислал параметры в другом виде (команды зарегистрированы другой версией бота)
@@ -242,9 +240,7 @@ async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
             let place = format!("параметры команды /{}", ctx.command().name);
             let text = "😵 Не поняла параметры команды. Если команды только что обновились — перезапусти Discord (Ctrl+R).";
             let _ = ctx.send(poise::CreateReply::default().content(text).ephemeral(true)).await;
-            if ctx.command().name != "admin_money" {
-                admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
-            }
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), &place, &details).await;
         }
         poise::FrameworkError::CommandCheckFailed { error: Some(error), ctx, .. } => {
             let details = interactions::sanitize_error(&format!("{}: {error:?}", interactions::error_context(ctx)));
@@ -252,9 +248,7 @@ async fn on_error(error: poise::FrameworkError<'_, Shared, Error>) {
             if !interactions::is_expired(&error) {
                 let _ = ctx.send(poise::CreateReply::default().content("😵 Не получилось выполнить проверку команды.").ephemeral(true)).await;
             }
-            if ctx.command().name != "admin_money" {
-                admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), "проверка команды", &details).await;
-            }
+            admin::report_error(ctx.http(), ctx.data(), ctx.guild_id(), "проверка команды", &details).await;
         }
         other => {
             println!("Ошибка: {}", interactions::sanitize_error(&other.to_string()));
@@ -356,7 +350,6 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         patchnotes::show(),
         patchnotes::set_channel(),
         admin::set_games_channel(),
-        admin::admin_money(),
         admin::set_log_channel(),
         admin::show_warns(),
         admin::warns_clear(),
@@ -619,7 +612,7 @@ mod tests {
         assert_eq!(names.len(), list.len());
         let games = list.iter().find(|c| c["name"] == "games").unwrap();
         assert!(games["options"].as_array().is_none_or(Vec::is_empty));
-        for retired in ["slovo", "wort", "words", "rocket", "slots", "roulette"] {
+        for retired in ["slovo", "wort", "words", "rocket", "slots", "roulette", "admin_money"] {
             assert!(!names.contains(retired));
         }
         assert!(!names.contains("welcome_channel"));
@@ -627,12 +620,12 @@ mod tests {
         assert!(names.contains("coinflip") && names.contains("blackjack"));
         #[cfg(feature = "voice")]
         {
-            assert_eq!(names.len(), 77);
+            assert_eq!(names.len(), 76);
             assert!(names.contains("favorites") && names.contains("history"));
         }
         #[cfg(not(feature = "voice"))]
         {
-            assert_eq!(names.len(), 56);
+            assert_eq!(names.len(), 55);
             assert!(!names.contains("favorites") && !names.contains("history"));
         }
     }
@@ -640,18 +633,14 @@ mod tests {
     /// Список команд для Discord собирается в JSON, который принимает массовое обновление (PUT).
     #[test]
     fn command_payload() {
-        let commands = vec![super::economy::coinflip(), super::admin::set_games_channel(), super::admin::admin_money()];
-        assert!(commands[2].ephemeral && commands[2].guild_only);
-        assert_eq!(commands[2].required_permissions, super::serenity::Permissions::ADMINISTRATOR);
+        let commands = vec![super::economy::coinflip(), super::admin::set_games_channel()];
         let payload = serde_json::to_value(poise::builtins::create_application_commands(&commands)).unwrap();
         let list = payload.as_array().unwrap();
-        assert_eq!(list.len(), 3);
+        assert_eq!(list.len(), 2);
         assert_eq!(list[0]["name"], "coinflip");
         assert_eq!(list[0]["options"].as_array().unwrap().len(), 2);
         assert_eq!(list[1]["name"], "games_channel");
         assert_eq!(list[1]["default_member_permissions"], "32"); // Manage Server
-        assert_eq!(list[2]["default_member_permissions"], "8"); // Administrator
-        assert_eq!(list[2]["options"][0]["min_value"], 1);
     }
 
     #[test]
