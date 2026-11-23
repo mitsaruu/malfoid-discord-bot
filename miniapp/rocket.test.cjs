@@ -15,7 +15,7 @@ function snapshot(flight = emptyRound(), balance = 500) {
 
 function flight(status, overrides = {}) {
   const elapsed = overrides.elapsed_ms ?? (status === 'countdown' ? -(overrides.next_launch_ms ?? 15000) : 0);
-  const nextLaunch = status === 'countdown' ? -elapsed : 15000 - elapsed;
+  const nextLaunch = status === 'countdown' ? -elapsed : Math.max(0, 15000 - elapsed);
   const result = { id: '9223372036854775807', status, stake: 100, elapsed_ms: elapsed,
     multiplier: 100, auto: null, payout: null, automatic: false, next_launch_ms: nextLaunch, ...overrides };
   return {
@@ -104,6 +104,7 @@ function viewFixture(reducedMotion = false) {
     removeAttribute(name) { this.attributes.delete(name); }
     focus() { this.focused = true; }
     append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = children; }
     insertBefore(child, reference) { this.children.splice(this.children.indexOf(reference), 0, child); }
     getContext() { return canvas; }
   }
@@ -404,23 +405,29 @@ test('opening a new scheduled countdown preserves the unsubmitted AutoBet draft'
   assert.deepEqual(f.starts(), [], 'editing the draft does not opt in');
 });
 
-test('a losing player sees the result while the shared cinematic flight continues', async () => {
+test('cashout is available during the opening grace and a loss only appears after the server ends the flight', async () => {
   const f = viewFixture();
   const action = f.elements.get('rocket-action');
   const message = f.elements.get('rocket-message');
-  const root = f.elements.get('rocket');
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 2160, multiplier: 174 })));
+  await f.reply(f.requests[0], snapshot(flight('flying', { elapsed_ms: 200, multiplier: 100 })));
   assert.equal(action.getAttribute('aria-disabled'), 'false');
-  const cinematic = { elapsed_ms: 2783, multiplier: 251, cinematic_from_ms: 2700 };
-  await f.poll(snapshot(flight('flying', { ...cinematic, can_cashout: false })));
+  assert.equal(action.textContent, 'Вывести');
+  await f.poll(snapshot(flight('crashed', { elapsed_ms: 1200, multiplier: 100, final_multiplier: 100 })));
   assert.equal(action.getAttribute('aria-disabled'), 'true');
   assert.equal(message.textContent, 'Ставка проиграна');
-  assert.equal(root.dataset.phase, 'flying');
-  assert.equal(root.dataset.cinematic, 'true');
-  await f.poll(snapshot(emptyRound('current', 'flying', cinematic)));
-  assert.equal(root.dataset.cinematic, 'true');
-  assert.match(message.textContent, /Ставки откроются/);
+  assert.equal(f.elements.get('rocket-final').textContent, '1,00×');
+});
+
+test('a player with a confirmed wager polls at launch without waiting for the normal interval', async () => {
+  const f = fixture();
+  f.feed.show();
+  await f.reply(f.requests[0], snapshot(flight('countdown', { next_launch_ms: 125 })));
+  assert.equal(f.tick(), 125);
+  assert.equal(f.requests.at(-1).path, 'api/rocket/state');
+  await f.reply(f.requests.at(-1), snapshot(flight('flying', { elapsed_ms: 25, multiplier: 100 })));
+  f.feed.cashout();
+  assert.equal(f.requests.at(-1).path, 'api/rocket/cashout');
 });
 
 test('a confirmed loss stays visible after a cashout response is lost', async () => {
@@ -432,7 +439,7 @@ test('a confirmed loss stays visible after a cashout response is lost', async ()
   assert.equal(cashout.path, 'api/rocket/cashout');
   cashout.reject(new TypeError('network error'));
   await new Promise(setImmediate);
-  await f.reply(f.requests.at(-1), snapshot(flight('flying', { can_cashout: false })));
+  await f.reply(f.requests.at(-1), snapshot(flight('crashed', { can_cashout: false, final_multiplier: 100 })));
   const message = f.elements.get('rocket-message').textContent;
   assert.match(message, /Ставка проиграна/);
   assert.match(message, /Ответ на запрос потерян/);
@@ -634,7 +641,7 @@ test('reloading a cashed-out flight shows the fixed payout and keeps launch lock
   await f.poll(snapshot(flight('crashed', { ...payoutDetails, multiplier: 260, elapsed_ms: 3721 }), 575));
   f.frame();
   assert.equal(liveMultiplier.textContent, '2,60×');
-  assert.equal(f.elements.get('rocket-multiplier-caption').textContent, 'Пик полёта');
+  assert.equal(f.elements.get('rocket-multiplier-caption').textContent, 'Итог полёта');
   assert.equal(action.attributes.get('aria-disabled'), 'true');
   assert.match(payoutLabel.textContent, /1,75×/);
   assert.equal(payout.textContent, '175 мон.');
@@ -856,53 +863,51 @@ test('the live readout displays every confirmed hundredth when frames are freque
   ]);
 });
 
-test('fast cinematic frames skip unreachable hundredths while the chart advances to the confirmed sample', async () => {
-  const f = viewFixture();
-  const readout = f.elements.get('rocket-multiplier');
-  f.view.show();
-  const cinematic = { cinematic_from_ms: 5400 };
-  await f.reply(f.requests[0], snapshot(emptyRound('current', 'flying', {
-    ...cinematic, elapsed_ms: 6850, multiplier: 22286,
-  })));
-  f.frame();
-  await f.poll(snapshot(emptyRound('current', 'flying', {
-    ...cinematic, elapsed_ms: 7350, multiplier: 89144,
-  })));
-  f.frame(16);
-  const first = f.drawing.ship;
-  assert.equal(readout.textContent, '244,25×');
-  f.frame(32);
-  assert.equal(readout.textContent, '265,64×');
-  assert.ok(f.drawing.ship[0] > first[0] && f.drawing.ship[1] < first[1]);
-  assert.deepEqual(f.drawing.curve.at(-1), f.drawing.ship);
-  f.frame(850);
-  assert.equal(readout.textContent, '891,44×');
-});
-
-test('the chart doubling times match both Rust flight phases', () => {
+test('the chart has the same grace and accelerating growth as Rust', () => {
   const rust = readFileSync(join(__dirname, '../rust/src/rocket.rs'), 'utf8');
-  const normal = Number(rust.match(/^const DOUBLE_SECONDS: f64 = ([\d.]+);/m)[1]) * 1000;
-  const cinematic = Number(rust.match(/^const CINEMATIC_DOUBLE_SECONDS: f64 = ([\d.]+);/m)[1]) * 1000;
+  function value(name) {
+    return Number(rust.match(new RegExp("const " + name + ": f64 = ([0-9_.]+);"))[1].replace(/_/g, ''));
+  }
+  const grace = value('GRACE_MS');
+  const doubling = value('DOUBLE_MS');
+  const power = value('GROWTH_POWER');
   const multiplierAt = vm.runInContext('rocketMultiplierAt', context);
-  assert.equal(multiplierAt(normal, null), 200);
-  assert.equal(multiplierAt(normal + cinematic, normal), 400);
+  assert.equal(multiplierAt(grace - 1), 100);
+  assert.equal(multiplierAt(grace), 100);
+  assert.ok(multiplierAt(grace + 500) < 103);
+  assert.equal(multiplierAt(grace + doubling), 200);
+  assert.ok(Math.abs(multiplierAt(grace + doubling * 2 ** (1 / power)) - 400) < 1e-8);
+  assert.equal(multiplierAt(100000), 100000);
 });
 
-test('reduced motion paints confirmed positions once and reveals the cinematic peak at crash', async () => {
-  const f = viewFixture(true);
-  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 5400 };
+test('round summary displays independent player cashout and newest-first history', async () => {
+  const f = viewFixture();
+  const data = snapshot(flight('crashed', { payout: 125, cashout_multiplier: 125, multiplier: 327, final_multiplier: 327 }));
+  data.bets = [{ id: '10', name: 'Талия', stake: 100, status: 'paid', multiplier: 125, payout: 125 }];
+  data.history = [{ id: 'current', multiplier: 327 }, { id: 'previous', multiplier: 105 }];
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 6850, multiplier: 22286 }), 600));
+  await f.reply(f.requests[0], data);
+  const bet = f.elements.get('rocket-bet-list').children[0];
+  assert.equal(bet.children[0].children[0].textContent, 'Талия');
+  assert.match(bet.children[0].children[1].textContent, /1,25×.*125/);
+  assert.deepEqual(f.elements.get('rocket-history-list').children.map(row => row.textContent), ['3,27×', '1,05×']);
+  assert.equal(f.elements.get('rocket-final').textContent, '3,27×');
+});
+test('reduced motion paints confirmed positions once and reveals the confirmed peak at crash', async () => {
+  const f = viewFixture(true);
+  const paid = { payout: 200, cashout_multiplier: 200 };
+  f.view.show();
+  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 36200, multiplier: 22286 }), 600));
   f.frame();
   const initial = f.drawing.ship;
   assert.equal(f.hasFrame(), false);
-  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 7350, multiplier: 89144 }), 600));
+  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 39000, multiplier: 89144 }), 600));
   f.frame();
   assert.ok(f.drawing.ship[0] > initial[0] && f.drawing.ship[1] < initial[1]);
   assert.equal(f.hasFrame(), false);
   assert.equal(f.elements.get('rocket-multiplier').textContent, '891,44×');
   assert.equal(f.elements.get('rocket-action').attributes.get('aria-disabled'), 'true');
-  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 7391, multiplier: 100000 }), 600));
+  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 39700, multiplier: 100000, final_multiplier: 100000 }), 600));
   f.frame();
   assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
   assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');
@@ -911,20 +916,20 @@ test('reduced motion paints confirmed positions once and reveals the cinematic p
   assert.equal(f.hasFrame(), false);
 });
 
-test('a confirmed cinematic crash reveals the peak immediately while the ship eases into the burst', async () => {
+test('a confirmed crash reveals the peak immediately while the ship eases into the burst', async () => {
   const f = viewFixture();
-  const paid = { payout: 200, cashout_multiplier: 200, cinematic_from_ms: 5400 };
+  const paid = { payout: 200, cashout_multiplier: 200 };
   f.view.show();
-  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 6850, multiplier: 22286 }), 600));
+  await f.reply(f.requests[0], snapshot(flight('flying', { ...paid, elapsed_ms: 36200, multiplier: 22286 }), 600));
   f.frame();
   const lastPaint = f.drawing.ship;
-  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 7350, multiplier: 89144 }), 600));
+  await f.poll(snapshot(flight('flying', { ...paid, elapsed_ms: 39000, multiplier: 89144 }), 600));
   f.frame();
   assert.deepEqual(f.drawing.ship, lastPaint);
   f.frame(480);
   const beforeCrash = f.drawing.ship;
 
-  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 7391, multiplier: 100000 }), 600));
+  await f.poll(snapshot(flight('crashed', { ...paid, elapsed_ms: 39700, multiplier: 100000, final_multiplier: 100000 }), 600));
   f.frame();
   assert.equal(f.elements.get('rocket-multiplier').textContent, '1\u00a0000,00×');
   assert.equal(f.elements.get('rocket-payout').textContent, '200 мон.');

@@ -3,9 +3,11 @@
 const ROCKET_POLL_MS = 500;
 const ROCKET_RETRY_POLL_MS = 2400;
 const ROCKET_MAX_REPEAT_ROUNDS = 10;
-// These shape the chart for confirmed samples and match the Rust flight phases.
-const ROCKET_DOUBLE_MS = 2700;
-const ROCKET_CINEMATIC_DOUBLE_MS = 250;
+// Match the server curve. The chart never leads a confirmed flight sample.
+const ROCKET_GRACE_MS = 1200;
+const ROCKET_GROWTH_MS = 7000;
+const ROCKET_GROWTH_POWER = 1.35;
+const ROCKET_MAX_FACTOR = 100000;
 const ROCKET_CRASH_EASE_MS = 160;
 const ROCKET_BURST_MS = 760;
 const ROCKET_STATUS = {
@@ -41,9 +43,9 @@ function rocketValidStake(snapshot, stake) {
   return Number.isSafeInteger(stake) && stake >= snapshot.min_bet && stake <= rocketMaxStake(snapshot);
 }
 
-function rocketMultiplierAt(elapsed, cinematicFrom) {
-  const normal = Math.min(elapsed, cinematicFrom ?? elapsed);
-  return 100 * 2 ** (normal / ROCKET_DOUBLE_MS + (elapsed - normal) / ROCKET_CINEMATIC_DOUBLE_MS);
+function rocketMultiplierAt(elapsed) {
+  const progress = Math.max(0, elapsed - ROCKET_GRACE_MS) / ROCKET_GROWTH_MS;
+  return Math.min(ROCKET_MAX_FACTOR, 100 * 2 ** (progress ** ROCKET_GROWTH_POWER));
 }
 
 function rocketPoint(flight) {
@@ -62,14 +64,12 @@ function interpolateRocket({ from, to }, progress) {
 function rocketResponse(data) {
   if (data?.error) throw new Error(data.error);
   const flight = data?.flight;
-  const cinematicFrom = flight?.cinematic_from_ms;
   if (!Number.isFinite(data?.balance) || !Number.isFinite(data.min_bet) || !Number.isFinite(data.max_bet) ||
       typeof flight?.id !== "string" || !flight.id || !Object.hasOwn(ROCKET_STATUS, flight.status) ||
       flight.status === "idle" || !Number.isFinite(flight.elapsed_ms) || !Number.isFinite(flight.multiplier) ||
       (flight.stake !== null && !(Number.isSafeInteger(flight.stake) && flight.stake > 0)) ||
       !Number.isFinite(flight.next_launch_ms) || flight.next_launch_ms < 0 ||
-      typeof flight.can_bet !== "boolean" || typeof flight.can_cashout !== "boolean" ||
-      (cinematicFrom != null && (!Number.isFinite(cinematicFrom) || cinematicFrom < 0 || cinematicFrom > flight.elapsed_ms))) {
+      typeof flight.can_bet !== "boolean" || typeof flight.can_cashout !== "boolean") {
     throw new Error("Сервер вернул неполные данные полёта.");
   }
   return data;
@@ -127,7 +127,11 @@ function createRocketFeed({
     clearPoll();
     if (!visible || pending) return;
     const interval = needsSync ? ROCKET_RETRY_POLL_MS : ROCKET_POLL_MS;
-    timer = setTimer(sync, Math.max(50, interval - (now() - startedAt)));
+    const time = now();
+    const flight = snapshot?.flight;
+    const launch = !needsSync && flight?.status === "countdown" && flight.stake != null
+      ? rocketUntilLaunch(flight, sampledAt, time) : Infinity;
+    timer = setTimer(sync, Math.max(50, Math.min(launch, interval - (time - startedAt))));
   }
 
   function accept(data) {
@@ -219,7 +223,7 @@ function createRocketFeed({
       if (!visible || !canAutoStart() || pending || needsSync || repeat ||
           !Number.isInteger(rounds) || rounds < 1 || rounds > ROCKET_MAX_REPEAT_ROUNDS) return;
       if (!Number.isSafeInteger(stake) || stake < snapshot.min_bet || stake > snapshot.max_bet ||
-          (target !== null && (!Number.isInteger(target) || target < 101 || target > 999))) return;
+          (target !== null && (!Number.isInteger(target) || target < 101 || target > ROCKET_MAX_FACTOR))) return;
       repeat = { id: snapshot.flight.id, stake, target, remaining: rounds };
       repeatNotice = "";
       report();
@@ -333,7 +337,7 @@ function createRocketChart(canvas) {
   const tickFactor = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1 });
   const tickTime = new Intl.NumberFormat("ru-RU");
 
-  return function draw(status, { elapsed, multiplier: factor }, cinematicFrom, timestamp, transition, reducedMotion) {
+  return function draw(status, { elapsed, multiplier: factor }, timestamp, transition, reducedMotion) {
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     if (!ctx || width < 100 || height < 100) return;
@@ -356,7 +360,7 @@ function createRocketChart(canvas) {
     const yFor = (value) => bottom - (bottom - top) * (value - 100) / (factorLimit - 100);
     const x = xFor(time);
     const y = yFor(factor);
-    const color = colors[status] || (cinematicFrom != null && time >= cinematicFrom ? "#f5cd91" : "#bcabff");
+    const color = colors[status] || "#bcabff";
 
     stars.forEach(([sx, sy], i) => {
       ctx.fillStyle = i % 5 ? "#b5a8ee34" : "#d5c9ff75";
@@ -389,9 +393,9 @@ function createRocketChart(canvas) {
 
     let angle = -.22;
     if (time > 0) {
-      const heightAtTime = rocketMultiplierAt(time, cinematicFrom) - 100;
+      const heightAtTime = rocketMultiplierAt(time) - 100;
       const yAt = (t) => {
-        const gain = heightAtTime ? (rocketMultiplierAt(t, cinematicFrom) - 100) / heightAtTime : t / time;
+        const gain = heightAtTime ? (rocketMultiplierAt(t) - 100) / heightAtTime : t / time;
         return yFor(100 + (factor - 100) * gain);
       };
       const curve = new Path2D();
@@ -438,7 +442,7 @@ function createRocketChart(canvas) {
   };
 }
 
-function createRocketView(request) {
+function createRocketView(request, avatar) {
   const get = (name) => document.getElementById("rocket-" + name);
   const root = document.getElementById("rocket");
   const chart = get("chart");
@@ -459,6 +463,8 @@ function createRocketView(request) {
   const factor = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const seconds = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  get("bets").open = get("history").open = !window.matchMedia("(max-width: 860px)").matches;
+  const avatars = window.createGameAvatars?.(avatar);
   const draw = createRocketChart(chart);
   const feed = createRocketFeed({ request, onChange: update, canAutoStart });
   let current = { snapshot: null, sampledAt: 0, needsSync: true };
@@ -475,6 +481,8 @@ function createRocketView(request) {
   let flightIntensity = -1;
   let fieldError = "";
   let connectionError = "";
+  let betsKey;
+  let historyKey;
 
   const repeatPanel = document.createElement("section");
   repeatPanel.className = "rocket-repeat";
@@ -521,6 +529,50 @@ function createRocketView(request) {
 
   function displayFactor(multiplier) {
     return factor.format(multiplier / 100) + "×";
+  }
+
+  function renderRoundLists(snapshot) {
+    const bets = snapshot?.bets ?? [];
+    const history = snapshot?.history ?? [];
+    const nextBets = JSON.stringify(bets);
+    const nextHistory = JSON.stringify(history);
+    function empty(text) {
+      const row = document.createElement("li");
+      row.className = "rocket-list-empty";
+      row.textContent = text;
+      return row;
+    }
+    if (betsKey !== nextBets) {
+      betsKey = nextBets;
+      const rows = bets.map(entry => {
+        const row = document.createElement("li");
+        row.className = "rocket-bet-row";
+        row.dataset.status = entry.status;
+        const icon = avatars?.image(entry.id, entry.name);
+        const text = document.createElement("div");
+        const name = document.createElement("strong");
+        name.textContent = entry.name;
+        const summary = document.createElement("small");
+        const result = entry.status === "paid" && Number.isFinite(entry.multiplier) && Number.isFinite(entry.payout)
+          ? " · " + displayFactor(entry.multiplier) + " → " + number.format(entry.payout) + " мон."
+          : entry.status === "lost" ? " · проиграна" : entry.status === "refunded" ? " · возвращена" : "";
+        summary.textContent = number.format(entry.stake) + " мон." + result;
+        text.append(name, summary);
+        if (icon) row.append(icon);
+        row.append(text);
+        return row;
+      });
+      get("bet-list").replaceChildren(...(rows.length ? rows : [empty("Ставок пока нет.")]));
+    }
+    if (historyKey !== nextHistory) {
+      historyKey = nextHistory;
+      const rows = history.map(entry => {
+        const item = document.createElement("li");
+        item.textContent = displayFactor(entry.multiplier);
+        return item;
+      });
+      get("history-list").replaceChildren(...(rows.length ? rows : [empty("Пока нет завершённых раундов.")]));
+    }
   }
 
   function invalidate() {
@@ -616,7 +668,7 @@ function createRocketView(request) {
       renderControls(timestamp);
     }
     const displayedStatus = approaching ? "flying" : status;
-    draw(displayedStatus, visual, flight?.cinematic_from_ms, timestamp, transition, !running);
+    draw(displayedStatus, visual, timestamp, transition, !running);
     paintAudio(flight, displayedStatus, time, visual.elapsed);
     if (running && (status === "flying" || launchIn > 0 ||
         (transition !== null && timestamp - transition < ROCKET_BURST_MS))) invalidate();
@@ -667,26 +719,24 @@ function createRocketView(request) {
     const status = flight?.status || "idle";
     const hasStake = flight?.stake != null;
     const paid = flight?.payout != null && status !== "refunded";
-    const cinematic = flight?.cinematic_from_ms != null;
     const lowBalance = snapshot && rocketMaxStake(snapshot) < snapshot.min_bet;
     const locked = Boolean(!canAutoStart() || pending || needsSync || !snapshot);
     const canBet = rocketCanBet(flight, current.sampledAt, timestamp);
     const canCashout = rocketCanCashout(flight);
-    const lost = hasStake && !paid && (status === "crashed" || (status === "flying" && !canCashout));
+    const lost = hasStake && !paid && status === "crashed";
     const actionEnabled = !locked && (canCashout || (canBet && !lowBalance));
     root.dataset.phase = status;
     root.dataset.cashedOut = String(paid);
-    root.dataset.cinematic = String(cinematic);
     write(phaseLabel, connectionError || (!snapshot && syncError) ? "Нет соединения" :
       snapshot ? ROCKET_STATUS[status] : "Подключение");
-    write(multiplierCaption, status === "crashed" ? "Пик полёта" : cinematic ? "Кинополёт" : "Коэффициент");
+    write(multiplierCaption, status === "crashed" ? "Итог полёта" : "Коэффициент");
     write(balance, snapshot ? number.format(snapshot.balance) + " мон." : "—");
     settings.hidden = useCurrentWager(flight);
     settings.disabled = locked || settings.hidden || lowBalance;
     action.setAttribute("aria-disabled", String(!actionEnabled));
     const actionText = pending === "start" ? "Принимаем ставку…" : pending === "cashout" ? "Забираем монеты…" :
       connectionError ? "Соединение закрыто" : needsSync ? "Подключение…" :
-      canCashout ? "Забрать монеты" : canBet ? (lowBalance ? "Недостаточно монет" : "Поставить") :
+      canCashout ? "Вывести" : canBet ? (lowBalance ? "Недостаточно монет" : "Поставить") :
       status === "countdown" && hasStake ? "Ставка принята" :
       status === "countdown" ? "Ждём старта…" : status === "flying" ? "Ждём конца полёта…" : "Ждём следующий раунд…";
     write(action, actionText);
@@ -702,6 +752,9 @@ function createRocketView(request) {
       const cashoutMultiplier = flight.cashout_multiplier;
       write(get("payout-label"), cashoutMultiplier == null ? payoutLabel : payoutLabel + " · " + displayFactor(cashoutMultiplier));
       if (flight.payout != null) write(get("payout"), number.format(flight.payout) + " мон.");
+      const final = flight.final_multiplier;
+      get("final-row").hidden = !Number.isFinite(final);
+      if (Number.isFinite(final)) write(get("final"), displayFactor(final));
     }
 
     if (snapshot) {
@@ -715,11 +768,11 @@ function createRocketView(request) {
       idle: "Укажите ставку перед стартом.",
       countdown: hasStake ? "Вывод станет доступен после старта." :
         canBet ? "Ставки принимаются до старта." : "Ожидаем старта раунда.",
-      flying: cinematic && paid ? "Выплата зафиксирована. Продолжается кинополёт." :
-        paid ? (flight.automatic ? "Автовывод сработал. Полёт продолжается." :
+      flying: paid ? (flight.automatic ? "Автовывод сработал. Полёт продолжается." :
         "Монеты зачислены. Полёт продолжается.") : canCashout ? "Вывод подтверждает сервер в момент запроса." :
         "Ставки откроются в следующем раунде.",
-      crashed: paid ? "Ракета разбилась. Выплата уже на балансе." : "Ставки откроются в следующем раунде.",
+      crashed: flight?.final_multiplier === ROCKET_MAX_FACTOR ? "Достигнут предел 1 000×. Активные ставки рассчитаны." :
+        paid ? "Полёт завершён. Выплата уже на балансе." : "Ставки откроются в следующем раунде.",
       refunded: hasStake ? "Монеты возвращены на баланс." : "Ставки откроются в следующем раунде.",
     };
     const error = connectionError || syncError || fieldError || actionError;
@@ -747,6 +800,7 @@ function createRocketView(request) {
       }
     }
     current = view;
+    renderRoundLists(view.snapshot);
     renderControls();
     invalidate();
   }
@@ -774,8 +828,8 @@ function createRocketView(request) {
       return null;
     }
     const rawTarget = auto.value.trim().replace(",", ".");
-    if (rawTarget && (!/^[1-9](?:\.\d{1,2})?$/.test(rawTarget) || Number(rawTarget) < 1.01)) {
-      if (showError) invalid(auto, "Введите коэффициент от 1,01× до 9,99× или оставьте поле пустым.");
+    if (rawTarget && (!/^\d{1,4}(?:\.\d{1,2})?$/.test(rawTarget) || Number(rawTarget) < 1.01 || Number(rawTarget) > 1000)) {
+      if (showError) invalid(auto, "Введите коэффициент от 1,01× до 1 000× или оставьте поле пустым.");
       return null;
     }
     return { stake, target: rawTarget ? Math.round(Number(rawTarget) * 100) : null };
@@ -872,10 +926,13 @@ function createRocketView(request) {
   return {
     show() {
       shown = true;
+      renderRoundLists(current.snapshot);
       resume();
     },
     hide() {
       shown = false;
+      avatars?.clear();
+      betsKey = undefined;
       suspend();
     },
     disconnect(reason) {

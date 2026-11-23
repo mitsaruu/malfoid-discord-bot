@@ -191,7 +191,7 @@ test('switching games hides the previous view and stops refreshing word data', a
   });
   const document = { body: { dataset: { game: 'lobby' } }, documentElement: {}, getElementById: id => panels[id] };
   const context = vm.createContext({
-    document, activeGame: null, session: 'test', lang: 'ru', reloadWords: false,
+    document, activeGame: null, session: 'test', lang: 'ru', reloadWords: false, gameAvatar: () => null,
     casinoViews: new Map(),
     helpEl: {}, playersEl: {}, gameLobby: { hidden: false }, gameSwitch: { querySelectorAll: () => [] },
     rocket: { show() { calls.push('show rocket'); }, hide() { calls.push('hide rocket'); } },

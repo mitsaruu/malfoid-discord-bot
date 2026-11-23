@@ -99,25 +99,426 @@
 .durak-player-reaction { font-size: 1.15rem; }
 .durak-reaction-palette { display: flex; flex-wrap: wrap; gap: 4px; }
 .casino .durak-reaction-palette button { width: 42px; padding: 0; font-size: 1.15rem; }
-.durak-online-room .durak-field > * + * { margin-top: 10px; }
-.durak-online-room .durak-board { min-height: 82px; align-items: center; }
-.durak-online-room .durak-pair { margin: 0; }
-.durak-online-stock { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); }
-.durak-online-stock .casino-card { --card-width: 24px; --card-size: .73rem; }
-.durak-online-turn {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px 10px;
-  color: var(--accent);
+.casino .durak-avatar {
+  position: relative;
+  display: grid;
+  width: max(42px, var(--avatar-size, 34px));
+  min-height: max(42px, var(--avatar-size, 34px));
+  padding: 0;
+  place-items: center;
+  border-color: transparent;
+  border-radius: 50%;
+  background: transparent;
 }
-.durak-online-clock { min-width: 5ch; text-align: center; }
-.durak-online-clock[data-urgent="true"] { border-color: var(--accent); color: var(--accent); }
-.durak-online-actions:empty { display: none; }
-.durak-online-room .durak-hand-card[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 2px; }
+.casino .durak-avatar:disabled { opacity: 1; }
+.durak-player-reaction {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  right: -9px;
+  display: grid;
+  width: 1.65rem;
+  height: 1.65rem;
+  place-items: center;
+  border: 1px solid #6b849d;
+  border-radius: 50%;
+  background: #102137;
+  font-size: 1rem;
+}
+.durak-reaction-palette { display: flex; flex-wrap: wrap; justify-content: center; gap: 5px; }
+.casino .durak-reaction-palette button { width: 42px; padding: 0; font-size: 1.15rem; }
 .durak-stake-fields[hidden], .durak-reaction-palette[hidden] { display: none; }
 
+.durak-online-room[data-table="true"] { border: 0; padding: 0; background: none; }
+.durak-table-screen {
+  --rail: #43607c;
+  --table-ink: #edf5fd;
+  --table-muted: #a7bdd3;
+  --card-width: clamp(26px, 5.4cqi, 56px);
+  --pile-width: clamp(26px, 4.8cqi, 48px);
+  --hand-width: clamp(45px, 7.6cqi, 76px);
+  position: relative;
+  container-type: inline-size;
+  min-width: 0;
+  border: 1px solid #324c66;
+  border-radius: clamp(14px, 3cqi, 24px);
+  background: #0c192a;
+  color: var(--table-ink);
+  isolation: isolate;
+}
+/* Resolve container units against the table itself for its contents. */
+.durak-arena {
+  position: relative;
+  display: grid;
+  grid-template:
+    "seats seats seats" auto
+    "stock board side" minmax(108px, 1fr)
+    "rail rail rail" auto
+    / minmax(56px, 1fr) minmax(0, 5fr) minmax(56px, 1fr);
+  gap: clamp(6px, 1.25cqi, 14px);
+  min-height: clamp(252px, 47cqi, 460px);
+  padding: clamp(8px, 2cqi, 22px);
+  align-items: center;
+}
+.durak-felt {
+  position: absolute;
+  z-index: -1;
+  inset: clamp(17px, 4cqi, 38px) clamp(6px, 1.9cqi, 20px);
+  border: clamp(3px, .7cqi, 7px) solid #213b55;
+  border-radius: 50% / 46%;
+  background:
+    repeating-linear-gradient(45deg, #d4e5f905 0 1px, transparent 1px 5px),
+    radial-gradient(ellipse at 48% 35%, #23486a, #1a3653 58%, #112840 100%);
+  box-shadow: inset 0 0 0 1px #7f9db566, inset 0 0 33px #080f1c99,
+    0 0 0 1px #516981, 0 12px 30px #040a1480;
+}
+
+.durak-opponents {
+  grid-area: seats;
+  display: flex;
+  justify-content: space-evenly;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.durak-table-seat { flex: 0 1 124px; min-width: 0; text-align: center; }
+.durak-seat-profile {
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  gap: 3px 6px;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  --avatar-size: clamp(32px, 6cqi, 54px);
+}
+.durak-seat-profile > :is(.durak-avatar, .game-player-avatar) {
+  grid-column: 1 / -1;
+  margin-block-end: 2px;
+}
+.durak-seat-name {
+  overflow: hidden;
+  justify-self: stretch;
+  color: var(--table-ink);
+  font-size: clamp(.72rem, 1.75cqi, .92rem);
+  font-weight: 720;
+  line-height: 1.35;
+  text-align: end;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.durak-seat-count {
+  min-width: 2ch;
+  padding: 1px 4px;
+  border: 1px solid #536e88;
+  border-radius: 6px;
+  background: #102339;
+  color: var(--table-muted);
+  font-size: .71rem;
+  line-height: 1.25;
+}
+.durak-table-seat[data-turn="true"] .durak-seat-name { color: var(--accent); }
+.durak-opponent-hand {
+  position: relative;
+  width: 100%;
+  height: calc(var(--pile-width) * .96);
+  margin-top: 7px;
+}
+.durak-opponent-hand .durak-card {
+  position: absolute;
+  left: 50%;
+  width: calc(var(--pile-width) * .64);
+  translate: calc(-50% + var(--fan) * clamp(4px, 1cqi, 10px)) 0;
+  rotate: calc(var(--fan) * 7deg);
+  transform-origin: center bottom;
+}
+
+.durak-card {
+  display: grid;
+  width: var(--card-width);
+  aspect-ratio: 5 / 7;
+  place-items: center;
+  border: 1px solid #b5c5d3;
+  border-radius: clamp(4px, 1cqi, 9px);
+  background: linear-gradient(150deg, #fafcfe, #e1eaf2);
+  box-shadow: 0 2px 6px #05122173;
+  color: #152840;
+  font-weight: 800;
+  font-size: clamp(.68rem, 1.9cqi, 1.1rem);
+  letter-spacing: -.075em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.durak-card:is([data-suit="hearts"], [data-suit="diamonds"]) { color: #a2203e; }
+.durak-card--back {
+  border-color: #9ab5d0;
+  background:
+    repeating-linear-gradient(45deg, #75a3cb43 0 1px, transparent 1px 5px),
+    repeating-linear-gradient(-45deg, #75a3cb43 0 1px, transparent 1px 5px),
+    linear-gradient(150deg, #254a72, #112842);
+  box-shadow: inset 0 0 0 2px #122a46, 0 2px 4px #07111f9c;
+}
+
+.durak-round-board {
+  grid-area: board;
+  display: grid;
+  grid-template-columns: repeat(3, calc(var(--card-width) * 1.36));
+  justify-content: center;
+  justify-self: stretch;
+  gap: clamp(3px, 1.15cqi, 12px) clamp(3px, 1cqi, 10px);
+}
+.durak-round-pair {
+  position: relative;
+  min-height: calc(var(--card-width) * 1.85);
+}
+.durak-board-anchor {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-start: 0;
+  width: var(--card-width);
+  aspect-ratio: 5 / 7;
+}
+.durak-round-pair[data-next="true"] .durak-board-attack {
+  border: 1px dashed #9bb9d387;
+  border-radius: 7px;
+  background: #10273a4a;
+}
+.durak-board-anchor .durak-card {
+  place-items: start;
+  padding: clamp(2px, .7cqi, 6px);
+}
+.durak-board-defense { inset-block-start: 29%; inset-inline-start: 25%; rotate: 8deg; }
+
+.durak-piles { display: contents; }
+.durak-pile, .durak-bank {
+  display: grid;
+  justify-items: center;
+  gap: 3px;
+  color: var(--table-ink);
+}
+.durak-stock {
+  grid-area: stock;
+  align-self: start;
+  margin-block-start: clamp(0px, 2cqi, 20px);
+}
+.durak-discard { grid-area: side; align-self: end; }
+.durak-pile-cards { position: relative; }
+.durak-pile .durak-card { width: var(--pile-width); }
+.durak-stock .durak-pile-cards { margin-inline-end: 15px; }
+.durak-pile-stack { box-shadow: inset 0 0 0 2px #122a46, 2px 2px #547697, 4px 4px #1c3855, 6px 6px #091a2c; }
+.durak-pile-empty { border: 1px dashed #8caecb8f; background: #091c3070; box-shadow: none; }
+.durak-pile-trump {
+  position: absolute;
+  top: 9%;
+  left: 61%;
+  place-items: start end;
+  padding: clamp(2px, .5cqi, 5px);
+  rotate: 16deg;
+  transform-origin: bottom center;
+}
+.durak-stock .durak-pile-stack { position: relative; }
+.durak-pile-name { color: var(--table-muted); font-size: clamp(.65rem, 1.65cqi, .8rem); line-height: 1.35; }
+.durak-pile-count { font-size: .85rem; }
+.durak-bank {
+  grid-template-columns: auto auto auto;
+  align-items: center;
+  justify-self: start;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid #5b654f;
+  border-radius: 999px;
+  background: #172635;
+  color: #f0d99d;
+  font-size: .78rem;
+}
+.durak-bank-chips {
+  width: 12px;
+  height: 12px;
+  border: 2px dotted #684d1e;
+  border-radius: 50%;
+  background: #e7bd60;
+  box-shadow: 0 2px #b58b3f;
+}
+
+.durak-bank-slot { grid-area: side; align-self: start; justify-self: end; }
+.durak-bank-slot:empty { display: none; }
+.durak-rail-controls {
+  grid-area: rail;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+  margin-inline-start: auto;
+}
+.durak-rules { position: relative; }
+.durak-rules summary {
+  display: list-item;
+  min-height: 42px;
+  padding: 11px 8px;
+  border-radius: 8px;
+  color: var(--table-ink);
+  cursor: pointer;
+  font-size: .79rem;
+  white-space: nowrap;
+}
+.durak-rule-content {
+  position: absolute;
+  z-index: 4;
+  right: 0;
+  width: min(250px, 71cqi);
+  padding: 12px;
+  border: 1px solid #607c95;
+  border-radius: 10px;
+  background: #13263c;
+  box-shadow: 0 5px 12px #080f1d80;
+  font-size: .81rem;
+}
+.durak-rule-content p { margin-top: 7px; color: #c3d5e7; }
+.casino .durak-rail-controls > button {
+  padding-inline: 8px;
+  border-color: #42607c;
+  background: #182d44;
+  font-size: .79rem;
+}
+
+.durak-dock {
+  display: grid;
+  grid-template:
+    "hint hint hint" auto
+    "self hand actions" auto
+    / clamp(44px, 10cqi, 85px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px clamp(4px, 1cqi, 12px);
+  min-width: 0;
+  padding: 9px clamp(8px, 2cqi, 20px) 12px;
+  border-top: 1px solid var(--rail);
+  border-end-start-radius: inherit;
+  border-end-end-radius: inherit;
+  background: linear-gradient(#14283e, #0d1d30);
+}
+.durak-hint { grid-area: hint; font-size: clamp(.85rem, 2.2cqi, 1.02rem); font-weight: 690; }
+.durak-last-action {
+  grid-column: 1 / -1;
+  min-height: 1.2em;
+  color: #bce3db;
+  font-size: .72rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.durak-own-seat { grid-area: self; min-width: 0; }
+.durak-table-seat--self .durak-seat-profile { --avatar-size: clamp(30px, 5.8cqi, 54px); }
+.durak-online-hand {
+  grid-area: hand;
+  min-width: 0;
+  min-height: 66px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-color: #55738e #14263a;
+  scrollbar-width: thin;
+}
+.durak-hand-spread {
+  display: flex;
+  justify-content: center;
+  gap: clamp(2px, .55cqi, 6px);
+  min-width: 100%;
+  width: max-content;
+  padding: 9px 10px 12px;
+}
+.durak-hand-position { width: var(--hand-width); }
+.durak-hand-position + .durak-hand-position { margin-inline-start: clamp(-22px, -2.25cqi, -11px); }
+.casino .durak-card--held {
+  position: relative;
+  width: 100%;
+  min-height: 0;
+  padding: 5px 3px;
+  place-items: start;
+  border-color: #adc1d2;
+  background: linear-gradient(150deg, #fff, #e2ebf5);
+  color: #152840;
+  font-size: clamp(.93rem, 2.5cqi, 1.35rem);
+  overflow-wrap: normal;
+  transform-origin: center bottom;
+  translate: 0 calc(var(--lift) * 2px);
+  rotate: calc(var(--fan) * 2deg);
+}
+.casino .durak-card--held:is([data-suit="hearts"], [data-suit="diamonds"]) { color: #a2203e; }
+.casino .durak-card--held[data-playable="true"][aria-disabled="false"] {
+  border-color: #b2dfd8;
+  box-shadow: inset 0 -3px #79bfb3, 0 2px 5px #071728aa;
+}
+.casino .durak-card--held[aria-disabled="true"] { opacity: 1; background: #bac9d7; cursor: default; }
+.casino .durak-card--held:is(:focus-visible, [aria-pressed="true"]),
+.casino .durak-card--held[aria-disabled="false"]:hover {
+  z-index: 1;
+  outline: 2px solid #89e0cc;
+  outline-offset: 1px;
+  background: #e4faf5;
+  translate: 0 -5px;
+}
+.durak-empty-hand { padding: 16px 8px; color: var(--table-muted); font-size: .85rem; }
+.durak-online-actions {
+  grid-area: actions;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+}
+.durak-online-actions:empty { display: none; }
+.casino .durak-online-actions button { min-width: min(104px, 100%); background: #25415c; border-color: #556e87; }
+.casino .durak-online-actions button[data-action="take"] { background: #d3ecef; color: #15303d; }
+.casino .durak-online-actions button[aria-disabled="true"] { cursor: default; opacity: .57; }
+.durak-table-screen > .durak-reaction-palette { padding: 0 8px 10px; }
+
+.durak-motion-layer { position: absolute; z-index: 5; inset: 0; pointer-events: none; }
+.durak-flight { position: absolute; translate: -50% -50%; opacity: 0; perspective: 320px; }
+.durak-flight > .durak-card, .durak-flight-flip, .durak-flight-flip > .durak-card { width: 100%; height: 100%; }
+.durak-flight-flip { position: relative; transform-style: preserve-3d; }
+.durak-flight-flip > .durak-card { position: absolute; inset: 0; backface-visibility: hidden; }
+.durak-flight-flip > .durak-card--back { transform: rotateY(180deg); }
+.durak-flight-label {
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+  height: 100%;
+  place-items: center;
+  padding-inline: 8px;
+  color: #e2f5ef;
+  font-weight: 760;
+  text-shadow: 0 1px 4px #061828;
+}
+
+@container (min-width: 680px) {
+  .durak-round-board { grid-template-columns: repeat(6, calc(var(--card-width) * 1.36)); }
+}
+@container (max-width: 560px) {
+  .durak-dock {
+    grid-template:
+      "self hint actions" auto
+      "hand hand hand" auto
+      / clamp(52px, 12cqi, 64px) minmax(0, 1fr) auto;
+    padding-block: 6px 8px;
+  }
+  .durak-online-actions { max-width: 34cqi; justify-content: end; }
+  .casino .durak-online-actions button { min-width: 0; padding-inline: 8px; }
+  .durak-bank { gap: 3px; padding-inline: 5px; }
+  .durak-bank-chips { display: none; }
+}
+@container (max-width: 375px) {
+  .durak-arena {
+    grid-template-rows: auto minmax(98px, 1fr) auto;
+    gap: 4px;
+    padding-block: 5px;
+  }
+  .durak-table-seat:not(.durak-table-seat--self) .durak-seat-profile { --avatar-size: 31px; }
+  .durak-seat-profile { column-gap: 3px; }
+  .durak-seat-profile > :is(.durak-avatar, .game-player-avatar) { margin-block-end: 0; }
+  .durak-seat-count { padding-inline: 2px; }
+  .durak-opponent-hand { height: 21px; margin-block-start: 4px; }
+  .durak-hand-spread { --hand-width: 41px; padding: 7px 6px; }
+  .durak-bank { position: relative; z-index: 1; background: #172635; }
+  .durak-bank .durak-pile-name { font-size: .6rem; }
+}
 @media (max-width: 480px) {
   .durak-room-row { gap: 6px; padding: 7px; }
   .durak-room-row button { padding-inline: 8px; }

@@ -34,6 +34,25 @@ html, body {
 button { font: inherit; color: inherit; cursor: pointer; }
 [hidden] { display: none !important; }
 
+.game-player-avatar {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: var(--avatar-size, 34px);
+  height: var(--avatar-size, 34px);
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: #24342f;
+  color: #e4eee8;
+  font: 730 .75rem system-ui, sans-serif;
+}
+.game-player-avatar[data-active="true"] { outline: 2px solid var(--mint); outline-offset: 3px; }
+.game-player-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.game-player-identity { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.game-player-identity :is(strong, h3) { min-width: 0; overflow-wrap: anywhere; }
+
 /* ---------- Навигация и каталог ---------- */
 body:not([data-game]) .activity-shell { display: none; }
 .activity-shell {

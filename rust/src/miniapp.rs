@@ -131,7 +131,7 @@ async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Respon
     match name.as_str() {
         "style.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
             file(&app, &name, "text/css; charset=utf-8").await,
-        "app.js" | "audio.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
+        "app.js" | "audio.js" | "game_avatars.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         "lobby-games.webp" => file(&app, &name, "image/webp").await,
         "menu-ambient.mp3" => file(&app, &name, "audio/mpeg").await,
@@ -263,7 +263,7 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         }
         sessions.insert(pass.clone(), session);
     }
-    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "game": game })).into_response())
+    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "user_id": user.to_string(), "game": game })).into_response())
 }
 
 async fn rocket_state(State(app): State<App>, headers: HeaderMap) -> Reply {
@@ -466,8 +466,19 @@ async fn durak_avatar(State(app): State<App>, Path((room, file)): Path<(String, 
     if !app.data.durak_online.shared_room(session.guild, session.user, user, &room) {
         return Err(missing());
     }
+    session_avatar(&app, session.guild, user).await
+}
+
+async fn game_avatar(State(app): State<App>, Path(file): Path<String>, headers: HeaderMap) -> Reply {
+    let user = file.strip_suffix(".png").and_then(discord_id).ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    session_avatar(&app, session.guild, user).await
+}
+
+async fn session_avatar(app: &Miniapp, guild: u64, user: u64) -> Reply {
+    let missing = || StatusCode::NOT_FOUND.into_response();
     let face = locked(&app.sessions).values()
-        .filter(|player| player.guild == session.guild && player.user == user && player.created.elapsed() < SESSION_LIFETIME)
+        .filter(|player| player.guild == guild && player.user == user && player.created.elapsed() < SESSION_LIFETIME)
         .max_by_key(|player| player.checked)
         .map(|player| player.face.clone()).ok_or_else(missing)?;
     let bytes = wordboard::cached_avatar(&app.data, &face).await.ok_or_else(missing)?;
@@ -490,6 +501,7 @@ pub fn router(app: App) -> axum::Router {
         .route("/api/games/{game}/{action}", post(casino_action).layer(DefaultBodyLimit::max(2048)))
         .route("/api/avatar/{guild}/{file}", get(avatar))
         .route("/api/durak/avatar/{room}/{file}", get(durak_avatar))
+        .route("/api/game-avatar/{file}", get(game_avatar))
         .with_state(app)
 }
 

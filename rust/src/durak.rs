@@ -2,7 +2,10 @@
 
 use rand::{Rng, seq::SliceRandom};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+};
 
 pub(crate) const HAND_SIZE: usize = 6;
 pub(crate) const DECK_SIZE: u8 = 36;
@@ -132,6 +135,10 @@ impl Card {
     pub(crate) fn view(self) -> Value {
         json!({"id": self.0, "rank": RANKS[self.rank()], "suit": SUITS[self.suit()]})
     }
+
+    pub(crate) fn hand_order(self, trump: Card) -> (bool, usize, usize) {
+        (self.suit() == trump.suit(), self.rank(), self.suit())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +148,13 @@ enum Side {
 }
 
 impl Side {
+    fn id(self) -> &'static str {
+        match self {
+            Self::User => "you",
+            Self::Bot => "bot",
+        }
+    }
+
     fn other(self) -> Self {
         match self {
             Self::User => Self::Bot,
@@ -180,6 +194,8 @@ struct Game {
     attack_limit: usize,
     bot_taking: bool,
     outcome: Option<Outcome>,
+    events: VecDeque<Value>,
+    last_action: Option<(Side, &'static str)>,
 }
 
 impl Game {
@@ -195,9 +211,13 @@ impl Game {
         let trump = deck[0];
         let mut user = Vec::with_capacity(HAND_SIZE);
         let mut bot = Vec::with_capacity(HAND_SIZE);
+        let mut events = VecDeque::with_capacity(HAND_SIZE * 2);
         for _ in 0..HAND_SIZE {
-            user.push(deck.pop().expect("full deck"));
+            let card = deck.pop().expect("full deck");
+            user.push(card);
+            events.push_back(json!({"id": events.len() + 1, "kind": "deal", "player": "you", "card": card.view(), "count": deck.len()}));
             bot.push(deck.pop().expect("full deck"));
+            events.push_back(json!({"id": events.len() + 1, "kind": "deal", "player": "bot", "count": deck.len()}));
         }
         let attacker = [(Side::User, &user), (Side::Bot, &bot)]
             .into_iter()
@@ -219,9 +239,44 @@ impl Game {
             attack_limit: HAND_SIZE,
             bot_taking: false,
             outcome: None,
+            events,
+            last_action: None,
         };
         game.advance();
         game
+    }
+
+    fn record(
+        &mut self,
+        kind: &'static str,
+        side: Side,
+        card: Option<Card>,
+        index: Option<usize>,
+        count: Option<usize>,
+    ) {
+        let id = self
+            .events
+            .back()
+            .and_then(|event| event["id"].as_u64())
+            .unwrap_or_default()
+            + 1;
+        if self.events.len() == 96 {
+            self.events.pop_front();
+        }
+        let mut event = json!({"id": id, "kind": kind, "player": side.id()});
+        if let Some(card) = card.filter(|_| kind != "draw" || side == Side::User) {
+            event["card"] = card.view();
+        }
+        if let Some(index) = index {
+            event["index"] = json!(index);
+        }
+        if let Some(count) = count {
+            event["count"] = json!(count);
+        }
+        if kind != "draw" {
+            self.last_action = Some((side, kind));
+        }
+        self.events.push_back(event);
     }
 
     fn hand(&self, side: Side) -> &[Card] {
@@ -274,6 +329,13 @@ impl Game {
 
     fn put_attack(&mut self, card: Card) {
         self.remove_card(self.attacker, card);
+        self.record(
+            "attack",
+            self.attacker,
+            Some(card),
+            Some(self.table.len()),
+            None,
+        );
         self.table.push(Pair {
             attack: card,
             defense: None,
@@ -283,6 +345,13 @@ impl Game {
     fn put_defense(&mut self, card: Card) {
         self.remove_card(self.attacker.other(), card);
         self.table.last_mut().expect("open attack").defense = Some(card);
+        self.record(
+            "defend",
+            self.attacker.other(),
+            Some(card),
+            Some(self.table.len() - 1),
+            None,
+        );
     }
 
     fn bot_attack(&self) -> Option<Card> {
@@ -301,6 +370,25 @@ impl Game {
     fn finish_bout(&mut self, take: bool) {
         let attacker = self.attacker;
         let defender = attacker.other();
+        let count = self
+            .table
+            .iter()
+            .map(|pair| 1 + usize::from(pair.defense.is_some()))
+            .sum::<usize>();
+        if count > 0 {
+            let actor = if take {
+                defender
+            } else {
+                self.last_action.map_or(attacker, |action| action.0)
+            };
+            self.record(
+                if take { "take" } else { "discard" },
+                actor,
+                None,
+                None,
+                Some(count),
+            );
+        }
         let table = std::mem::take(&mut self.table);
         let destination = if take {
             self.hand_mut(defender)
@@ -317,6 +405,7 @@ impl Game {
             while self.hand(side).len() < HAND_SIZE {
                 let Some(card) = self.deck.pop() else { break };
                 self.hand_mut(side).push(card);
+                self.record("draw", side, Some(card), None, Some(self.deck.len()));
             }
         }
 
@@ -408,7 +497,10 @@ impl Game {
                 }
                 self.finish_bout(true);
             }
-            (Phase::Throw, Some("pass")) => self.finish_bout(self.bot_taking),
+            (Phase::Throw, Some("pass")) => {
+                self.record("pass", Side::User, None, None, None);
+                self.finish_bout(self.bot_taking);
+            }
             _ => return Err(ILLEGAL),
         }
         self.advance();
@@ -458,7 +550,7 @@ impl Game {
             }
         };
         let mut hand = self.user.clone();
-        hand.sort_unstable_by_key(|card| (card.suit() == self.trump.suit(), card.0));
+        hand.sort_unstable_by_key(|card| card.hand_order(self.trump));
         let table: Vec<_> = self.table.iter().map(|pair| {
             json!({"attack": pair.attack.view(), "defense": pair.defense.map(Card::view)})
         }).collect();
@@ -469,10 +561,14 @@ impl Game {
             "hand": hand.into_iter().map(Card::view).collect::<Vec<_>>(),
             "trump": self.trump.view(),
             "deck_count": self.deck.len(),
+            "attack_limit": self.attack_limit,
             "opponent_count": self.bot.len(),
             "table": table,
             "legal_cards": legal_cards,
             "actions": actions,
+            "events": self.events,
+            "discard_count": self.discard.len(),
+            "last_action": self.last_action.map(|(actor, kind)| json!({"player": actor.id(), "kind": kind})),
             "message": message,
         })
     }
@@ -624,6 +720,8 @@ mod tests {
             }),
             bot_taking: false,
             outcome: None,
+            events: VecDeque::new(),
+            last_action: None,
         }
     }
 

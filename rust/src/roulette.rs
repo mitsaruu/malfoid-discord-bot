@@ -91,6 +91,25 @@ struct Bet {
     request_id: String,
 }
 
+impl Bet {
+    fn payout(&self, number: Option<u8>) -> i64 {
+        number.map_or(self.amount, |number| self.amount * self.space.multiplier(number))
+    }
+
+    fn public_snapshot(&self, payout: Option<i64>) -> Value {
+        let mut row = json!({
+            "user_id": self.user.to_string(),
+            "name": self.name,
+            "amount": self.amount,
+            "space": self.key,
+        });
+        if let Some(payout) = payout {
+            row["payout"] = json!(payout);
+        }
+        row
+    }
+}
+
 struct Round {
     started: Instant,
     deadline: Instant,
@@ -135,13 +154,13 @@ fn own_bets(bets: &[Bet], user: u64) -> Vec<Value> {
 impl Completed {
     fn snapshot(&self, user: u64) -> Value {
         let mut totals = BTreeMap::new();
+        let mut bets = Vec::with_capacity(self.bets.len());
         for bet in &self.bets {
-            let net = self
-                .number
-                .map_or(0, |number| bet.amount * (bet.space.multiplier(number) - 1));
+            let payout = bet.payout(self.number);
+            bets.push(bet.public_snapshot(Some(payout)));
             let (name, total) = totals.entry(bet.user).or_insert((bet.name.as_str(), 0));
             *name = &bet.name;
-            *total += net;
+            *total += payout - bet.amount;
         }
         let mut players: Vec<_> = totals.into_iter().collect();
         players.sort_by_key(|&(user, (_, net))| (std::cmp::Reverse(net), user));
@@ -149,6 +168,7 @@ impl Completed {
             "id": self.id.to_string(),
             "number": self.number,
             "refunded": self.number.is_none(),
+            "bets": bets,
             "your_bets": own_bets(&self.bets, user),
             "players": players.into_iter().map(|(id, (name, net))| json!({
                 "id": id.to_string(), "name": name, "net": net,
@@ -169,7 +189,7 @@ impl Table {
             let payouts: Vec<_> = round
                 .bets
                 .iter()
-                .map(|bet| (bet.ticket, bet.amount * bet.space.multiplier(drawn)))
+                .map(|bet| (bet.ticket, bet.payout(Some(drawn))))
                 .collect();
             match wagers::settle(db, self.round_id, &payouts) {
                 Ok(()) => number = Some(drawn),
@@ -214,6 +234,7 @@ impl Table {
                 "refunding": round.refund_pending,
                 "bet_count": round.bets.len(),
                 "player_count": round.bets.iter().map(|bet| bet.user).collect::<HashSet<_>>().len(),
+                "bets": round.bets.iter().map(|bet| bet.public_snapshot(None)).collect::<Vec<_>>(),
                 "your_bets": own_bets(&round.bets, user),
             })
         });
@@ -503,6 +524,63 @@ mod tests {
     }
 
     #[test]
+    fn public_bets_keep_each_stake_and_report_exact_round_payouts() {
+        let f = Fixture::new();
+        let idle = f.call(3, 0, "state", json!({}));
+        let stakes = [(1, "red", 10), (1, "red", 13), (2, "black", 17), (2, "0", 19)];
+        for (i, (user, space, amount)) in stakes.into_iter().enumerate() {
+            let placed = f.call(user, 0, "bet", json!({
+                "round_id": idle["round_id"], "request_id": format!("private-{i}"),
+                "bet": amount.to_string(), "space": space,
+            }));
+            assert!(placed["bet_error"].is_null());
+        }
+        let open = f.call(3, 0, "state", json!({}));
+        assert_eq!(open["round"]["your_bets"], json!([]));
+        let public = open["round"]["bets"].as_array().unwrap();
+        assert_eq!(public.len(), stakes.len());
+        for (row, (user, space, amount)) in public.iter().zip(stakes) {
+            assert_eq!(row, &json!({
+                "user_id": user.to_string(), "name": "Игрок", "space": space, "amount": amount,
+            }));
+        }
+
+        let settled = f.call(3, 15, "state", json!({}));
+        let result = &settled["last_result"];
+        assert_eq!(result["id"], open["round"]["id"]);
+        assert!(settled["round"].is_null());
+        let number = result["number"].as_u64().unwrap() as u8;
+        let mut totals = [0; 2];
+        let paid = result["bets"].as_array().unwrap();
+        assert_eq!(paid.len(), public.len());
+        for ((row, before), (user, space, amount)) in paid.iter().zip(public).zip(stakes) {
+            let multiplier = match space {
+                "red" if RED.contains(&number) => 2,
+                "black" if number != 0 && !RED.contains(&number) => 2,
+                "0" if number == 0 => 36,
+                _ => 0,
+            };
+            let mut expected = before.clone();
+            expected["payout"] = json!(amount * multiplier);
+            assert_eq!(row, &expected);
+            totals[user as usize - 1] += amount * (multiplier - 1);
+        }
+        for (index, net) in totals.into_iter().enumerate() {
+            let player = f.call(index as u64 + 1, 15, "state", json!({}));
+            assert_eq!(player["balance"], 500 + net);
+            assert_eq!(player["last_result"]["bets"], result["bets"]);
+        }
+        let next = f.call(3, 16, "bet", json!({
+            "round_id": settled["round_id"], "request_id": "next", "bet": "20", "space": "even",
+        }));
+        assert_ne!(next["round"]["id"], result["id"]);
+        assert_eq!(next["round"]["bets"], json!([
+            {"user_id": "3", "name": "Игрок", "space": "even", "amount": 20}
+        ]));
+        assert_eq!(next["last_result"]["bets"], result["bets"]);
+    }
+
+    #[test]
     fn wagers_below_ten_do_not_open_a_round() {
         let f = Fixture::new();
         let idle = f.call(1, 0, "state", json!({}));
@@ -629,6 +707,9 @@ mod tests {
         assert_eq!(settled["last_result"]["refunded"], true);
         assert!(settled["last_result"]["number"].is_null());
         assert_eq!(settled["last_result"]["players"][0]["net"], 0);
+        for bet in settled["last_result"]["bets"].as_array().unwrap() {
+            assert_eq!(bet["payout"], bet["amount"]);
+        }
         assert_eq!(wagers::refund(&f.db, None).unwrap(), 0);
     }
 

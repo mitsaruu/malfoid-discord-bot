@@ -33,6 +33,7 @@ const keyboardEl = document.getElementById("keyboard");
 const statusEl = document.getElementById("status");
 
 let session = null;   // пропуск от сервера бота
+let activityProfile = null;
 let state = null;     // состояние партии с сервера
 let typed = "";       // что игрок сейчас набирает
 let busy = false;     // ждём ответа сервера
@@ -161,6 +162,16 @@ async function api(path, body, { signal = AbortSignal.timeout(path === "api/toke
   if (!response.ok) throw new Error(data.error || "Сервер бота не ответил (" + response.status + ")");
   return data;
 }
+
+async function loadGameAvatar(path) {
+  if (!session) return null;
+  const response = await fetch(path, {
+    headers: { Authorization: `Bearer ${session}` }, signal: AbortSignal.timeout(8000),
+  });
+  return response.ok ? response.blob() : null;
+}
+
+const gameAvatar = user => loadGameAvatar(`api/game-avatar/${encodeURIComponent(user)}.png`);
 
 // ---------- Экран загрузки ----------
 function loading(text, percent) {
@@ -548,15 +559,10 @@ function openGame(game) {
         if (!session) return Promise.reject(new Error("Соединение с Discord закрыто."));
         return api(`api/games/${game}/${action}`, fields);
       };
-      const avatar = game === "durak" ? async (room, user) => {
-        if (!session) return null;
-        const path = `api/durak/avatar/${encodeURIComponent(room)}/${encodeURIComponent(user)}.png`;
-        const response = await fetch(path, {
-          headers: { Authorization: `Bearer ${session}` }, signal: AbortSignal.timeout(8000),
-        });
-        return response.ok ? response.blob() : null;
-      } : undefined;
-      casinoViews.set(game, mount({ root, request, avatar }));
+      const avatar = game === "durak"
+        ? (room, user) => loadGameAvatar(`api/durak/avatar/${encodeURIComponent(room)}/${encodeURIComponent(user)}.png`)
+        : gameAvatar;
+      casinoViews.set(game, mount({ root, request, avatar, profile: game === "durak" ? activityProfile : null }));
     }
     casinoViews.get(game).show();
   }
@@ -603,11 +609,14 @@ async function start() {
       code, guild_id: params.get("guild_id"), channel_id: params.get("channel_id"),
     });
     session = login.session;
+    if (login.user_id && login.name) {
+      activityProfile = { name: login.name, avatar: () => gameAvatar(login.user_id) };
+    }
     await discordCommand("AUTHENTICATE", { access_token: login.access_token });
     if (typeof createRocketView === "function") {
       rocket = createRocketView((path, body) => api(path, body, {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
-      }));
+      }), gameAvatar);
     }
     gameSwitch.hidden = false;
     document.getElementById("game-audio").hidden = false;

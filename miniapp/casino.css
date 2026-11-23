@@ -120,6 +120,8 @@
 .casino-seat p { color: #c2d0de; font-size: .74rem; }
 .casino-seat--own { border-color: #7b9bad; }
 .casino-seat--active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.casino-seat .game-player-identity { justify-content: center; margin-bottom: 6px; }
+.casino-seat .game-player-avatar { --avatar-size: 30px; }
 
 /* Poker */
 .poker-table > * + * { margin-top: 10px; }
@@ -365,6 +367,8 @@
 }
 
 @media (max-width: 640px) {
+  .poker-seat .game-player-identity { flex-direction: column; gap: 4px; }
+  .poker-seat .game-player-avatar { --avatar-size: 24px; }
   .poker-felt {
     grid-template-columns: repeat(4, minmax(0, 1fr));
     grid-template-rows: auto minmax(100px, auto) auto;

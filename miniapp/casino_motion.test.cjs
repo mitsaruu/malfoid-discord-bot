@@ -4,7 +4,7 @@ const { join } = require("node:path");
 const test = require("node:test");
 const { runInNewContext } = require("node:vm");
 
-function fixture(game, { reduced = false, audio = true } = {}) {
+function fixture(game, { reduced = false, audio = true, avatar = false } = {}) {
   const calls = [];
   const sounds = [];
   const cues = [];
@@ -19,13 +19,16 @@ function fixture(game, { reduced = false, audio = true } = {}) {
     children = [];
     style = { setProperty() {} };
     dataset = {};
-    classList = { toggle() {} };
+    classList = { add() {}, toggle() {} };
     #value = "";
     get value() { return this.#value; }
     set value(value) { this.#value = String(value); }
     append(...children) {
-      for (const child of children) child.parent = this;
-      this.children.push(...children);
+      for (const child of children) {
+        const node = typeof child === "string" ? Object.assign(new Element(), { textContent: child }) : child;
+        node.parent = this;
+        this.children.push(node);
+      }
     }
     prepend(child) {
       child.parent = this;
@@ -60,9 +63,19 @@ function fixture(game, { reduced = false, audio = true } = {}) {
     createElement: (tag) => Object.assign(new Element(), { tag }),
   });
   const motion = Object.assign(new EventTarget(), { matches: reduced });
+  const loadAvatar = avatar ? async () => null : undefined;
   const window = Object.assign(new EventTarget(), {
     matchMedia: () => motion,
     getComputedStyle: () => ({ rowGap: "2px" }),
+    createGameAvatars: avatar ? (loader) => {
+      assert.equal(loader, loadAvatar);
+      return {
+        image(id, name, active = false) {
+          return Object.assign(new Element(), { className: "game-player-avatar", id, name, active });
+        },
+        clear() {},
+      };
+    } : undefined,
     GameAudio: audio ? {
       play(name, delay = 0) {
         sounds.push(name);
@@ -74,7 +87,7 @@ function fixture(game, { reduced = false, audio = true } = {}) {
       },
     } : undefined,
   });
-  const file = game === "slots" ? "casino_slots.js" : `${game}.js`;
+  const file = { slots: "casino_slots.js", blackjack: "table_blackjack.js" }[game] ?? `${game}.js`;
   runInNewContext(readFileSync(join(__dirname, file), "utf8"), {
     document, window, matchMedia: window.matchMedia, performance: { now: () => time },
     crypto: { randomUUID: () => "wager" },
@@ -89,7 +102,8 @@ function fixture(game, { reduced = false, audio = true } = {}) {
     clearInterval: (id) => intervals.delete(id),
   });
   const view = window.CasinoGames[game]({
-    root, request: (action, fields) => new Promise((resolve, reject) => calls.push({ action, fields, resolve, reject })),
+    root, avatar: loadAvatar,
+    request: (action, fields) => new Promise((resolve, reject) => calls.push({ action, fields, resolve, reject })),
   });
 
   function descendants(node) {
@@ -139,6 +153,7 @@ const receipt = (number, net) => ({
 });
 const rouletteState = (round = null, last_result = null) =>
   ({ user_id: "1", round_id: "round", round, last_result, balance: 500, min_bet: 10, max_bet: 500, max_bets: 10 });
+const roundBet = (user_id, name, space, amount) => ({ user_id, name, space, amount });
 const rotation = (wheel) => Number(wheel.style.transform?.match(/rotate\((.+)deg\)/)?.[1] ?? 0);
 const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-8, `${actual} ≈ ${expected}`);
 
@@ -148,6 +163,58 @@ function assertPocket(ball, wheel, index) {
   near(parseFloat(ball.style.left), 50 + 34.2 * Math.sin(angle));
   near(parseFloat(ball.style.top), 50 - 34.2 * Math.cos(angle));
 }
+
+test("roulette keeps individual stakes visible and reveals their payouts only after landing", async () => {
+  const f = fixture("roulette", { avatar: true });
+  const bets = [roundBet("2", "Алиса", "red", 10), roundBet("2", "Алиса", "3", 15)];
+  const settled = {
+    ...receipt(3),
+    bets: [...bets.map((bet, i) => ({ ...bet, payout: [20, 540][i] })),
+      { ...roundBet("3", "Борис", "black", 30), payout: 0 }],
+  };
+  const textOf = (className) => f.nodes(className).map((node) => String(node.textContent));
+
+  f.view.show();
+  await f.respond("state", rouletteState({ ...openRound, bets }));
+  assert.equal(f.node("roulette-bets-panel").children[0].textContent, "Ставки раунда");
+  assert.equal(f.node("roulette-layout").children[0], f.node("roulette-bets-panel"));
+  assert.deepEqual(f.nodes("game-player-avatar").map(({ id, name }) => [id, name]), [["2", "Алиса"], ["2", "Алиса"]]);
+  assert.deepEqual(textOf("roulette-bet-position"), ["Красное", "3"]);
+  assert.deepEqual(textOf("roulette-bet-amount"), ["10", "15"]);
+  assert.deepEqual(textOf("roulette-bet-payout"), []);
+
+  await f.poll(rouletteState(null, settled));
+  assert.deepEqual(textOf("roulette-bet-position"), ["Красное", "3", "Чёрное"]);
+  f.frame(2799);
+  assert.deepEqual(textOf("roulette-bet-payout"), []);
+  f.frame(2800);
+  assert.equal(f.node("roulette-result-number").textContent, 3);
+  assert.deepEqual(textOf("roulette-bet-payout"), ["Выплата 20", "Выплата 540", "Выплата 0"]);
+  await f.poll(rouletteState(null, settled));
+  assert.equal(f.nodes("roulette-bet-payout").length, 3);
+
+  const next = { ...openRound, id: "next", bets: [roundBet("4", "Вера", "0", 25)] };
+  await f.poll(rouletteState(next, settled));
+  assert.deepEqual(textOf("roulette-bet-position"), ["0"]);
+  assert.deepEqual(textOf("roulette-bet-amount"), ["25"]);
+  assert.deepEqual(textOf("roulette-bet-payout"), []);
+  assert.equal(f.node("roulette-result-number").textContent, "—");
+});
+
+test("roulette does not put a previous spin's payouts on an already open round", async () => {
+  const f = fixture("roulette");
+  f.view.show();
+  await f.respond("state", rouletteState({ ...openRound, bets: [roundBet("1", "Алиса", "3", 10)] }));
+  const settled = { ...receipt(3, 350), bets: [{ ...roundBet("1", "Алиса", "3", 10), payout: 360 }] };
+  await f.poll(rouletteState(null, settled));
+  const next = { ...openRound, id: "next", bets: [roundBet("2", "Борис", "black", 20)] };
+  await f.poll(rouletteState(next, settled));
+  f.frame(2800);
+  assert.equal(f.node("roulette-bet-position").textContent, "Чёрное");
+  assert.equal(f.nodes("roulette-bet-payout").length, 0);
+  assert.equal(f.node("roulette-result-number").textContent, "—");
+  assert.ok(f.sounds.includes("roulette.land"));
+});
 
 test("roulette spins at a steady speed before the first state reply and during betting", async () => {
   const f = fixture("roulette");
@@ -331,6 +398,48 @@ test("a roulette refund leaves the ball hidden and preserves the idle cadence", 
   f.frame(1000);
   near(rotation(f.node("roulette-wheel")), pocket);
   assert.deepEqual(f.sounds, ["roulette.tick"]);
+});
+
+test("poker seats render their names and mark the acting player's avatar", async () => {
+  const f = fixture("poker", { avatar: true });
+  f.view.show();
+  await f.respond("state", {
+    balance: 500, min_buy_in: 100, max_buy_in: 1000, small_blind: 5, big_blind: 10,
+    table: {
+      id: "poker-round", status: "playing", street: "preflop", board: [], actor: 1, you: 0,
+      pot: 15, remaining_ms: 1000,
+      seats: [
+        { id: "1", name: "Алиса", stack: 100, rank: null, cards: ["A♥", "3♣"] },
+        { id: "2", name: "Борис", stack: 100, rank: null, cards: null },
+        { id: null, name: "Бот", stack: 100, rank: null, cards: null },
+      ],
+    },
+  });
+  assert.deepEqual(f.nodes("game-player-avatar").map(({ id, name, active }) => [id, name, active]),
+    [["1", "Алиса", false], ["2", "Борис", true], [null, "Бот", false]]);
+  assert.deepEqual(f.nodes("game-player-identity").map((identity) => identity.children.at(-1).textContent),
+    ["Алиса (вы)", "Борис", "Бот"]);
+});
+
+test("blackjack marks the avatar of the player with the active hand", async () => {
+  const f = fixture("blackjack", { avatar: true });
+  const hand = (active) => ({ active, cards: ["9♥", "6♣"], total: 15, bet: 10 });
+  f.view.show();
+  await f.respond("state", {
+    user_id: "1", balance: 500, actions: [],
+    table: {
+      id: "blackjack-round", phase: "playing", current_user: "2", remaining_ms: 1000,
+      dealer: { cards: ["J♥", null], total: 10 },
+      players: [
+        { id: "1", name: "Алиса", bet: 10, hands: [hand(false)] },
+        { id: "2", name: "Борис", bet: 10, hands: [hand(false), hand(true)] },
+      ],
+    },
+  });
+  assert.deepEqual(f.nodes("game-player-avatar").map(({ id, name, active }) => [id, name, active]),
+    [["1", "Алиса", false], ["2", "Борис", true]]);
+  assert.deepEqual(f.nodes("game-player-identity").map((identity) => identity.children.at(-1).textContent),
+    ["Алиса (вы)", "Борис"]);
 });
 
 const symbols = Array.from({ length: 6 }, (_, index) => ({ icon: String(index), name: String(index), payouts: [] }));

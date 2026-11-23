@@ -1,4 +1,4 @@
-(window.CasinoGames ||= {}).poker = function ({ root, request }) {
+(window.CasinoGames ||= {}).poker = function ({ root, request, avatar }) {
   const streets = { preflop: "Префлоп", flop: "Флоп", turn: "Тёрн", river: "Ривер" };
   const ranks = ["Старшая карта", "Пара", "Две пары", "Тройка", "Стрит", "Флеш",
     "Фулл-хаус", "Каре", "Стрит-флеш"];
@@ -8,6 +8,7 @@
   const moves = { fold: "пас", check: "чек", call: "колл", bet: "ставка", raise: "рейз", all_in: "олл-ин" };
   const fmt = new Intl.NumberFormat("ru-RU");
   const motion = matchMedia("(prefers-reduced-motion: reduce)");
+  const avatars = window.createGameAvatars?.(avatar);
   const amount = (value) => fmt.format(value);
 
   function node(tag, label, className) {
@@ -276,11 +277,15 @@
     table.seats.forEach((seat, i) => {
       const player = node("section", "", "casino-seat poker-seat");
       const own = table.you === i;
+      const active = table.actor === i;
       const offset = (i - (table.you ?? 0) + table.seats.length) % table.seats.length;
       player.dataset.position = String(Math.round(offset * 10 / table.seats.length));
       player.classList.toggle("casino-seat--own", own);
-      player.classList.toggle("casino-seat--active", table.actor === i);
-      player.append(node("h3", seat.name + (own ? " (вы)" : "")));
+      player.classList.toggle("casino-seat--active", active);
+      const identity = node("div", "", "game-player-identity");
+      if (avatars) identity.append(avatars.image(seat.id, seat.name, active));
+      identity.append(node("h3", seat.name + (own ? " (вы)" : "")));
+      player.append(identity);
       const chips = mode === "solo" ? "фишек" : "монет";
       const stack = table.status === "finished" && mode === "online" ? "Выплата" : "Стек";
       player.append(node("p", `${stack} ${amount(seat.stack)} ${chips}`, "casino-seat-stack"));
@@ -527,6 +532,7 @@
     hide() {
       visible = false;
       clearInterval(timer);
+      avatars?.clear();
       reset();
     },
   };

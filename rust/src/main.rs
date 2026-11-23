@@ -135,7 +135,7 @@ impl Data {
             music_runtime: Default::default(),
             db: std::sync::Arc::new(database),
             economy: economy::EconomySettings::load(settings),
-            rocket: Default::default(),
+            rocket: rocket::State::with_settings(settings),
             casino_solo: Default::default(),
             poker: Default::default(),
             table_blackjack: Default::default(),

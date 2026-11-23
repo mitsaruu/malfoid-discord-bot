@@ -1,9 +1,10 @@
 //! Guild-local multiplayer Durak. Room mutations and snapshots share one lock.
 
 use crate::durak::{Card, DECK_SIZE, FULL_DECK_SIZE, HAND_SIZE};
-use rand::{Rng, seq::SliceRandom};
-use serde_json::{Value, json};
+use rand::{seq::SliceRandom, Rng};
+use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -11,6 +12,7 @@ use std::{
 const MAX_ROOMS: usize = 256;
 const INACTIVE_TTL: Duration = Duration::from_secs(30 * 60);
 const FINISHED_TTL: Duration = Duration::from_secs(10 * 60);
+const TABLE_EVENTS: usize = 96;
 const REACTION_TTL: Duration = Duration::from_secs(5);
 const REACTION_COOLDOWN: Duration = Duration::from_secs(2);
 const REACTIONS: [&str; 6] = ["👍", "😂", "😮", "👏", "😎", "😤"];
@@ -62,9 +64,7 @@ impl State {
     ) -> Result<Value, String> {
         let mut store = self.store.lock().map_err(|_| "Игра недоступна.")?;
         let now = Instant::now();
-        store
-            .rooms
-            .retain(|room| room.is_playing() || !room.expired(now));
+        store.rooms.retain(|room| !room.expired(now));
         let mut current = store
             .rooms
             .iter()
@@ -146,7 +146,7 @@ impl State {
                     "online_move" => {
                         let mut next = room.clone();
                         let played = Instant::now();
-                        next.play(seat, body, played)?;
+                        next.play(seat, body)?;
                         next.changed = played;
                         room.commit(bank, next)?;
                     }
@@ -267,7 +267,6 @@ struct Options {
     deck: u8,
     cheating: bool,
     throwers: Throwers,
-    speed: Speed,
     stake: i64,
 }
 
@@ -287,11 +286,6 @@ impl Options {
             Some(Some("neighbors")) => Throwers::Neighbors,
             _ => return Err("Выберите, кто может подкидывать карты."),
         };
-        let speed = match body.get("speed").map(Value::as_str) {
-            None | Some(Some("slow")) => Speed::Slow,
-            Some(Some("fast")) => Speed::Fast,
-            _ => return Err("Выберите темп игры."),
-        };
         let stake = body
             .get("stake")
             .map_or(Some(0), Value::as_i64)
@@ -301,7 +295,6 @@ impl Options {
             deck,
             cheating,
             throwers,
-            speed,
             stake,
         })
     }
@@ -319,28 +312,6 @@ impl Throwers {
             Self::All => "all",
             Self::Neighbors => "neighbors",
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Speed {
-    Slow,
-    Fast,
-}
-
-impl Speed {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Slow => "slow",
-            Self::Fast => "fast",
-        }
-    }
-
-    fn turn_time(self) -> Duration {
-        Duration::from_secs(match self {
-            Self::Slow => 45,
-            Self::Fast => 15,
-        })
     }
 }
 
@@ -395,7 +366,7 @@ struct Room {
 #[derive(Clone)]
 struct Settlement {
     loser: Option<u64>,
-    next: Option<Box<Room>>,
+    next: Box<Room>,
 }
 
 impl Room {
@@ -406,7 +377,8 @@ impl Room {
     fn expired(&self, now: Instant) -> bool {
         let ttl = match self.game.as_ref().map(|game| &game.phase) {
             Some(Phase::Finished { .. }) => FINISHED_TTL,
-            _ => INACTIVE_TTL,
+            None => INACTIVE_TTL,
+            Some(_) => return false,
         };
         now.duration_since(self.changed) >= ttl
     }
@@ -438,7 +410,7 @@ impl Room {
             bank.reserve(self.round, self.guild, &players, self.options.stake)?;
         }
         self.changed = Instant::now();
-        self.game = Some(Game::new(self.players.len(), self.options, self.changed));
+        self.game = Some(Game::new(self.players.len(), self.options));
         Ok(())
     }
 
@@ -446,28 +418,7 @@ impl Room {
         if self.pending.is_some() {
             return self.settle_pending(bank);
         }
-        if self.expired(now) {
-            if self.options.stake > 0 && self.is_playing() {
-                self.pending = Some(Settlement {
-                    loser: None,
-                    next: None,
-                });
-                return self.settle_pending(bank);
-            }
-            return Ok(false);
-        }
-        if let Some(seat) = self
-            .game
-            .as_ref()
-            .filter(|game| now >= game.deadline)
-            .and_then(Game::turn)
-        {
-            let mut next = self.clone();
-            next.forfeit(seat, "не успел сделать ход и проиграл.");
-            next.changed = now;
-            return self.commit(bank, next);
-        }
-        Ok(true)
+        Ok(!self.expired(now))
     }
 
     fn commit(&mut self, bank: &impl Bank, next: Self) -> Result<bool, String> {
@@ -478,7 +429,7 @@ impl Room {
                 // Preserve both the live state and the original outcome across bank failures.
                 self.pending = Some(Settlement {
                     loser,
-                    next: Some(Box::new(next)),
+                    next: Box::new(next),
                 });
                 return self.settle_pending(bank);
             }
@@ -491,9 +442,7 @@ impl Room {
         let pending = self.pending.as_ref().expect("pending settlement");
         bank.settle(self.round, pending.loser)?;
         let pending = self.pending.take().expect("settled outcome");
-        let Some(mut next) = pending.next else {
-            return Ok(false);
-        };
+        let mut next = pending.next;
         next.changed = Instant::now();
         *self = *next;
         Ok(self.host().is_some())
@@ -528,7 +477,6 @@ impl Room {
             "deck": self.options.deck,
             "cheating": self.options.cheating,
             "throwers": self.options.throwers.name(),
-            "speed": self.options.speed.name(),
             "stake": self.options.stake,
             "capacity": self.capacity,
             "host": self.host().expect("occupied room").id.to_string(),
@@ -547,7 +495,7 @@ impl Room {
         detail["game"] = self
             .game
             .as_ref()
-            .map_or(Value::Null, |game| game.view(self, seat, now));
+            .map_or(Value::Null, |game| game.view(self, seat));
         detail
     }
 
@@ -555,7 +503,7 @@ impl Room {
         format!("{}-{}", self.id, game.version)
     }
 
-    fn play(&mut self, seat: usize, body: &Value, now: Instant) -> Result<(), String> {
+    fn play(&mut self, seat: usize, body: &Value) -> Result<(), String> {
         let game = self.game.as_ref().ok_or(ILLEGAL)?;
         if body["revision"].as_str() != Some(self.revision(game).as_str()) {
             return Err("Игра уже изменилась. Обновите её состояние.".into());
@@ -571,7 +519,6 @@ impl Room {
         let version = game.version.checked_add(1).ok_or("Игра недоступна.")?;
         game.play(seat, movement, &self.players, self.options.throwers);
         game.version = version;
-        game.deadline = now + self.options.speed.turn_time();
         Ok(())
     }
 
@@ -658,6 +605,36 @@ struct Pair {
     defense: Option<Card>,
 }
 
+#[derive(Clone, Copy)]
+struct TableEvent {
+    id: u64,
+    kind: &'static str,
+    seat: usize,
+    card: Option<Card>,
+    index: Option<usize>,
+    count: Option<usize>,
+}
+
+impl TableEvent {
+    fn view(self, players: &[Player], viewer: usize) -> Value {
+        let mut event =
+            json!({"id": self.id, "kind": self.kind, "player": players[self.seat].id.to_string()});
+        if let Some(card) = self
+            .card
+            .filter(|_| self.seat == viewer || !matches!(self.kind, "deal" | "draw"))
+        {
+            event["card"] = card.view();
+        }
+        if let Some(index) = self.index {
+            event["index"] = json!(index);
+        }
+        if let Some(count) = self.count {
+            event["count"] = json!(count);
+        }
+        event
+    }
+}
+
 #[derive(Clone)]
 struct Game {
     version: u64,
@@ -670,12 +647,14 @@ struct Game {
     defender: usize,
     limit: usize,
     phase: Phase,
-    deadline: Instant,
+    events: VecDeque<TableEvent>,
+    discard_count: usize,
+    last_action: Option<(usize, &'static str)>,
     cheated: Vec<bool>,
 }
 
 impl Game {
-    fn new(count: usize, options: Options, now: Instant) -> Self {
+    fn new(count: usize, options: Options) -> Self {
         let mut rng = rand::rng();
         let lowest_rank = 13 - usize::from(options.deck) / 4;
         let mut deck: Vec<_> = (1..=FULL_DECK_SIZE)
@@ -683,20 +662,26 @@ impl Game {
             .filter(|card| card.rank() >= lowest_rank)
             .collect();
         deck.shuffle(&mut rng);
-        Self::deal(
-            deck,
-            count,
-            rng.random_range(0..count),
-            now + options.speed.turn_time(),
-        )
+        Self::deal(deck, count, rng.random_range(0..count))
     }
 
-    fn deal(mut deck: Vec<Card>, count: usize, first: usize, deadline: Instant) -> Self {
+    fn deal(mut deck: Vec<Card>, count: usize, first: usize) -> Self {
         let trump = deck[0];
         let mut hands = vec![Vec::with_capacity(HAND_SIZE); count];
+        let mut events = VecDeque::with_capacity(HAND_SIZE * count);
         for _ in 0..HAND_SIZE {
             for offset in 0..count {
-                hands[(first + offset) % count].push(deck.pop().expect("full deck"));
+                let seat = (first + offset) % count;
+                let card = deck.pop().expect("full deck");
+                hands[seat].push(card);
+                events.push_back(TableEvent {
+                    id: events.len() as u64 + 1,
+                    kind: "deal",
+                    seat,
+                    card: Some(card),
+                    index: None,
+                    count: Some(deck.len()),
+                });
             }
         }
         let opener = hands
@@ -717,9 +702,33 @@ impl Game {
             defender: (opener + 1) % count,
             limit: HAND_SIZE,
             phase: Phase::Open,
-            deadline,
+            events,
+            discard_count: 0,
+            last_action: None,
             cheated: vec![false; count],
         }
+    }
+
+    fn record(
+        &mut self,
+        kind: &'static str,
+        seat: usize,
+        card: Option<Card>,
+        index: Option<usize>,
+        count: Option<usize>,
+    ) {
+        let id = self.events.back().map_or(1, |event| event.id + 1);
+        if self.events.len() == TABLE_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(TableEvent {
+            id,
+            kind,
+            seat,
+            card,
+            index,
+            count,
+        });
     }
 
     fn seat_after(&self, seat: usize, offset: usize) -> usize {
@@ -815,8 +824,11 @@ impl Game {
             }
             hand.remove(index);
         }
+        let (kind, _) = movement.view();
+        self.last_action = Some((seat, kind));
         match movement {
             Move::Attack(card) => {
+                self.record("attack", seat, Some(card), Some(self.table.len()), None);
                 self.table.push(Pair {
                     attack: card,
                     defense: None,
@@ -832,16 +844,19 @@ impl Game {
                 }
             }
             Move::Defend(card) => {
-                self.table
-                    .iter_mut()
-                    .find(|pair| pair.defense.is_none())
-                    .expect("uncovered attack")
-                    .defense = Some(card);
+                let index = self
+                    .table
+                    .iter()
+                    .position(|pair| pair.defense.is_none())
+                    .expect("uncovered attack");
+                self.table[index].defense = Some(card);
+                self.record("defend", seat, Some(card), Some(index), None);
                 if self.table.iter().all(|pair| pair.defense.is_some()) {
                     self.offer_throws(0, false, players, throwers);
                 }
             }
             Move::Transfer(card) => {
+                self.record("transfer", seat, Some(card), Some(self.table.len()), None);
                 self.defender = self.next_with_cards(seat).expect("eligible next defender");
                 self.attacker = seat;
                 self.limit = self.hands[self.defender].len().min(HAND_SIZE);
@@ -852,6 +867,7 @@ impl Game {
             }
             Move::Take => self.offer_throws(0, true, players, throwers),
             Move::Pass => {
+                self.record("pass", seat, None, None, None);
                 let Phase::Throw { offset, taking } = self.phase else {
                     unreachable!("only attackers can pass");
                 };
@@ -887,6 +903,24 @@ impl Game {
     }
 
     fn finish_bout(&mut self, taking: bool, players: &[Player]) {
+        let count = self
+            .table
+            .iter()
+            .map(|pair| 1 + usize::from(pair.defense.is_some()))
+            .sum::<usize>();
+        if count > 0 {
+            let (seat, kind) = if taking {
+                (self.defender, "take")
+            } else {
+                self.discard_count += count;
+                (
+                    self.last_action.map_or(self.attacker, |action| action.0),
+                    "discard",
+                )
+            };
+            self.record(kind, seat, None, None, Some(count));
+            self.last_action = Some((seat, kind));
+        }
         for pair in self.table.drain(..) {
             if taking {
                 self.hands[self.defender].push(pair.attack);
@@ -943,15 +977,21 @@ impl Game {
     }
 
     fn refill(&mut self, seat: usize) {
-        let hand = &mut self.hands[seat];
-        while hand.len() < HAND_SIZE {
+        while self.hands[seat].len() < HAND_SIZE {
             let Some(card) = self.deck.pop() else { break };
-            hand.push(card);
+            self.hands[seat].push(card);
+            self.record("draw", seat, Some(card), None, Some(self.deck.len()));
         }
     }
 
-    fn view(&self, room: &Room, seat: usize, now: Instant) -> Value {
-        let hand: Vec<_> = self.hands[seat].iter().map(|card| card.view()).collect();
+    fn view(&self, room: &Room, seat: usize) -> Value {
+        let mut hand = self.hands[seat].clone();
+        hand.sort_unstable_by_key(|card| card.hand_order(self.trump));
+        let events: Vec<_> = self
+            .events
+            .iter()
+            .map(|event| event.view(&room.players, seat))
+            .collect();
         let table: Vec<_> = self
             .table
             .iter()
@@ -977,9 +1017,28 @@ impl Game {
             }
         }
 
-        let turn = self.turn().map(|seat| &room.players[seat]);
+        let turn_seat = self.turn();
+        let turn = turn_seat.map(|seat| &room.players[seat]);
         let name = turn.map_or("", |player| player.name.as_str());
         let message = match &self.phase {
+            Phase::Open if turn_seat == Some(seat) => "Выберите карту для атаки.".into(),
+            Phase::Defend if turn_seat == Some(seat) => {
+                if actions.contains(&"transfer") {
+                    "Отбейте карту, переведите ход или нажмите «Взять».".into()
+                } else if actions.contains(&"defend") {
+                    "Отбейте карту или нажмите «Взять».".into()
+                } else {
+                    "Нажмите «Взять», чтобы забрать карты со стола.".into()
+                }
+            }
+            Phase::Throw { taking, .. } if turn_seat == Some(seat) => {
+                let end = if *taking { "Пас" } else { "Бито" };
+                if actions.contains(&"attack") {
+                    format!("Подкиньте карту или нажмите «{end}».")
+                } else {
+                    format!("Нажмите «{end}», чтобы завершить ход.")
+                }
+            }
             Phase::Open => format!("Ходит {name}."),
             Phase::Defend => format!("Отбивается {name}."),
             Phase::Throw { taking: true, .. } => {
@@ -993,14 +1052,18 @@ impl Game {
         };
         json!({
             "revision": room.revision(self),
-            "hand": hand,
+            "hand": hand.into_iter().map(Card::view).collect::<Vec<_>>(),
             "trump": self.trump.view(),
             "deck_count": self.deck.len(),
+            "attack_limit": self.limit,
             "table": table,
             "actions": actions,
             "legal_cards": legal_cards,
             "turn": turn.map(|player| player.id.to_string()).unwrap_or_default(),
-            "remaining_ms": turn.map_or(0, |_| self.deadline.saturating_duration_since(now).as_millis()),
+            "discard_count": self.discard_count,
+            "bank": if self.turn().is_some() { room.options.stake * room.players.len() as i64 } else { 0 },
+            "events": events,
+            "last_action": self.last_action.map(|(actor, kind)| json!({"player": room.players[actor].id.to_string(), "kind": kind})),
             "message": message,
         })
     }
@@ -1214,67 +1277,23 @@ mod tests {
     }
 
     #[test]
-    fn sweep_retries_timeout_and_expiry_and_ignores_free_and_waiting_rooms() {
-        for (stake, start, expire) in [
-            (0, true, false),
-            (10, false, true),
-            (10, true, false),
-            (10, true, true),
-        ] {
+    fn idle_waiting_rooms_expire_but_started_games_never_advance_automatically() {
+        for (stake, start) in [(0, true), (10, false), (10, true)] {
             let state = State::default();
             let bank = RecordingBank::default();
             let body = bank_lobby(&state, &bank, stake);
-            if start {
-                bank_request(&state, &bank, 10, "online_start", &body).unwrap();
-            }
-            let loser = {
-                let mut store = state.store.lock().unwrap();
-                let room = &mut store.rooms[0];
-                if expire {
-                    room.changed = Instant::now() - INACTIVE_TTL;
-                }
-                room.game.as_mut().map(|game| {
-                    game.deadline = Instant::now();
-                    room.players[game.turn().unwrap()].id
-                })
-            };
-
-            if start && stake > 0 {
-                bank.fail_settle.store(true, Ordering::Relaxed);
-                assert_eq!(state.sweep(&bank), Err("settle failed".into()));
-                let store = state.store.lock().unwrap();
-                assert_eq!(store.rooms.len(), 1);
-                assert!(store.rooms[0].game.as_ref().unwrap().turn().is_some());
-                assert!(store.rooms[0].member(loser.unwrap()).is_some());
-                bank.fail_settle.store(false, Ordering::Relaxed);
-            }
-            state.sweep(&bank).unwrap();
-            state.sweep(&bank).unwrap();
-            {
-                let store = state.store.lock().unwrap();
-                if expire {
-                    assert!(store.rooms.is_empty());
-                } else {
-                    assert!(store.rooms[0].game.as_ref().unwrap().turn().is_none());
-                    assert!(store.rooms[0].member(loser.unwrap()).is_some());
-                }
-            }
-            let calls = bank.calls.lock().unwrap();
-            if start && stake > 0 {
-                let BankCall::Reserve(round, ..) = calls[0] else {
-                    panic!("expected reserve");
-                };
-                let outcome = if expire { None } else { loser };
-                assert_eq!(
-                    calls[1..],
-                    [
-                        BankCall::Settle(round, outcome),
-                        BankCall::Settle(round, outcome)
-                    ]
-                );
+            let before = if start {
+                bank_request(&state, &bank, 10, "online_start", &body).unwrap()
             } else {
-                assert!(calls.is_empty());
-            }
+                Value::Null
+            };
+            state.store.lock().unwrap().rooms[0].changed = Instant::now() - INACTIVE_TTL * 3;
+            state.sweep(&bank).unwrap();
+            let after = bank_request(&state, &bank, 10, "online_state", &json!({})).unwrap();
+            assert_eq!(after["room"]["game"], before["room"]["game"]);
+            assert_eq!(after["room"].is_null(), !start);
+            let calls = bank.calls.lock().unwrap();
+            assert_eq!(calls.len(), usize::from(start && stake > 0));
         }
     }
 
@@ -1298,7 +1317,6 @@ mod tests {
             json!({"deck":52,"capacity":7}),
             json!({"cheating":"true"}),
             json!({"throwers":"other"}),
-            json!({"speed":null}),
             json!({"stake":9}),
             json!({"stake":1_000_001}),
             json!({"stake":-10}),
@@ -1322,7 +1340,6 @@ mod tests {
             ("deck", json!(36)),
             ("cheating", json!(false)),
             ("throwers", json!("all")),
-            ("speed", json!("slow")),
             ("stake", json!(0)),
         ] {
             assert_eq!(created["room"][field], value);
@@ -1391,20 +1408,16 @@ mod tests {
         assert!(state.handle(1, other, "", "online_move", &action).is_err());
         let result = state.handle(1, turn, "", "online_move", &action).unwrap();
         let after = &result["room"]["game"];
-        assert!(
-            !after["actions"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("cheat"))
-        );
+        assert!(!after["actions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("cheat")));
         assert!(after["hand"].as_array().unwrap().contains(&top.view()));
-        assert!(
-            after["hand"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|card| card["id"] != swapped)
-        );
+        assert!(after["hand"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|card| card["id"] != swapped));
         assert_eq!(after["turn"], before["turn"]);
         assert_ne!(after["revision"], before["revision"]);
         let observer_after = snapshot(other);
@@ -1452,10 +1465,6 @@ mod tests {
         assert_eq!(
             sent["room"]["game"]["revision"],
             before["room"]["game"]["revision"]
-        );
-        assert!(
-            sent["room"]["game"]["remaining_ms"].as_u64().unwrap()
-                <= before["room"]["game"]["remaining_ms"].as_u64().unwrap()
         );
         assert!(state.handle(1, 10, "", "online_react", &reaction).is_err());
         let other = state.handle(1, 20, "", "online_react", &reaction).unwrap();
@@ -1524,74 +1533,29 @@ mod tests {
     }
 
     #[test]
-    fn tempo_resets_per_accepted_move_and_timeout_forfeits_the_turn() {
-        for (speed, milliseconds) in [("fast", 15_000), ("slow", 45_000)] {
-            let state = State::default();
-            let (created, room) = create_room(&state, json!({"speed":speed}));
-            assert_eq!(created["room"]["speed"], speed);
-            let started = state.handle(1, 10, "", "online_start", &room).unwrap();
-            let remaining = started["room"]["game"]["remaining_ms"].as_u64().unwrap();
-            assert!((milliseconds - 1_000..=milliseconds).contains(&remaining));
-            let (turn, other) = {
-                let mut store = state.store.lock().unwrap();
-                let room = &mut store.rooms[0];
-                let game = room.game.as_mut().unwrap();
-                game.deadline = Instant::now() + Duration::from_secs(5);
-                let seat = game.turn().unwrap();
-                (room.players[seat].id, room.players[1 - seat].id)
-            };
-            let snapshot = state
-                .handle(1, turn, "", "online_state", &json!({}))
-                .unwrap();
-            let game = &snapshot["room"]["game"];
-            let mut attack = json!({
-                "room_id":room["room_id"], "revision":game["revision"], "action":"attack", "card":0,
-            });
-            assert!(state.handle(1, turn, "", "online_move", &attack).is_err());
-            let after_invalid = state
-                .handle(1, turn, "", "online_state", &json!({}))
-                .unwrap();
-            assert!(
-                after_invalid["room"]["game"]["remaining_ms"]
-                    .as_u64()
-                    .unwrap()
-                    <= 5_000
-            );
-            attack["card"] = game["legal_cards"]["attack"][0].clone();
-            let after_attack = state.handle(1, turn, "", "online_move", &attack).unwrap();
-            let remaining = after_attack["room"]["game"]["remaining_ms"]
-                .as_u64()
-                .unwrap();
-            assert!((milliseconds - 1_000..=milliseconds).contains(&remaining));
-
-            state.store.lock().unwrap().rooms[0]
-                .game
-                .as_mut()
-                .unwrap()
-                .deadline = Instant::now();
-            let late_move = json!({"room_id":room["room_id"], "revision":after_attack["room"]["game"]["revision"], "action":"take"});
-            assert!(
-                state
-                    .handle(1, other, "", "online_move", &late_move)
-                    .is_err()
-            );
-            let finished = state
-                .handle(1, turn, "", "online_state", &json!({}))
-                .unwrap();
-            assert_eq!(finished["room"]["status"], "finished");
-            assert_eq!(finished["room"]["game"]["remaining_ms"], 0);
-            assert_eq!(finished["room"]["players"].as_array().unwrap().len(), 2);
-            let timed_out = state
-                .handle(1, other, "", "online_state", &json!({}))
-                .unwrap();
-            assert_eq!(timed_out["room"]["status"], "finished");
-            assert!(
-                timed_out["room"]["game"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("не успел")
-            );
+    fn round_events_are_ordered_and_never_reveal_the_opponents_deal() {
+        let state = State::default();
+        let (_, room) = create_room(&state, json!({}));
+        state.handle(1, 10, "", "online_start", &room).unwrap();
+        let hand = state.handle(1, 10, "", "online_state", &json!({})).unwrap();
+        let game = &hand["room"]["game"];
+        let events = game["events"].as_array().unwrap();
+        assert_eq!(events.len(), 12);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event["id"], (index + 1) as u64);
+            assert_eq!(event["kind"], "deal");
+            assert_eq!(event.get("card").is_some(), event["player"] == "10");
+            assert_eq!(event["count"], 35 - index as u64);
         }
+        let trump = Card(game["trump"]["id"].as_u64().unwrap() as u8);
+        let sorted: Vec<_> = game["hand"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| Card(card["id"].as_u64().unwrap() as u8).hand_order(trump))
+            .collect();
+        assert!(sorted.is_sorted());
+        assert!(game.get("remaining_ms").is_none());
     }
 
     #[test]
@@ -1635,12 +1599,10 @@ mod tests {
             .unwrap();
         assert_eq!(finished["room"]["status"], "finished");
         assert_eq!(finished["room"]["game"]["actions"], json!([]));
-        assert!(
-            finished["room"]["game"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Host")
-        );
+        assert!(finished["room"]["game"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Host"));
     }
 
     #[test]
@@ -1713,7 +1675,9 @@ mod tests {
                 defender: 1,
                 limit: 2,
                 phase: Phase::Open,
-                deadline: Instant::now() + Speed::Slow.turn_time(),
+                events: VecDeque::new(),
+                discard_count: 0,
+                last_action: None,
                 cheated: vec![false; 3],
             }),
             changed: Instant::now(),
@@ -1726,7 +1690,6 @@ mod tests {
         room.play(
             seat,
             &json!({"revision":revision, "action":action, "card":card}),
-            Instant::now(),
         )
     }
 
@@ -1780,12 +1743,8 @@ mod tests {
         assert_eq!(started["room"]["players"].as_array().unwrap().len(), 6);
         assert_eq!(started["room"]["game"]["deck_count"], 0);
 
-        state.store.lock().unwrap().rooms[0].game = Some(Game::deal(
-            (1..=DECK_SIZE).map(Card).collect(),
-            6,
-            0,
-            Instant::now() + Speed::Slow.turn_time(),
-        ));
+        state.store.lock().unwrap().rooms[0].game =
+            Some(Game::deal((1..=DECK_SIZE).map(Card).collect(), 6, 0));
         let mut snapshot = request(1, "online_state", &json!({}));
         for _ in 0..300 {
             if snapshot["room"]["status"] == "finished" {
@@ -1815,12 +1774,10 @@ mod tests {
         assert_eq!(snapshot["room"]["status"], "finished");
         assert_eq!(snapshot["room"]["game"]["table"], json!([]));
         assert_eq!(snapshot["room"]["game"]["actions"], json!([]));
-        assert!(
-            snapshot["room"]["game"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Player 1")
-        );
+        assert!(snapshot["room"]["game"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Player 1"));
         let counts: Vec<_> = snapshot["room"]["players"]
             .as_array()
             .unwrap()

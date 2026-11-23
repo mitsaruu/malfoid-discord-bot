@@ -32,17 +32,50 @@
 
 .roulette-layout {
   display: grid;
-  grid-template-columns: minmax(0, .66fr) minmax(0, 1fr);
+  grid-template-columns: minmax(190px, .7fr) minmax(0, 1fr) minmax(0, 1.65fr);
   align-items: start;
   gap: 14px;
 }
-.roulette-wheel-panel, .roulette-table, .roulette-panel {
+.roulette-wheel-panel, .roulette-table, .roulette-panel, .roulette-bets-panel {
   min-width: 0;
   border: 1px solid var(--roulette-edge);
   border-radius: 14px;
   background: var(--surface);
   padding: clamp(12px, 2vw, 18px);
 }
+.roulette-bets-panel { padding: 12px; }
+.roulette-bets-empty {
+  margin-top: 6px;
+  color: var(--roulette-muted);
+  font-size: .79rem;
+}
+.roulette-bets {
+  max-height: 258px;
+  margin-top: 8px;
+  padding: 0 8px;
+  overflow: auto;
+  list-style: none;
+  border: 1px solid var(--roulette-edge);
+  border-radius: 10px;
+  background: var(--inset);
+}
+.roulette-bets:empty { display: none; }
+.roulette-bets li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-block: 6px;
+  font-size: .79rem;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+.roulette-bets li + li { border-top: 1px solid var(--roulette-edge); }
+.roulette-bet-identity, .roulette-bet-values { display: grid; gap: 3px; min-width: 0; }
+.roulette-bet-identity { flex: 1; }
+.roulette-bet-values { text-align: right; }
+.roulette-bet-position, .roulette-bet-payout { color: var(--roulette-muted); font-size: .73rem; }
+.roulette-bet-payout[data-win="true"] { color: var(--roulette-accent); }
+
 .roulette-wheel-panel {
   display: grid;
   justify-items: center;
@@ -201,12 +234,16 @@
 .roulette-results [data-net="win"] { color: var(--roulette-accent); }
 .roulette-results [data-net="loss"] { color: #ffb8b2; }
 
-@media (max-width: 870px) {
-  .roulette-layout { grid-template-columns: 1fr; }
+@media (max-width: 990px) {
+  .roulette-layout { grid-template-columns: minmax(0, .72fr) minmax(0, 1fr); }
+  .roulette-table { grid-column: 1 / -1; }
   .roulette-wheel-frame { width: min(100%, 340px, 66vw); }
 }
 
 @media (max-width: 560px) {
+  .roulette-layout { grid-template-columns: minmax(0, 1fr); }
+  .roulette-wheel-panel { grid-row: 1; }
+  .roulette-bets { max-height: 148px; }
   .roulette-board { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .roulette-view .roulette-cell {
     grid-column: var(--mobile-column);

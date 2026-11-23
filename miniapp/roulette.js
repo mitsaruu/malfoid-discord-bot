@@ -1,4 +1,4 @@
-(window.CasinoGames ||= {}).roulette = function ({ root, request }) {
+(window.CasinoGames ||= {}).roulette = function ({ root, request, avatar }) {
   const wheelOrder = [0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10,
     5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26];
   const red = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
@@ -7,6 +7,7 @@
   const colorNames = { green: "Зеро", red: "Красное", black: "Чёрное" };
   const format = new Intl.NumberFormat("ru");
   const signed = new Intl.NumberFormat("ru", { signDisplay: "exceptZero" });
+  const avatars = window.createGameAvatars?.(avatar);
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
   const pocketAngle = 360 / wheelOrder.length;
   const launchRadius = 49;
@@ -49,6 +50,14 @@
   const wheelPanel = element("div", "", "roulette-wheel-panel");
   wheelPanel.append(wheelFrame, resultReadout);
 
+  const betsPanel = element("section", "", "roulette-bets-panel");
+  const betsTitle = element("h2", "Ставки раунда");
+  betsTitle.id = "roulette-bets-title";
+  betsPanel.setAttribute("aria-labelledby", betsTitle.id);
+  const betsEmpty = element("p", "Ставок пока нет", "roulette-bets-empty");
+  const betsList = element("ul", "", "roulette-bets");
+  betsPanel.append(betsTitle, betsEmpty, betsList);
+
   const table = element("section", "", "roulette-table");
   table.setAttribute("aria-label", "Стол ставок");
   const tableHeader = element("div", "", "roulette-table-header");
@@ -75,6 +84,8 @@
   let feedbackText = "";
   let feedbackTone = "";
   let shownResult = null;
+  let renderedResultKey;
+  let renderedBetsKey;
   let rotation = 0;
   let ballAngle = 0;
   let ballRadius = trackRadius;
@@ -153,7 +164,7 @@
   table.append(tableHeader, board, form, feedback, own);
 
   const layout = element("div", "", "roulette-layout");
-  layout.append(wheelPanel, table);
+  layout.append(betsPanel, wheelPanel, table);
   const results = element("section", "", "roulette-panel");
   results.hidden = true;
   const resultsList = element("ul", "", "roulette-results");
@@ -222,9 +233,11 @@
   }
   drawWheel();
 
-  function displayResult(result) {
-    shownResult = result;
-    if (result?.number !== null && result?.number !== undefined) {
+  function renderResult(result) {
+    const key = result?.id ?? (spin ? "spinning" : state?.round ? "betting" : null);
+    if (key === renderedResultKey) return;
+    renderedResultKey = key;
+    if (Number.isInteger(result?.number)) {
       const color = tone(result.number);
       resultNumber.textContent = result.number;
       resultNumber.dataset.tone = color;
@@ -232,7 +245,8 @@
     } else {
       resultNumber.textContent = "—";
       delete resultNumber.dataset.tone;
-      resultLabel.textContent = result ? "Ставки возвращены" : "Ожидаем первый результат";
+      resultLabel.textContent = result ? "Ставки возвращены" :
+        spin ? "Колесо вращается" : "Ожидаем результат";
     }
     results.hidden = !result;
     resultsList.replaceChildren(...(result?.players ?? []).map((player) => {
@@ -240,6 +254,37 @@
       const net = element("strong", signed.format(player.net));
       net.dataset.net = player.net > 0 ? "win" : player.net < 0 ? "loss" : "even";
       row.append(element("span", player.name + (player.id === state?.user_id ? " (вы)" : "")), net);
+      return row;
+    }));
+  }
+
+  function renderBets(result) {
+    const round = state?.round ?? spin?.result ?? result;
+    const bets = round?.bets ?? [];
+    // The server appends stakes in placement order and settles each round once.
+    const key = round ? round.id + ":" + bets.length + ":" + Boolean(result) : null;
+    if (key === renderedBetsKey) return;
+    renderedBetsKey = key;
+    betsEmpty.hidden = bets.length > 0;
+    betsList.replaceChildren(...bets.map((bet) => {
+      const row = element("li");
+      const identity = element("div", "", "roulette-bet-identity");
+      const name = bet.name + (bet.user_id === state.user_id ? " (вы)" : "");
+      identity.append(
+        element("strong", name, "roulette-bet-name"),
+        element("span", labels.get(bet.space) ?? bet.space, "roulette-bet-position"),
+      );
+      const amounts = element("div", "", "roulette-bet-values");
+      amounts.append(element("strong", format.format(bet.amount), "roulette-bet-amount"));
+      if (result && Number.isFinite(bet.payout)) {
+        const payout = element("span",
+          (result.refunded ? "Возврат " : "Выплата ") + format.format(bet.payout), "roulette-bet-payout");
+        payout.dataset.win = String(!result.refunded && bet.payout > 0);
+        amounts.append(payout);
+      }
+      const image = avatars?.image(bet.user_id, bet.name);
+      if (image) row.append(image);
+      row.append(identity, amounts);
       return row;
     }));
   }
@@ -292,7 +337,7 @@
     spin = null;
     rotateWheel(winningRotation(result));
     placeBall(0, pocketRadius);
-    displayResult(result);
+    shownResult = result;
     if (audible) {
       window.GameAudio?.play?.("roulette.land");
       const net = result.players?.find((player) => player.id === state?.user_id)?.net;
@@ -350,7 +395,7 @@
         startIdleWheel();
       }
       ball.hidden = true;
-      displayResult(result);
+      shownResult = result;
       return;
     }
     if (!canAnimate() || reduceMotion.matches) {
@@ -364,10 +409,6 @@
     placeBall(launchAngle, launchRadius);
     window.GameAudio?.play?.("roulette.launch");
     spin = { result, startedAt: performance.now(), from, to };
-    resultLabel.textContent = "Колесо вращается";
-    resultNumber.textContent = "—";
-    delete resultNumber.dataset.tone;
-    results.hidden = true;
     animationFrame = requestAnimationFrame(animateWheel);
   }
 
@@ -445,6 +486,9 @@
   }
 
   function render() {
+    const result = !state?.round && !spin && shownResult?.id === state?.last_result?.id ? shownResult : null;
+    renderResult(result);
+    renderBets(result);
     if (!spin) wallet.textContent = state ? "Баланс " + format.format(state.balance) : "";
     tableCount.textContent = state?.round
       ? "Игроки " + state.round.player_count + " · Ставки " + state.round.bet_count + " / " + state.max_bets
@@ -553,6 +597,8 @@
       ball.hidden = true;
       state = null;
       syncError = "";
+      avatars?.clear();
+      render();
     },
   };
 };

@@ -1,4 +1,4 @@
-(window.CasinoGames ||= {}).blackjack = function ({ root, request }) {
+(window.CasinoGames ||= {}).blackjack = function ({ root, request, avatar }) {
   const amounts = new Intl.NumberFormat("ru");
   const outcomes = {
     blackjack: "Блэкджек",
@@ -10,6 +10,7 @@
   const suits = { "♥": "hearts", "♦": "diamonds", "♠": "spades", "♣": "clubs" };
   const moveLabels = { hit: "Ещё карту", stand: "Хватит", double: "Удвоить", split: "Разделить" };
   const motion = matchMedia("(prefers-reduced-motion: reduce)");
+  const avatars = window.createGameAvatars?.(avatar);
   const turnDuration = 225; // casino-turn-card duration
   let mode = "online";
   let visible = false;
@@ -159,10 +160,13 @@
 
   function playerPanel(player, table, user, priorPlayer, queueDeal) {
     const section = element("section", "", "casino-seat blackjack-seat");
+    const active = player.hands.some((hand) => hand.active);
     section.classList.toggle("casino-seat--own", player.id === user);
-    section.classList.toggle("casino-seat--active", player.hands.some((hand) => hand.active));
-    const name = element("h3", player.id === user ? player.name + " (вы)" : player.name);
-    section.append(name);
+    section.classList.toggle("casino-seat--active", active);
+    const identity = element("div", "", "game-player-identity");
+    if (avatars) identity.append(avatars.image(player.id, player.name, active));
+    identity.append(element("h3", player.id === user ? player.name + " (вы)" : player.name));
+    section.append(identity);
     if (table.phase === "lobby") {
       section.append(element("p", "Ставка " + amounts.format(player.bet) + " • " +
         (player.id === table.host_id ? "Открывает раздачу" : "Готов к раздаче")));
@@ -471,6 +475,7 @@
     },
     hide() {
       visible = false;
+      avatars?.clear();
       audioSnapshot = undefined;
       audibleCards = new WeakMap();
       serial++;

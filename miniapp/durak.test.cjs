@@ -12,19 +12,29 @@ function game(changes) {
   return {
     revision: "001/r1", status: "playing", phase: "attack", hand: [card, other],
     trump, deck_count: 24, opponent_count: 6, table: [], legal_cards: [0],
-    actions: ["attack"], message: "", ...changes,
+    actions: ["attack"], message: "", events: [], discard_count: 0, bank: 0, ...changes,
   };
 }
 
-function fixture(online) {
+function fixture(online, profile) {
   const calls = [];
+  const flights = [];
+  const revoked = [];
   class Element extends EventTarget {
     children = [];
     dataset = {};
     attributes = {};
+    style = { setProperty(name, value) { this[name] = value; } };
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.children = children; }
     setAttribute(name, value) { this.attributes[name] = value; }
+    getAttribute(name) { return this.attributes[name]; }
+    remove() {}
+    getBoundingClientRect() { return { left: 0, top: 0, right: 40, width: 40, height: 55 }; }
+    animate() {
+      if (this.dataset.motion) flights.push(this.dataset.motion);
+      return { finished: Promise.resolve(), cancel() {} };
+    }
     focus() { document.activeElement = this; }
     click() {
       if (!this.disabled) {
@@ -35,12 +45,15 @@ function fixture(online) {
   }
   const document = { createElement: (tag) => Object.assign(new Element(), { tag }) };
   const root = document.createElement("section");
-  const window = { createDurakOnline: online };
+  const window = {};
+  const URL = { createObjectURL: () => "blob:solo-avatar", revokeObjectURL: value => revoked.push(value) };
   const file = join(__dirname, "durak.js");
   assert.ok(existsSync(file), "The Durak view module is available");
-  runInNewContext(readFileSync(file, "utf8"), { document, window });
+  const shared = readFileSync(join(__dirname, "durak_online.js"), "utf8");
+  runInNewContext(shared + "\n" + readFileSync(file, "utf8"), { document, window, URL });
+  window.createDurakOnline = online;
   const view = window.CasinoGames.durak({
-    root,
+    root, profile,
     request: (action, fields) => new Promise((resolve, reject) => {
       calls.push({ action, fields: JSON.parse(JSON.stringify(fields)), resolve, reject });
     }),
@@ -53,7 +66,9 @@ function fixture(online) {
   const byCard = (id) => buttons().find((node) => node.dataset.cardId === String(id));
   const flush = () => new Promise(setImmediate);
   return {
-    view, calls, document, byText, byCard, flush,
+    view, calls, document, byText, byCard, flush, flights, revoked,
+    find: predicate => descendants(root).find(predicate),
+    labelled: label => descendants(root).find(node => node.attributes["aria-label"] === label),
     sent: () => calls.map(({ action, fields }) => [action, fields]),
     async respond(current, call = calls.at(-1)) {
       call.resolve({ game: current });
@@ -168,4 +183,39 @@ test("restarting an active game requires confirmation", async () => {
   ui.byText("Начать заново").click();
   ui.byText("Да, начать заново").click();
   assert.deepEqual(ui.sent().at(-1), ["start", {}]);
+});
+
+test("the solo table deals and moves cards using the shared event stream", async () => {
+  const ui = fixture();
+  ui.view.show();
+  await ui.respond(null);
+  ui.byText("Начать игру").click();
+  const deal = [
+    { id: 1, kind: "deal", player: "you", card, count: 25 },
+    { id: 2, kind: "deal", player: "bot", count: 24 },
+  ];
+  await ui.respond(game({ events: deal, turn: "you" }));
+  assert.ok(ui.labelled("Колода: 24"));
+  assert.deepEqual(ui.flights, ["deal", "deal"]);
+  ui.byCard(0).click();
+  await ui.respond(game({
+    revision: "001/r2", phase: "throw", actions: ["pass"], legal_cards: [], hand: [other], turn: "you",
+    table: [{ attack: card, defense: trump }],
+    events: [...deal, { id: 3, kind: "attack", player: "you", index: 0, card },
+      { id: 4, kind: "defend", player: "bot", index: 0, card: trump }],
+  }));
+  assert.deepEqual(ui.flights, ["deal", "deal", "attack", "defend"]);
+});
+
+test("the solo seat uses the authenticated name and releases the avatar on hide", async () => {
+  const ui = fixture(undefined, { name: "Влад", avatar: async () => new Blob(["avatar"]) });
+  ui.view.show();
+  await ui.respond(game());
+  const portrait = ui.find(node => node.className === "game-player-avatar" && node.dataset.active === "true");
+  assert.ok(portrait);
+  assert.equal(portrait.textContent, "В");
+  assert.equal(portrait.children[0].src, "blob:solo-avatar");
+  assert.ok(ui.find(node => node.className === "durak-seat-name" && node.textContent === "Влад"));
+  ui.view.hide();
+  assert.deepEqual(ui.revoked, ["blob:solo-avatar"]);
 });
