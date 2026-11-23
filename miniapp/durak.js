@@ -327,7 +327,7 @@ function createDurakSolo({ root, request }) {
   };
 }
 
-(window.CasinoGames ||= {}).durak = function ({ root, request }) {
+(window.CasinoGames ||= {}).durak = function ({ root, request, avatar }) {
   const heading = document.createElement("h1");
   heading.textContent = "Дурак";
   const header = document.createElement("header");
@@ -368,7 +368,7 @@ function createDurakSolo({ root, request }) {
       button.setAttribute("aria-pressed", String(selected));
       panel.hidden = !selected;
     }
-    current.view ??= current.mount({ root: current.panel, request });
+    current.view ??= current.mount({ root: current.panel, request, avatar });
     current.view.show();
   }
 

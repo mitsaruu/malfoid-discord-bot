@@ -327,7 +327,7 @@ async fn casino_action(
     let result = tokio::task::spawn_blocking(move || {
         let (guild, user, name) = (session.guild, session.user, session.name.as_str());
         match game.as_str() {
-            "durak" if action.starts_with("online_") => Ok(data.durak_online.handle(guild, user, name, &action, &body)),
+            "durak" if action.starts_with("online_") => Ok(data.durak_online.handle_with_bank(data.as_ref(), guild, user, name, &action, &body)),
             "durak" => Ok(data.durak.handle(guild, user, &action, &body)),
             "poker" => crate::poker::handle(&data, guild, user, name, &action, &body),
             "blackjack" => crate::table_blackjack::handle(&data, guild, user, name, &action, &body),
@@ -351,6 +351,9 @@ fn start_game_cleanup(data: Shared) {
                 crate::table_blackjack::sweep(&data);
                 crate::casino_solo::sweep(&data);
                 crate::roulette::sweep(&data);
+                if let Err(error) = data.durak_online.sweep(data.as_ref()) {
+                    eprintln!("Дурак: {error}");
+                }
             }).await {
                 eprintln!("Mini App: {error}");
             }
@@ -455,6 +458,22 @@ async fn avatar(State(app): State<App>, Path((guild, file)): Path<(u64, String)>
     Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response())
 }
 
+/// Аватар участника того же стола. Подлинная сессия нужна даже для загрузки своего аватара.
+async fn durak_avatar(State(app): State<App>, Path((room, file)): Path<(String, String)>, headers: HeaderMap) -> Reply {
+    let missing = || StatusCode::NOT_FOUND.into_response();
+    let user = file.strip_suffix(".png").and_then(discord_id).ok_or_else(missing)?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    if !app.data.durak_online.shared_room(session.guild, session.user, user, &room) {
+        return Err(missing());
+    }
+    let face = locked(&app.sessions).values()
+        .filter(|player| player.guild == session.guild && player.user == user && player.created.elapsed() < SESSION_LIFETIME)
+        .max_by_key(|player| player.checked)
+        .map(|player| player.face.clone()).ok_or_else(missing)?;
+    let bytes = wordboard::cached_avatar(&app.data, &face).await.ok_or_else(missing)?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response())
+}
+
 pub fn router(app: App) -> axum::Router {
     axum::Router::new()
         .route("/", get(index))
@@ -470,6 +489,7 @@ pub fn router(app: App) -> axum::Router {
         .route("/api/rocket/cashout", post(rocket_cashout))
         .route("/api/games/{game}/{action}", post(casino_action).layer(DefaultBodyLimit::max(2048)))
         .route("/api/avatar/{guild}/{file}", get(avatar))
+        .route("/api/durak/avatar/{room}/{file}", get(durak_avatar))
         .with_state(app)
 }
 

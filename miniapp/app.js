@@ -548,7 +548,15 @@ function openGame(game) {
         if (!session) return Promise.reject(new Error("Соединение с Discord закрыто."));
         return api(`api/games/${game}/${action}`, fields);
       };
-      casinoViews.set(game, mount({ root, request }));
+      const avatar = game === "durak" ? async (room, user) => {
+        if (!session) return null;
+        const path = `api/durak/avatar/${encodeURIComponent(room)}/${encodeURIComponent(user)}.png`;
+        const response = await fetch(path, {
+          headers: { Authorization: `Bearer ${session}` }, signal: AbortSignal.timeout(8000),
+        });
+        return response.ok ? response.blob() : null;
+      } : undefined;
+      casinoViews.set(game, mount({ root, request, avatar }));
     }
     casinoViews.get(game).show();
   }

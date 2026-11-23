@@ -138,7 +138,7 @@ const receipt = (number, net) => ({
     ...(net === undefined ? [] : [{ id: "1", name: "Viewer", net }])],
 });
 const rouletteState = (round = null, last_result = null) =>
-  ({ user_id: "1", round_id: "round", round, last_result, balance: 500, min_bet: 1, max_bet: 500, max_bets: 10 });
+  ({ user_id: "1", round_id: "round", round, last_result, balance: 500, min_bet: 10, max_bet: 500, max_bets: 10 });
 const rotation = (wheel) => Number(wheel.style.transform?.match(/rotate\((.+)deg\)/)?.[1] ?? 0);
 const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-8, `${actual} ≈ ${expected}`);
 
@@ -281,10 +281,10 @@ test("roulette recovers a confirmed first wager after a lost reply and sounds it
   f.nodes("roulette-cell roulette-cell--number")[0].dispatchEvent(new Event("click"));
   f.node("roulette-form").dispatchEvent(new Event("submit", { cancelable: true }));
   assert.equal(f.calls.at(-1).action, "bet");
-  assert.equal(f.calls.at(-1).fields.bet, "1");
+  assert.equal(f.calls.at(-1).fields.bet, "10");
   f.calls.at(-1).reject(new Error("connection lost"));
   await f.flush();
-  const result = { ...receipt(0, 35), your_bets: [{ request_id: "wager", amount: 1, space: "0" }] };
+  const result = { ...receipt(0, 350), your_bets: [{ request_id: "wager", amount: 10, space: "0" }] };
   await f.respond("state", rouletteState(null, result));
   f.frame(2800);
   await f.poll(rouletteState(null, result));

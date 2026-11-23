@@ -1,13 +1,18 @@
 //! Подкидной дурак один на один с ботом, без ставок.
 
-use rand::{seq::SliceRandom, Rng};
-use serde_json::{json, Value};
+use rand::{Rng, seq::SliceRandom};
+use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Mutex};
 
 pub(crate) const HAND_SIZE: usize = 6;
 pub(crate) const DECK_SIZE: u8 = 36;
+pub(crate) const FULL_DECK_SIZE: u8 = 52;
 const MAX_GAMES: usize = 1024;
-const RANKS: [&str; 9] = ["6", "7", "8", "9", "10", "J", "Q", "K", "A"];
+const RANKS: [&str; 13] = [
+    "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A",
+];
+const STANDARD_RANKS: usize = 9;
+const EXTRA_RANKS: usize = RANKS.len() - STANDARD_RANKS;
 const SUITS: [&str; 4] = ["♣", "♦", "♥", "♠"];
 const STALE: &str = "Игра уже изменилась. Обновите её состояние.";
 const ILLEGAL: &str = "Этот ход сейчас недоступен.";
@@ -101,11 +106,19 @@ pub(crate) struct Card(pub(crate) u8);
 
 impl Card {
     pub(crate) fn rank(self) -> usize {
-        usize::from(self.0 - 1) % RANKS.len()
+        if self.0 <= DECK_SIZE {
+            usize::from(self.0 - 1) % STANDARD_RANKS + EXTRA_RANKS
+        } else {
+            usize::from(self.0 - DECK_SIZE - 1) % EXTRA_RANKS
+        }
     }
 
     pub(crate) fn suit(self) -> usize {
-        usize::from(self.0 - 1) / RANKS.len()
+        if self.0 <= DECK_SIZE {
+            usize::from(self.0 - 1) / STANDARD_RANKS
+        } else {
+            usize::from(self.0 - DECK_SIZE - 1) / EXTRA_RANKS
+        }
     }
 
     pub(crate) fn beats(self, attack: Self, trump: usize) -> bool {
@@ -468,7 +481,7 @@ impl Game {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, seq::IndexedRandom, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng, seq::IndexedRandom};
 
     #[test]
     fn start_returns_a_playable_game_scoped_to_guild_and_user() {

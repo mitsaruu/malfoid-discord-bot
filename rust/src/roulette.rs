@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(15);
 const MAX_ROUND: Duration = Duration::from_secs(60);
-const MIN_BET: i64 = 1;
+const MIN_BET: i64 = 10;
 const MAX_BETS: usize = 50;
 const HELP_BUTTON: &str = "roulette:help";
 const RED: [u8; 18] = [
@@ -473,40 +473,40 @@ mod tests {
     }
 
     #[test]
-    fn one_coin_opens_a_round_and_settles_once() {
+    fn minimum_bet_opens_a_round_and_settles_once() {
         let f = Fixture::new();
         let idle = f.call(1, 0, "state", json!({}));
-        assert_eq!(idle["min_bet"], 1);
+        assert_eq!(idle["min_bet"], 10);
         let body = json!({
-            "round_id": idle["round_id"], "request_id": "one", "bet": "1", "space": "0",
+            "round_id": idle["round_id"], "request_id": "minimum", "bet": "10", "space": "0",
         });
         let placed = f.call(1, 0, "bet", body.clone());
         assert!(placed["bet_error"].is_null());
-        assert_eq!(placed["min_bet"], 1);
-        assert_eq!(placed["balance"], 499);
+        assert_eq!(placed["min_bet"], 10);
+        assert_eq!(placed["balance"], 490);
         assert_eq!(placed["round"]["remaining_ms"], 15000);
-        assert_eq!(placed["round"]["your_bets"][0]["amount"], 1);
+        assert_eq!(placed["round"]["your_bets"][0]["amount"], 10);
         let retry = f.call(1, 1, "bet", body.clone());
         assert_eq!(retry["round"]["bet_count"], 1);
-        assert_eq!(retry["balance"], 499);
+        assert_eq!(retry["balance"], 490);
         assert_eq!(retry["round"]["remaining_ms"], 14000);
 
         let settled = f.call(1, 15, "bet", body);
         let number = settled["last_result"]["number"].as_u64().unwrap();
         assert!(settled["bet_error"].is_null());
         assert!(settled["round"].is_null());
-        assert_eq!(settled["balance"], if number == 0 { 535 } else { 499 });
+        assert_eq!(settled["balance"], if number == 0 { 850 } else { 490 });
         assert_eq!(
             settled["last_result"]["players"][0]["net"],
-            if number == 0 { 35 } else { -1 },
+            if number == 0 { 350 } else { -10 },
         );
     }
 
     #[test]
-    fn wagers_below_one_do_not_open_a_round() {
+    fn wagers_below_ten_do_not_open_a_round() {
         let f = Fixture::new();
         let idle = f.call(1, 0, "state", json!({}));
-        for bet in ["0", "-1"] {
+        for bet in ["0", "-1", "1", "9"] {
             let rejected = f.call(1, 0, "bet", json!({
                 "round_id": idle["round_id"], "request_id": bet, "bet": bet, "space": "red",
             }));

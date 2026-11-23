@@ -166,25 +166,6 @@ body:not([data-game]) .activity-shell { display: none; }
 .game-card-info { display: grid; align-content: start; gap: 5px; padding: 12px; }
 .game-card-info strong { color: var(--text); font-size: 15px; line-height: 1.2; }
 .game-card-info small { color: var(--muted); font-size: 12px; line-height: 1.35; }
-.game-card:not(.game-card-feature) {
-  display: block;
-  min-height: clamp(166px, 17vw, 220px);
-  overflow: visible;
-  border: 0;
-  background: transparent;
-}
-.game-card-panel {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--panel-radius);
-  background: var(--surface);
-}
-.game-card-panel .game-cover { aspect-ratio: auto; }
-.game-card-panel .play-label { display: none; }
 .game-card[data-game="durak"] .game-cover {
   display: grid;
   grid-template-columns: repeat(3, clamp(28px, 4vw, 50px));
@@ -247,43 +228,9 @@ body:not([data-game]) .activity-shell { display: none; }
   font-size: 12px;
   font-weight: 750;
 }
-@media (min-width: 601px) {
-  .game-card-panel small {
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-  .game-card:not(.game-card-feature):not(:disabled):is(:hover, :focus-visible) { z-index: 1; }
-  .game-card:not(.game-card-feature):focus-visible { outline: none; }
-  .game-card:focus-visible .game-card-panel { outline: 2px solid var(--mint); outline-offset: 2px; }
-  .game-card:not(:disabled):is(:hover, :focus-visible) .game-card-panel {
-    inset-inline-end: auto;
-    width: calc(200% + 13px);
-    grid-template: "info cover" minmax(0, 1fr) / minmax(0, .9fr) minmax(0, 1fr);
-    border-color: var(--line-strong);
-    background: var(--surface-hover);
-    box-shadow: 0 10px 24px #0009;
-    transform-origin: left center;
-    animation: preview-expand .16s ease-out;
-  }
-  .game-card:not(:disabled):is(:hover, :focus-visible) .game-card-panel .game-cover { grid-area: cover; filter: saturate(.72) brightness(.84); }
-  .game-card:not(:disabled):is(:hover, :focus-visible) .game-card-panel .game-card-info { grid-area: info; align-content: center; padding: 14px; }
-  .game-card:not(:disabled):is(:hover, :focus-visible) .game-card-panel strong { font-size: clamp(17px, 2vw, 24px); }
-  .game-card:not(:disabled):is(:hover, :focus-visible) .game-card-panel small { display: block; }
-  .game-card:not(:disabled):is(:hover, :focus-visible) .game-card-panel .play-label { display: flex; margin-top: 6px; }
-}
-@media (min-width: 1051px) {
-  .game-card:nth-child(4):is(:hover, :focus-visible) .game-card-panel,
-  .game-card:nth-child(9):is(:hover, :focus-visible) .game-card-panel { inset-inline: auto 0; transform-origin: right center; }
-}
 @media (max-width: 1050px) {
   .game-catalog { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .game-card-feature { grid-column: 1 / -1; }
-}
-@media (min-width: 601px) and (max-width: 1050px) {
-  .game-card:nth-child(5):is(:hover, :focus-visible) .game-card-panel,
-  .game-card:nth-child(9):is(:hover, :focus-visible) .game-card-panel { inset-inline: auto 0; transform-origin: right center; }
 }
 @media (max-width: 780px) {
   .activity-shell { display: block; }
@@ -321,11 +268,6 @@ body:not([data-game]) .activity-shell { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .game-card, .game-cover { transition: none; }
-  .game-card .game-card-panel { animation: none !important; }
-}
-@keyframes preview-expand {
-  from { opacity: .84; transform: scaleX(.86); }
-  to { opacity: 1; transform: none; }
 }
 
 #app {

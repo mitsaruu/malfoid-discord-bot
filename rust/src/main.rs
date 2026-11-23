@@ -20,6 +20,7 @@ mod daily;
 mod db;
 mod draw;
 mod durak;
+mod durak_bank;
 mod durak_online;
 mod economy;
 mod fun;
