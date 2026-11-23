@@ -4,11 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Игры Malfoid</title>
-  <link rel="stylesheet" href="static/style.css?v=2">
+  <link rel="stylesheet" href="static/style.css?v=3">
   <link rel="stylesheet" href="static/rocket.css?v=2">
   <link rel="stylesheet" href="static/casino.css?v=2">
   <link rel="stylesheet" href="static/roulette.css?v=2">
   <link rel="stylesheet" href="static/coinflip.css?v=2">
+  <link rel="stylesheet" href="static/durak.css?v=2">
+  <link rel="stylesheet" href="static/durak_online.css">
 </head>
 <body>
   <div class="splash" id="splash">
@@ -31,6 +33,7 @@
         <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false"><span aria-hidden="true">↗</span>Ракетка</button>
         <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false"><span aria-hidden="true">◇</span>Минное поле</button>
         <button type="button" data-game="poker" aria-controls="poker" aria-pressed="false"><span aria-hidden="true">♠</span>Покер</button>
+        <button type="button" data-game="durak" aria-controls="durak" aria-pressed="false"><span aria-hidden="true">♥</span>Дурак</button>
         <button type="button" data-game="slots" aria-controls="slots" aria-pressed="false"><span aria-hidden="true">▥</span>Слоты</button>
         <button type="button" data-game="blackjack" aria-controls="blackjack" aria-pressed="false"><span aria-hidden="true">♣</span>Блэкджек</button>
         <button type="button" data-game="roulette" aria-controls="roulette" aria-pressed="false"><span aria-hidden="true">◎</span>Рулетка</button>
@@ -50,13 +53,86 @@
             <span class="game-cover" aria-hidden="true"></span>
             <span class="game-card-info"><strong>Ракетка</strong><small>Заберите монеты, пока растёт коэффициент.</small><span class="play-label">Играть <span aria-hidden="true">↗</span></span></span>
           </button>
-          <button type="button" class="game-card" data-game="words"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Слово дня</strong><small>Русский и немецкий</small></span></button>
-          <button type="button" class="game-card" data-game="poker"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Покер</strong><small>Техасский холдем</small></span></button>
-          <button type="button" class="game-card" data-game="mines"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Минное поле</strong><small>Откройте безопасные клетки</small></span></button>
-          <button type="button" class="game-card" data-game="slots"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Слоты</strong><small>Пять барабанов</small></span></button>
-          <button type="button" class="game-card" data-game="blackjack"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Блэкджек</strong><small>В одиночку и онлайн</small></span></button>
-          <button type="button" class="game-card" data-game="roulette"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Рулетка</strong><small>Европейское колесо</small></span></button>
-          <button type="button" class="game-card" data-game="coinflip"><span class="game-cover" aria-hidden="true"></span><span class="game-card-info"><strong>Орёл или решка</strong><small>Выберите сторону монеты</small></span></button>
+          <button type="button" class="game-card" data-game="words">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Слово дня</strong>
+                <small>Угадайте слово из пяти букв на русском или немецком.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="poker">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Покер</strong>
+                <small>Соберите лучшую комбинацию в Техасском холдеме.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="durak">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"><span>9♥</span><span>Q♣</span><span>A♦</span></span>
+              <span class="game-card-info">
+                <strong>Дурак</strong>
+                <small>Играйте с ботом или за открытым столом сервера. Подкидной и переводной режимы.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="mines">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Минное поле</strong>
+                <small>Открывайте безопасные клетки и заберите выигрыш до встречи с миной.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="slots">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Слоты</strong>
+                <small>Запустите пять барабанов и соберите выигрышные линии.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="blackjack">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Блэкджек</strong>
+                <small>Наберите ближе к 21, чем дилер. Играйте в одиночку или онлайн.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="roulette">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Рулетка</strong>
+                <small>Выберите число, цвет или группу и дождитесь остановки колеса.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
+          <button type="button" class="game-card" data-game="coinflip">
+            <span class="game-card-panel">
+              <span class="game-cover" aria-hidden="true"></span>
+              <span class="game-card-info">
+                <strong>Орёл или решка</strong>
+                <small>Выберите сторону монеты перед броском.</small>
+                <span class="play-label" aria-hidden="true">Играть ↗</span>
+              </span>
+            </span>
+          </button>
         </div>
       </main>
 
@@ -152,6 +228,7 @@
   <main class="casino" id="blackjack" aria-label="Блэкджек" lang="ru" hidden></main>
   <main class="casino" id="roulette" aria-label="Рулетка" lang="ru" hidden></main>
   <main class="casino" id="coinflip" aria-label="Орёл или решка" lang="ru" hidden></main>
+  <main class="casino" id="durak" aria-label="Дурак" lang="ru" hidden></main>
     </div>
   </div>
 
@@ -176,6 +253,8 @@
   <script src="static/table_blackjack.js"></script>
   <script src="static/roulette.js"></script>
   <script src="static/coinflip.js"></script>
-  <script src="static/app.js?v=3"></script>
+  <script src="static/durak_online.js"></script>
+  <script src="static/durak.js?v=2"></script>
+  <script src="static/app.js?v=4"></script>
 </body>
 </html>

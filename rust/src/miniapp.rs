@@ -129,9 +129,9 @@ async fn index(State(app): State<App>) -> Response {
 /// Разрешённые файлы интерфейса.
 async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Response {
     match name.as_str() {
-        "style.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" =>
+        "style.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
             file(&app, &name, "text/css; charset=utf-8").await,
-        "app.js" | "audio.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" =>
+        "app.js" | "audio.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         "lobby-games.webp" => file(&app, &name, "image/webp").await,
         "menu-ambient.mp3" => file(&app, &name, "audio/mpeg").await,
@@ -306,7 +306,7 @@ async fn casino_action(
     Json(body): Json<Value>,
 ) -> Reply {
     let rule = match game.as_str() {
-        "mines" | "poker" | "slots" | "blackjack" | "roulette" | "coinflip" => game.as_str(),
+        "mines" | "poker" | "slots" | "blackjack" | "roulette" | "coinflip" | "durak" => game.as_str(),
         _ => return Err(StatusCode::NOT_FOUND.into_response()),
     };
     if action.len() > 24 || !body.is_object() {
@@ -315,7 +315,7 @@ async fn casino_action(
     let (_, session) = app.authorized(&headers, None, false).await?;
     // Новые игры появились после настройки части серверов, поэтому применяем
     // игровой канал к ним и при отсутствии их имён в старом конфиге.
-    if matches!(rule, "poker" | "mines") {
+    if matches!(rule, "poker" | "mines" | "durak") {
         let channel = app.data.db.games_channel(session.guild).map_err(failed)?;
         if channel.is_some_and(|id| id != session.channel && Some(id) != session.parent) {
             return Err(json_error("Эта игра доступна только в игровом канале сервера.", StatusCode::FORBIDDEN));
@@ -327,6 +327,8 @@ async fn casino_action(
     let result = tokio::task::spawn_blocking(move || {
         let (guild, user, name) = (session.guild, session.user, session.name.as_str());
         match game.as_str() {
+            "durak" if action.starts_with("online_") => Ok(data.durak_online.handle(guild, user, name, &action, &body)),
+            "durak" => Ok(data.durak.handle(guild, user, &action, &body)),
             "poker" => crate::poker::handle(&data, guild, user, name, &action, &body),
             "blackjack" => crate::table_blackjack::handle(&data, guild, user, name, &action, &body),
             "roulette" => Ok(crate::roulette::handle(&data, guild, user, name, &action, &body)?),

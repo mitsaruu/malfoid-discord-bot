@@ -41,7 +41,7 @@ let rocket = null;
 let reloadWords = false;
 const casinoTitles = {
   mines: "Минное поле", poker: "Техасский холдем", slots: "Слоты", blackjack: "Блэкджек",
-  roulette: "Рулетка", coinflip: "Орёл или решка",
+  roulette: "Рулетка", coinflip: "Орёл или решка", durak: "Дурак",
 };
 const casinoViews = new Map();
 
@@ -509,7 +509,10 @@ function openGame(game) {
   document.getElementById("app").hidden = !words;
   playersEl.hidden = !words;
   document.getElementById("rocket").hidden = game !== "rocket";
-  for (const id of Object.keys(casinoTitles)) document.getElementById(id).hidden = id !== game;
+  for (const id of Object.keys(casinoTitles)) {
+    const view = document.getElementById(id);
+    if (view) view.hidden = id !== game;
+  }
   helpEl.hidden = true;
   for (const button of gameSwitch.querySelectorAll("button[aria-pressed]")) {
     button.setAttribute("aria-pressed", String(button.dataset.game === game));

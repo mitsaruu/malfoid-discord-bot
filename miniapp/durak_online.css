@@ -1,0 +1,39 @@
+.durak-room-list, .durak-player-list { padding: 0; list-style: none; }
+.durak-room-list { display: grid; gap: 7px; }
+.durak-room-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: var(--inset);
+}
+.durak-room-row strong, .durak-room-row small { display: block; overflow-wrap: anywhere; }
+.durak-room-row small { margin-top: 3px; color: var(--muted); }
+.durak-seats { white-space: nowrap; color: var(--accent); font-variant-numeric: tabular-nums; }
+.durak-create summary { cursor: pointer; color: var(--accent); }
+.durak-create form { margin-top: 8px; align-items: center; }
+.durak-player-list { display: flex; flex-wrap: wrap; gap: 7px; }
+.durak-player-list li {
+  padding: 6px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 8px;
+  background: var(--inset);
+  overflow-wrap: anywhere;
+}
+.durak-player-list li[data-turn="true"] { border-color: var(--accent); color: var(--accent); }
+.durak-online-room .durak-field > * + * { margin-top: 10px; }
+.durak-online-room .durak-board { min-height: 82px; align-items: center; }
+.durak-online-room .durak-pair { margin: 0; }
+.durak-online-stock { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); }
+.durak-online-stock .casino-card { --card-width: 24px; --card-size: .73rem; }
+.durak-online-turn { color: var(--accent); }
+.durak-online-actions:empty { display: none; }
+.durak-online-room .durak-hand-card[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 480px) {
+  .durak-room-row { gap: 6px; padding: 7px; }
+  .durak-room-row button { padding-inline: 8px; }
+}

@@ -181,7 +181,7 @@ test('a guess crossing midnight carries its old date and clears stale input', as
 
 test('switching games hides the previous view and stops refreshing word data', async () => {
   const panels = Object.fromEntries(
-    ['app', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip']
+    ['app', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip', 'durak']
       .map(id => [id, { hidden: true }]),
   );
   const calls = [];

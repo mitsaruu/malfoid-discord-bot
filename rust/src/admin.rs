@@ -12,6 +12,24 @@ pub const DEFAULT_GAMES_COMMANDS: &str = "rank, leaderboard, money_leaderboard, 
     dick_leaderboard, work, balance, give_money, coinflip, slots, blackjack, games, rocket, roulette, case, pets, pets_collect, pet_feed, pet_sell, \
     dice, roll, predskazanie, shar, words, daily, shop, shop_buy, pet_battle, pet_trade, wordstats, wordtop, wordduel, quiz";
 
+/// Начислить монеты на свой баланс сервера. Ответ виден только администратору.
+#[poise::command(slash_command, guild_only, ephemeral, required_permissions = "ADMINISTRATOR", default_member_permissions = "ADMINISTRATOR")]
+pub async fn admin_money(
+    ctx: Context<'_>,
+    #[description = "Сколько монет начислить"] #[min = 1] amount: i64,
+) -> Result<(), Error> {
+    let Some(guild) = ctx.guild_id() else { return Ok(()) };
+    if amount <= 0 {
+        return whisper(ctx, "Число монет должно быть положительным.").await;
+    }
+    let user = ctx.author();
+    let name = crate::reply::user_name(user);
+    let data = ctx.data();
+    let balance = data.db.add_money(guild.get(), user.id.get(), &name, data.economy.start_balance, amount)?;
+    println!("Административное начисление монет: guild={guild}, user={}, amount={amount}", user.id);
+    whisper(ctx, format!("Начислено {}. Баланс: {}.", crate::text::money_text(amount), crate::text::money_text(balance))).await
+}
+
 /// Названия через запятую → набор названий без «/» и в нижнем регистре.
 pub fn parse_commands(text: &str) -> BTreeSet<String> {
     let mut commands: BTreeSet<_> = text.split(',').map(|name| {
