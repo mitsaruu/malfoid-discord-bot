@@ -13,6 +13,7 @@ pub struct Pet {
     pub level: i64,
     pub last_collect: f64, // с какого момента копится доход
     pub spent: i64,        // сколько монет вложено в питомца (кейс + корм)
+    pub inactive_since: Option<f64>,
 }
 
 fn pet_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pet> {
@@ -22,6 +23,7 @@ fn pet_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pet> {
         level: row.get::<_, Option<i64>>(2)?.unwrap_or(1),
         last_collect: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
         spent: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        inactive_since: row.get(5)?,
     })
 }
 
@@ -144,7 +146,8 @@ impl Database {
                  species      TEXT,
                  level        INTEGER DEFAULT 1,
                  last_collect REAL,
-                 spent        INTEGER DEFAULT 0
+                 spent        INTEGER DEFAULT 0,
+                 inactive_since REAL
              );
              CREATE TABLE IF NOT EXISTS case_openings (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -286,6 +289,7 @@ impl Database {
              CREATE INDEX IF NOT EXISTS case_openings_player_species ON case_openings(guild_id, user_id, species);",
         )?;
         let database = Self { connection: Mutex::new(connection) };
+        database.prepare_pet_activity()?;
         crate::wordsummary::prepare(&database)?;
         crate::wordstats::prepare_duels(&database)?;
         crate::shop::prepare(&database)?;
@@ -373,9 +377,57 @@ impl Database {
         )
     }
 
+    fn prepare_pet_activity(&self) -> rusqlite::Result<()> {
+        self.transaction(|tx| {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pets') WHERE name = 'inactive_since')",
+                [], |row| row.get(0),
+            )?;
+            if !present {
+                tx.execute("ALTER TABLE pets ADD COLUMN inactive_since REAL", [])?;
+                tx.execute(
+                    "UPDATE pets SET inactive_since = ?1 WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, ROW_NUMBER() OVER (PARTITION BY guild_id, user_id ORDER BY id) AS slot
+                            FROM pets
+                        ) WHERE slot > ?2
+                    )",
+                    params![now(), crate::pets::ACTIVE_PET_LIMIT],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn active_pet_count_on(connection: &Connection, guild: u64, user: u64) -> rusqlite::Result<i64> {
+        connection.query_row(
+            "SELECT COUNT(*) FROM pets WHERE guild_id = ?1 AND user_id = ?2 AND inactive_since IS NULL",
+            params![guild as i64, user as i64], |row| row.get(0),
+        )
+    }
+
+    pub(crate) fn set_pet_activity_on(
+        connection: &Connection, pet: &Pet, active: bool, time: f64,
+    ) -> rusqlite::Result<()> {
+        match (active, pet.inactive_since) {
+            (true, Some(paused)) => {
+                let last_collect = pet.last_collect + (time - paused).max(0.0);
+                connection.execute(
+                    "UPDATE pets SET inactive_since = NULL, last_collect = ?2 WHERE id = ?1",
+                    params![pet.id, last_collect],
+                )?;
+            }
+            (false, None) => {
+                connection.execute("UPDATE pets SET inactive_since = ?2 WHERE id = ?1", params![pet.id, time])?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub(crate) fn pets_on(connection: &Connection, guild: u64, user: u64) -> rusqlite::Result<Vec<Pet>> {
         let mut statement = connection.prepare(
-            "SELECT id, species, level, last_collect, spent FROM pets WHERE guild_id = ?1 AND user_id = ?2 ORDER BY id",
+            "SELECT id, species, level, last_collect, spent, inactive_since FROM pets WHERE guild_id = ?1 AND user_id = ?2 ORDER BY id",
         )?;
         let pets = statement.query_map(params![guild as i64, user as i64], pet_from_row)?.collect();
         pets
@@ -389,7 +441,7 @@ impl Database {
     pub(crate) fn own_pet_on(connection: &Connection, id: i64, guild: u64, user: u64) -> rusqlite::Result<Option<Pet>> {
         connection
             .query_row(
-                "SELECT id, species, level, last_collect, spent FROM pets WHERE id = ?1 AND guild_id = ?2 AND user_id = ?3",
+                "SELECT id, species, level, last_collect, spent, inactive_since FROM pets WHERE id = ?1 AND guild_id = ?2 AND user_id = ?3",
                 params![id, guild as i64, user as i64],
                 pet_from_row,
             )
@@ -438,19 +490,15 @@ impl Database {
     pub fn swap_pets(&self, guild: u64, first: (i64, u64), second: (i64, u64)) -> rusqlite::Result<bool> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
-        let owns = |pet: i64, user: u64| -> rusqlite::Result<bool> {
-            transaction
-                .query_row(
-                    "SELECT 1 FROM pets WHERE id = ?1 AND guild_id = ?2 AND user_id = ?3",
-                    params![pet, guild as i64, user as i64],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map(|found| found.is_some())
-        };
-        if !(owns(first.0, first.1)? && owns(second.0, second.1)?) {
+        let (Some(first_pet), Some(second_pet)) = (
+            Self::own_pet_on(&transaction, first.0, guild, first.1)?,
+            Self::own_pet_on(&transaction, second.0, guild, second.1)?,
+        ) else {
             return Ok(false);
-        }
+        };
+        let time = now();
+        Self::set_pet_activity_on(&transaction, &first_pet, second_pet.inactive_since.is_none(), time)?;
+        Self::set_pet_activity_on(&transaction, &second_pet, first_pet.inactive_since.is_none(), time)?;
         transaction.execute("UPDATE pets SET user_id = ?1 WHERE id = ?2", params![second.1 as i64, first.0])?;
         transaction.execute("UPDATE pets SET user_id = ?1 WHERE id = ?2", params![first.1 as i64, second.0])?;
         transaction.commit()?;
@@ -1262,23 +1310,23 @@ mod tests {
         assert_eq!(db.wallet(1, 2, "test", 100).unwrap().0, 100);
     }
 
-    struct QuotaTestFile(std::path::PathBuf);
+    struct TestDatabaseFile(std::path::PathBuf);
 
-    impl QuotaTestFile {
+    impl TestDatabaseFile {
         fn new() -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let directory = std::env::temp_dir().join(format!(
-                "musicbot-quota-{}-{}-{}",
+                "musicbot-db-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ));
             std::fs::create_dir(&directory).unwrap();
-            Self(directory.join("quota.db"))
+            Self(directory.join("levels.db"))
         }
     }
 
-    impl Drop for QuotaTestFile {
+    impl Drop for TestDatabaseFile {
         fn drop(&mut self) {
             std::fs::remove_dir_all(self.0.parent().unwrap()).unwrap();
         }
@@ -1347,7 +1395,7 @@ mod tests {
 
     #[test]
     fn ai_model_quota_reopen_keeps_successes_and_releases_stale_reservations() {
-        let file = QuotaTestFile::new();
+        let file = TestDatabaseFile::new();
         {
             let db = Database::open(&file.0).unwrap();
             assert!(db.reserve_ai_model(1, "2026-11-17", "hydrogen", 4).unwrap());
@@ -1367,7 +1415,7 @@ mod tests {
 
     #[test]
     fn ai_model_quota_is_atomic_across_separate_connections() {
-        let file = QuotaTestFile::new();
+        let file = TestDatabaseFile::new();
         // Open all connections before reserving: open is single-bot startup recovery.
         let databases: Vec<_> = (0..12).map(|_| Database::open(&file.0).unwrap()).collect();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(databases.len()));
@@ -1408,6 +1456,42 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_old_database_preserves_pets_and_wallets() {
+        let file = TestDatabaseFile::new();
+        let db = Database::open(&file.0).unwrap();
+        let accounts = [(7, 1, 12), (7, 2, 10), (8, 1, 3)];
+        for (guild, user, count) in accounts {
+            db.wallet(guild, user, "Player", 500).unwrap();
+            db.record_work(guild, user, 25 * count, 1500.0).unwrap();
+            for index in 0..count {
+                let key = if index % 2 == 0 { "valera" } else { "igor" };
+                let id = db.add_pet(guild, user, key, 100.0 + index as f64, 500 + index).unwrap();
+                if index % 3 == 0 {
+                    db.feed_pet(id, 200, 200.0 + index as f64).unwrap();
+                }
+            }
+        }
+        let pets_before = accounts.map(|(guild, user, _)| db.user_pets(guild, user).unwrap());
+        let wallets_before = accounts.map(|(guild, user, _)| db.wallet(guild, user, "Player", 0).unwrap());
+        db.lock().execute("ALTER TABLE pets DROP COLUMN inactive_since", []).unwrap();
+        drop(db);
+
+        let migrated = Database::open(&file.0).unwrap();
+        let pets_after = accounts.map(|(guild, user, _)| migrated.user_pets(guild, user).unwrap());
+        for (before, after) in pets_before.iter().zip(&pets_after) {
+            assert_eq!(after.len(), before.len());
+            for (index, (before, after)) in before.iter().zip(after).enumerate() {
+                assert_eq!(after.inactive_since.is_none(), index < 10);
+                assert_eq!(Pet { inactive_since: None, ..after.clone() }, *before);
+            }
+        }
+        drop(migrated);
+        let reopened = Database::open(&file.0).unwrap();
+        assert_eq!(accounts.map(|(guild, user, _)| reopened.user_pets(guild, user).unwrap()), pets_after);
+        assert_eq!(accounts.map(|(guild, user, _)| reopened.wallet(guild, user, "Player", 0).unwrap()), wallets_before);
+    }
+
+    #[test]
     fn pets_rows() {
         let db = Database::in_memory().unwrap();
         let cat = db.add_pet(7, 1, "valera", 100.0, 500).unwrap();
@@ -1417,7 +1501,7 @@ mod tests {
         assert_eq!(db.own_pet(dog, 7, 2).unwrap(), None); // чужой питомец
         db.feed_pet(cat, 200, 150.0).unwrap();
         assert_eq!(db.own_pet(cat, 7, 1).unwrap(),
-                   Some(Pet { id: cat, species: "valera".into(), level: 2, last_collect: 150.0, spent: 700 }));
+                   Some(Pet { id: cat, species: "valera".into(), level: 2, last_collect: 150.0, spent: 700, inactive_since: None }));
         db.mark_pets_collected(7, 1, 999.0).unwrap();
         assert!(db.user_pets(7, 1).unwrap().iter().all(|pet| pet.last_collect == 999.0));
         assert_eq!(db.user_pets(7, 2).unwrap()[0].last_collect, 300.0);

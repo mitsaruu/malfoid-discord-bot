@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Игры Malfoid</title>
   <link rel="stylesheet" href="static/style.css?v=5">
-  <link rel="stylesheet" href="static/cases.css?v=18">
+  <link rel="stylesheet" href="static/cases.css?v=22">
   <link rel="stylesheet" href="static/rocket.css?v=9">
   <link rel="stylesheet" href="static/casino.css?v=3">
   <link rel="stylesheet" href="static/roulette.css?v=3">
@@ -123,7 +123,7 @@
           <nav class="cases-nav" aria-label="Разделы кейсов">
             <a id="cases-home" href="#cases-title" aria-current="page"><span aria-hidden="true">⬡</span> Кейсы</a>
             <button type="button" id="cases-warehouse-tab" aria-controls="cases-warehouse"><span aria-hidden="true">▦</span> Склад</button>
-            <button type="button" id="cases-upgrade" aria-controls="cases-development"><span aria-hidden="true">⇧</span> Апгрейд</button>
+            <button type="button" id="cases-upgrade" aria-controls="cases-upgrade-panel"><span aria-hidden="true">⇧</span> Апгрейд</button>
             <button type="button" id="cases-contract" aria-controls="cases-development"><span aria-hidden="true">▤</span> Контракт</button>
           </nav>
           <div class="cases-profile">
@@ -181,19 +181,40 @@
           </section>
 
           <section class="case-view cases-inventory" id="cases-warehouse" aria-labelledby="cases-warehouse-title" hidden>
-            <h1 id="cases-warehouse-title" tabindex="-1">Склад</h1>
+            <div class="inventory-header">
+              <h1 id="cases-warehouse-title" tabindex="-1">Склад</h1>
+              <span class="inventory-count" id="inventory-count"></span>
+              <button class="inventory-collect" id="inventory-collect" type="button" disabled>
+                <span class="cases-coin" aria-hidden="true"></span> Собрать доход
+              </button>
+            </div>
             <p class="inventory-status" id="inventory-status" role="status"></p>
             <button class="cases-retry" id="inventory-retry" type="button" hidden>Обновить склад</button>
-            <ul class="case-pets inventory-pets" id="inventory-pets" role="list" aria-label="Питомцы на складе"></ul>
+            <section class="inventory-group" data-active="true" aria-labelledby="inventory-active-title">
+              <div class="inventory-group-heading">
+                <h2 id="inventory-active-title">Активные</h2><span class="inventory-group-count"></span>
+              </div>
+              <ul class="case-pets inventory-pets" id="inventory-pets" role="list"></ul>
+              <p class="inventory-empty">Здесь пока нет питомцев.</p>
+            </section>
+            <section class="inventory-group" data-active="false" aria-labelledby="inventory-inactive-title">
+              <div class="inventory-group-heading">
+                <h2 id="inventory-inactive-title">Неактивные</h2><span class="inventory-group-count"></span>
+              </div>
+              <ul class="case-pets inventory-pets" id="inventory-inactive-pets" role="list"></ul>
+              <p class="inventory-empty">Здесь пока нет питомцев.</p>
+            </section>
             <template id="inventory-pet-template">
               <li class="case-pet inventory-pet">
-                <button class="inventory-pick" type="button" disabled>
-                  <span class="inventory-sale-coin cases-coin" aria-hidden="true" hidden></span>
-                  <span class="case-pet-art" aria-hidden="true">
-                    <span data-pet-emoji></span><img data-pet-image alt="" hidden>
-                  </span>
-                  <strong class="case-pet-name"></strong>
-                </button>
+                <div class="inventory-drag-area">
+                  <button class="inventory-pick" type="button" disabled>
+                    <span class="inventory-sale-coin cases-coin" aria-hidden="true" hidden></span>
+                    <span class="case-pet-art" aria-hidden="true">
+                      <span data-pet-emoji></span><img data-pet-image alt="" hidden>
+                    </span>
+                    <strong class="case-pet-name"></strong>
+                  </button>
+                </div>
                 <dl class="inventory-stats">
                   <div><dt>Доход</dt><dd class="inventory-income"></dd></div>
                   <div><dt>Уровень</dt><dd class="inventory-level"></dd></div>
@@ -212,6 +233,43 @@
             </div>
           </section>
 
+          <section class="case-view pet-upgrade" id="cases-upgrade-panel" aria-labelledby="cases-upgrade-title" hidden>
+            <h1 id="cases-upgrade-title" tabindex="-1">Апгрейд питомцев</h1>
+            <div class="pet-upgrade-layout">
+              <section class="pet-upgrade-side" aria-labelledby="upgrade-owned-title">
+                <h2 id="upgrade-owned-title">Твои питомцы</h2>
+                <div class="upgrade-preview" id="upgrade-source-preview">Выбери питомца для ставки</div>
+                <div class="upgrade-options" id="upgrade-owned"></div>
+              </section>
+              <div class="upgrade-center">
+                <div class="upgrade-wheel" id="upgrade-wheel">
+                  <div class="upgrade-needle" aria-hidden="true"></div>
+                  <div class="upgrade-dial"><strong id="upgrade-chance">—</strong><span>Шанс успеха</span></div>
+                </div>
+                <fieldset class="upgrade-speed" id="upgrade-speed" aria-label="Скорость апгрейда">
+                  <label><input type="radio" name="upgrade-speed" value="normal" checked><span>Обычный</span></label>
+                  <label><input type="radio" name="upgrade-speed" value="fast" id="upgrade-fast"><span>Быстрый</span></label>
+                </fieldset>
+                <button class="case-open-button upgrade-submit" id="upgrade-submit" type="button" disabled>Улучшить</button>
+                <p id="upgrade-status" class="inventory-status" role="status"></p>
+                <button class="cases-retry" id="upgrade-retry" type="button" hidden>Обновить список</button>
+              </div>
+              <section class="pet-upgrade-side" aria-labelledby="upgrade-target-title">
+                <h2 id="upgrade-target-title">Желаемые питомцы</h2>
+                <div class="upgrade-preview" id="upgrade-target-preview">Выбери питомца, которого хочешь получить</div>
+                <div class="upgrade-options" id="upgrade-targets"></div>
+              </section>
+            </div>
+            <template id="upgrade-pet-template">
+              <span class="upgrade-pet-content">
+                <span class="case-pet-art" aria-hidden="true"><span data-pet-emoji></span><img data-pet-image alt="" hidden></span>
+                <strong class="case-pet-name"></strong>
+                <span class="upgrade-pet-value"></span>
+                <span class="upgrade-pet-income" hidden></span>
+              </span>
+            </template>
+          </section>
+
           <section class="case-view cases-development" id="cases-development" aria-labelledby="cases-development-title" hidden>
             <h1 id="cases-development-title" tabindex="-1"></h1>
             <p>В разработке</p>
@@ -222,14 +280,17 @@
             <div class="case-stage">
               <h1 id="cases-case-title" tabindex="-1"></h1>
               <div class="case-art case-stage-art" aria-hidden="true"></div>
-              <button class="case-open-button" id="cases-open" type="button">
-                <span id="cases-open-label">Открыть</span>
-                <span class="case-open-price">
-                  <span class="cases-coin" aria-hidden="true"></span>
-                  <span id="cases-open-price"></span>
-                  <span class="case-open-unit">монет</span>
-                </span>
-              </button>
+              <div class="case-open-actions" id="cases-open-actions">
+                <button class="case-open-button" id="cases-open" type="button">
+                  <span id="cases-open-label">Открыть</span>
+                  <span class="case-open-price">
+                    <span class="cases-coin" aria-hidden="true"></span>
+                    <span id="cases-open-price"></span>
+                    <span class="case-open-unit">монет</span>
+                  </span>
+                </button>
+                <button class="case-fast-open" type="button" data-fast-open>Быстро открыть</button>
+              </div>
               <div class="case-reel" id="cases-reel" aria-hidden="true" hidden>
                 <div class="case-reel-window">
                   <div class="case-reel-track" id="cases-reel-track"></div>
@@ -262,10 +323,7 @@
                 </dl>
               </div>
               <div class="case-result-actions" id="cases-result-actions" hidden>
-                <button class="case-open-button" id="cases-open-again" type="button">
-                  <span>Открыть снова</span>
-                  <span class="case-open-price"><span class="cases-coin" aria-hidden="true"></span><span id="cases-again-price"></span></span>
-                </button>
+                <button class="case-open-button" id="cases-open-again" type="button">Открыть снова</button>
                 <button class="case-back" id="cases-result-back" type="button">В меню кейсов</button>
               </div>
             </div>
@@ -422,8 +480,9 @@
   <script src="static/coinflip.js"></script>
   <script src="static/durak_online.js?v=3"></script>
   <script src="static/durak.js?v=4"></script>
-  <script src="static/cases-inventory.js?v=4"></script>
-  <script src="static/cases.js?v=15"></script>
+  <script src="static/cases-inventory.js?v=9"></script>
+  <script src="static/cases-upgrade.js?v=4"></script>
+  <script src="static/cases.js?v=18"></script>
   <script src="static/app.js?v=11"></script>
 </body>
 </html>

@@ -8,6 +8,12 @@ use crate::{Context, Error};
 use poise::serenity_prelude as serenity;
 use rand::Rng;
 use rusqlite::{params, OptionalExtension, Transaction};
+use std::collections::BTreeMap;
+
+pub(crate) const ACTIVE_PET_LIMIT: i64 = 10;
+pub(crate) const MAX_PET_LIMIT: usize = 40;
+pub(crate) const UPGRADE_SCALE: u32 = 10_000;
+const LEGACY_PET_LIMIT: i64 = 10;
 
 /// Настройки из settings.ini, раздел [pets].
 pub struct PetSettings {
@@ -19,8 +25,11 @@ pub struct PetSettings {
 
 impl PetSettings {
     pub fn load(settings: &crate::config::Settings) -> Self {
+        let capacity = MAX_PET_LIMIT as i64;
+        let configured_limit = settings.int("pets", "max_pets", capacity);
         Self {
-            max_pets: settings.int("pets", "max_pets", 10).max(1),
+            // Existing servers can keep the previous default in their settings file.
+            max_pets: if configured_limit == LEGACY_PET_LIMIT { capacity } else { configured_limit.clamp(1, capacity) },
             max_level: settings.int("pets", "max_level", 20).max(1),
             collect_cap_hours: settings.int("pets", "collect_cap_hours", 24).max(1),
             case_prices: [
@@ -151,7 +160,15 @@ pub fn stage(level: i64) -> &'static str {
 
 /// Монет в час у питомца этого вида и уровня (округление — как round() в Python: половинки к чётному).
 pub fn income(species: &Species, level: i64) -> i64 {
-    (species.income as f64 * (1.0 + 0.25 * (level.max(1) - 1) as f64)).round_ties_even() as i64
+    scaled_pet_stat(species.income, level)
+}
+
+pub(crate) fn value(species: &Species, level: i64) -> i64 {
+    scaled_pet_stat(species.sale_price, level)
+}
+
+fn scaled_pet_stat(base: i64, level: i64) -> i64 {
+    (base as f64 * (1.0 + 0.25 * (level.max(1) - 1) as f64)).round_ties_even() as i64
 }
 
 /// Сколько стоит покормить питомца, чтобы он вырос с level до level + 1.
@@ -168,6 +185,14 @@ pub fn title(species: &Species, level: i64) -> String {
 pub fn pending(species: &Species, level: i64, last_collect: f64, now: f64, cap_hours: i64) -> i64 {
     let hours = ((now - last_collect) / 3600.0).clamp(0.0, cap_hours as f64);
     (income(species, level) as f64 * hours) as i64
+}
+
+fn income_clock(pet: &Pet, now: f64) -> f64 {
+    pet.inactive_since.map_or(now, |paused| now.min(paused))
+}
+
+fn owned_pending(pet: &Pet, species: &Species, now: f64, cap_hours: i64) -> i64 {
+    pending(species, pet.level, pet.last_collect, income_clock(pet, now), cap_hours)
 }
 
 /// Случайный вид из кейса: сначала редкость по шансам (roll — число от 0 до 100), потом вид внутри редкости.
@@ -212,15 +237,106 @@ fn buy_pet(
         return Ok(Err(insufficient_money(balance, price, "цена кейса")));
     }
     let balance = db::change_balance(tx, wallet.guild, wallet.user, -price)?;
-    tx.execute(
-        "INSERT INTO pets (guild_id, user_id, species, level, last_collect, spent) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-        params![wallet.guild as i64, wallet.user as i64, species.key, db::now(), price],
-    )?;
+    let now = db::now();
+    let active = Database::active_pet_count_on(tx, wallet.guild, wallet.user)? < ACTIVE_PET_LIMIT;
+    insert_owned_pet(tx, wallet, species, now, price, active)?;
     tx.execute(
         "INSERT INTO case_openings (guild_id, user_id, name, face, species) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![wallet.guild as i64, wallet.user as i64, wallet.name, face, species.key],
     )?;
     Ok(Ok((tx.last_insert_rowid(), balance)))
+}
+
+fn insert_owned_pet(
+    tx: &Transaction<'_>, wallet: Wallet<'_>, species: &Species, now: f64, spent: i64, active: bool,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO pets (guild_id, user_id, species, level, last_collect, spent, inactive_since)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6)",
+        params![wallet.guild as i64, wallet.user as i64, species.key, now, spent, (!active).then_some(now)],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn move_pet(
+    database: &Database, wallet: Wallet<'_>, id: i64, active: bool, replace: Option<i64>, now: f64,
+) -> rusqlite::Result<Result<(), &'static str>> {
+    database.transaction(|tx| {
+        let find = |id| Database::own_pet_on(tx, id, wallet.guild, wallet.user);
+        let missing = "Питомец уже недоступен. Обнови склад.";
+        let Some(pet) = find(id)? else { return Ok(Err(missing)); };
+        if active == pet.inactive_since.is_none() {
+            return Ok(if replace.is_none() { Ok(()) } else { Err("Состав уже изменился. Обнови склад.") });
+        }
+        if let Some(other_id) = replace {
+            let Some(other) = find(other_id)? else { return Ok(Err(missing)); };
+            if other.inactive_since.is_none() != active {
+                return Ok(Err("Для замены выбери питомца из другой группы."));
+            }
+            Database::set_pet_activity_on(tx, &other, !active, now)?;
+        } else if active && Database::active_pet_count_on(tx, wallet.guild, wallet.user)? >= ACTIVE_PET_LIMIT {
+            return Ok(Err("Все активные места заняты. Выбери питомца для замены."));
+        }
+        Database::set_pet_activity_on(tx, &pet, active, now)?;
+        Ok(Ok(()))
+    })
+}
+
+pub(crate) struct PetUpgrade {
+    pub won: bool,
+    pub chance: u32,
+    pub roll: u32,
+    pub target: &'static Species,
+    pub balance: i64,
+}
+
+pub(crate) fn upgrade_pet(
+    database: &Database, wallet: Wallet<'_>, stakes: &BTreeMap<i64, i64>, target: &'static Species,
+    cap_hours: i64, roll: impl FnOnce() -> u32,
+) -> rusqlite::Result<Result<PetUpgrade, &'static str>> {
+    if stakes.is_empty() || stakes.len() > MAX_PET_LIMIT {
+        return Ok(Err("Выбери питомцев для ставки."));
+    }
+    database.transaction(|tx| {
+        let mut selected = Vec::with_capacity(stakes.len());
+        for (&id, &level) in stakes {
+            let found = Database::own_pet_on(tx, id, wallet.guild, wallet.user)?
+                .and_then(|pet| find_species(&pet.species).map(|species| (pet, species)));
+            let Some((pet, species)) = found else {
+                return Ok(Err("Один из питомцев уже недоступен. Обнови список."));
+            };
+            if pet.level.max(1) != level {
+                return Ok(Err("Уровень изменился. Выбери питомцев заново."));
+            }
+            selected.push((pet, species));
+        }
+        let source_value: i128 = selected.iter().map(|(pet, species)| i128::from(value(species, pet.level))).sum();
+        let target_value = i128::from(value(target, 1));
+        if target.rarity == "secret" || source_value >= target_value {
+            return Ok(Err("Выбери доступного питомца дороже ставки."));
+        }
+        let chance = (source_value * i128::from(UPGRADE_SCALE) / target_value) as u32;
+        if chance == 0 {
+            return Ok(Err("Разница в стоимости слишком велика."));
+        }
+        let roll = roll();
+        let won = roll < chance;
+        let now = db::now();
+        let earned = selected.iter().try_fold(0_i64, |sum, (pet, species)| {
+            sum.checked_add(owned_pending(pet, species, now, cap_hours))
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, sum))
+        })?;
+        let (balance, _) = wallet.open(tx)?;
+        let balance = if earned > 0 { db::change_balance(tx, wallet.guild, wallet.user, earned)? } else { balance };
+        for (pet, _) in &selected {
+            tx.execute("DELETE FROM pets WHERE id = ?1", [pet.id])?;
+        }
+        if won {
+            let active = selected.iter().any(|(pet, _)| pet.inactive_since.is_none());
+            insert_owned_pet(tx, wallet, target, now, source_value as i64, active)?;
+        }
+        Ok(Ok(PetUpgrade { won, chance, roll, target, balance }))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -312,7 +428,7 @@ pub(crate) fn has_opened_stellochka(database: &Database, guild: u64, user: u64) 
     )
 }
 
-fn collect_pets(
+pub(crate) fn collect_pets(
     database: &Database,
     wallet: Wallet<'_>,
     cap_hours: i64,
@@ -324,7 +440,7 @@ fn collect_pets(
             return Ok(Err("🐾 Питомцев пока нет. Открой кейс: /case"));
         }
         let total = pets.iter().try_fold(0_i64, |total, (pet, species)| {
-            total.checked_add(pending(species, pet.level, pet.last_collect, now, cap_hours))
+            total.checked_add(owned_pending(pet, species, now, cap_hours))
                 .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, total))
         })?;
         if total <= 0 {
@@ -335,7 +451,7 @@ fn collect_pets(
         for (pet, _) in &pets {
             tx.execute(
                 "UPDATE pets SET last_collect = ?2 WHERE id = ?1 AND COALESCE(last_collect, 0) < ?2",
-                params![pet.id, now],
+                params![pet.id, income_clock(pet, now)],
             )?;
         }
         Ok(Ok((total, balance)))
@@ -375,10 +491,14 @@ pub(crate) fn feed_owned_pet(
             return Ok(Err(insufficient_money(balance, cost, "корм")));
         }
         let spent = pet.spent.checked_add(cost).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, pet.spent))?;
-        let now = db::now();
+        let now = income_clock(&pet, db::now());
         let saved = pending(species, pet.level, pet.last_collect, now, settings.collect_cap_hours);
         let new_level = pet.level.max(1) + 1;
-        let last_collect = now - saved as f64 / income(species, new_level) as f64 * 3600.0;
+        let mut last_collect = now - saved as f64 / income(species, new_level) as f64 * 3600.0;
+        if pending(species, new_level, last_collect, now, settings.collect_cap_hours) < saved {
+            // The timestamp conversion can round up by one float step.
+            last_collect = last_collect.next_down();
+        }
         let balance = db::change_balance(tx, wallet.guild, wallet.user, -cost)?;
         tx.execute(
             "UPDATE pets SET level = ?2, spent = ?3, last_collect = ?4 WHERE id = ?1",
@@ -409,14 +529,14 @@ fn owned_pet_autocomplete(ctx: Context<'_>, partial: &str, show_sale_price: bool
     let choices: Vec<serenity::AutocompleteChoice> = sorted_pets(pets)
         .into_iter()
         .enumerate()
-        .map(|(index, (pet, species))| (format!("{}. {}", index + 1, title(species, pet.level)), pet.id, species))
+        .map(|(index, (pet, species))| (format!("{}. {}", index + 1, title(species, pet.level)), pet, species))
         .filter(|(label, _, _)| label.to_lowercase().contains(&partial))
         .take(25)
-        .map(|(mut label, id, species)| {
+        .map(|(mut label, pet, species)| {
             if show_sale_price {
-                label.push_str(&format!(" — {}", money_text(species.sale_price)));
+                label.push_str(&format!(" — {}", money_text(value(species, pet.level))));
             }
-            serenity::AutocompleteChoice::new(label, id)
+            serenity::AutocompleteChoice::new(label, pet.id)
         })
         .collect();
     response.set_choices(choices)
@@ -522,7 +642,8 @@ pub async fn show_pets(
     let (now, cap) = (db::now(), data.pets.collect_cap_hours);
     let (mut lines, mut total_income, mut total_pending) = (Vec::new(), 0, 0);
     for (index, (pet, species)) in pets.iter().enumerate() {
-        let (hourly, saved) = (income(species, pet.level), pending(species, pet.level, pet.last_collect, now, cap));
+        let (hourly, saved) = (if pet.inactive_since.is_none() { income(species, pet.level) } else { 0 },
+            owned_pending(pet, species, now, cap));
         total_income += hourly;
         total_pending += saved;
         let feed = if pet.level < data.pets.max_level {
@@ -533,10 +654,19 @@ pub async fn show_pets(
         lines.push(format!(
             "`{}.` {} — {}/ч, накопил {}, {feed}", index + 1, title(species, pet.level), money_text(hourly), number(saved)));
     }
+    let mut description = lines.join("\n");
+    if description.encode_utf16().count() > 4096 {
+        let mut length = 0;
+        description = lines.into_iter().take_while(|line| {
+            length += line.encode_utf16().count() + 1;
+            length <= 4000
+        }).collect::<Vec<_>>().join("\n");
+        description.push_str("\nОстальные питомцы видны на складе в /games.");
+    }
     let mut embed = serenity::CreateEmbed::new()
         .color(0x22C55E)
         .title(format!("🐾 Питомцы {owner_name} ({}/{})", pets.len(), data.pets.max_pets))
-        .description(lines.join("\n"))
+        .description(description)
         .field("Доход", format!("{} в час", money_text(total_income)), true)
         .field("Можно забрать", money_text(total_pending), true)
         .footer(serenity::CreateEmbedFooter::new(format!(
@@ -632,9 +762,9 @@ fn commit_pet_sale<'a>(
     let mut earned = 0_i64;
     let mut payout = 0_i64;
     for (pet, species) in pets {
-        let saved = pending(species, pet.level, pet.last_collect, now, cap_hours);
+        let saved = owned_pending(pet, species, now, cap_hours);
         earned = earned.checked_add(saved).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, earned))?;
-        payout = payout.checked_add(species.sale_price).and_then(|amount| amount.checked_add(saved))
+        payout = payout.checked_add(value(species, pet.level)).and_then(|amount| amount.checked_add(saved))
             .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, payout))?;
         tx.execute("DELETE FROM pets WHERE id = ?1", [pet.id])?;
     }
@@ -684,7 +814,7 @@ pub async fn pet_sell(
         let offer = format!(
             "Продать {} за **{}**? Накопленный к моменту продажи доход будет начислен отдельно. \
              Вернуть питомца после продажи нельзя.",
-            title(species, pet.level), money_text(species.sale_price));
+            title(species, pet.level), money_text(value(species, pet.level)));
         if !crate::qol::confirm(ctx, offer).await? {
             return Ok(());
         }
@@ -697,7 +827,7 @@ pub async fn pet_sell(
     };
     say(ctx, format!(
         "💸 <@{user}> продаёт питомца {} за **{}**. Накопленный доход: **+{}**. Баланс: **{}**.",
-        title(species, pet.level), money_text(species.sale_price), money_text(earned), money_text(balance))).await
+        title(species, pet.level), money_text(value(species, pet.level)), money_text(earned), money_text(balance))).await
 }
 
 const BATTLE_MIN_CHANCE: i64 = 10; // шанс победить в бою не бывает меньше 10% и больше 90%
@@ -1031,7 +1161,175 @@ mod tests {
     }
 
     #[test]
-    fn sale_pays_fixed_species_price_and_unpaid_income_once() {
+    fn opening_cases_respects_both_inventory_limits() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100_000 };
+        let settings = PetSettings::load(&crate::config::Settings::parse("[pets]\nmax_pets = 10"));
+        assert_eq!(settings.max_pets, 40);
+        let open = || buy_case(&db, wallet, "", &settings, Case::Cheap, None).unwrap();
+        for _ in 0..40 {
+            assert!(open().is_ok());
+        }
+        assert!(open().is_err());
+        let owned = db.user_pets(7, 1).unwrap();
+        assert_eq!(owned.len(), 40);
+        assert_eq!(owned.iter().filter(|pet| pet.inactive_since.is_none()).count(), 10);
+        assert_eq!(wallet.open(&db.lock()).unwrap().0, 100_000 - 40 * settings.case_prices[0]);
+        assert!(move_pet(&db, wallet, owned[10].id, true, None, db::now()).unwrap().is_err());
+        assert!(move_pet(&db, wallet, owned[10].id, true, Some(owned[0].id), db::now()).unwrap().is_ok());
+        assert!(db.own_pet(owned[0].id, 7, 1).unwrap().unwrap().inactive_since.is_some());
+        assert!(db.own_pet(owned[10].id, 7, 1).unwrap().unwrap().inactive_since.is_none());
+    }
+
+    #[test]
+    fn standby_freezes_income_and_reactivation_resumes_it() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
+        let id = db.add_pet(7, 1, "valera", 0.0, 500).unwrap();
+        assert!(move_pet(&db, wallet, id, false, None, 3600.0).unwrap().is_ok());
+        assert_eq!(collect_pets(&db, wallet, 24, 7200.0).unwrap(), Ok((10, 110)));
+        assert!(collect_pets(&db, wallet, 24, 10_800.0).unwrap().is_err());
+        assert!(move_pet(&db, wallet, id, true, None, 10_800.0).unwrap().is_ok());
+        assert_eq!(collect_pets(&db, wallet, 24, 14_400.0).unwrap(), Ok((10, 120)));
+    }
+
+    #[test]
+    fn trading_a_standby_pet_preserves_both_active_counts_and_unpaid_income() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 500 };
+        let now = db::now();
+        let cat = db.add_pet(7, 1, "valera", now - 720.0, 500).unwrap();
+        let fox = db.add_pet(7, 2, "arkady", now - 440.0, 2000).unwrap();
+        assert!(move_pet(&db, wallet, cat, false, None, now - 280.0).unwrap().is_ok());
+        for _ in 0..ACTIVE_PET_LIMIT {
+            db.add_pet(7, 1, "valera", now, 500).unwrap();
+        }
+        assert!(db.swap_pets(7, (cat, 1), (fox, 2)).unwrap());
+        let new_fox = db.own_pet(fox, 7, 1).unwrap().unwrap();
+        let new_cat = db.own_pet(cat, 7, 2).unwrap().unwrap();
+        assert!(new_cat.inactive_since.is_none());
+        assert!(new_fox.inactive_since.is_some());
+        assert_eq!(owned_pending(&new_cat, kind("valera"), db::now(), 24), 1);
+        assert_eq!(owned_pending(&new_fox, kind("arkady"), db::now(), 24), 3);
+        for (guild, user, expected) in [(7, 1, 10), (7, 2, 1)] {
+            assert_eq!(Database::active_pet_count_on(&db.lock(), guild, user).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn feeding_a_standby_pet_keeps_its_frozen_coins_at_epoch_timestamps() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 10_000 };
+        let paused = 1_730_000_000.25;
+        let id = db.add_pet(7, 1, "arkady", paused - 288.0, 500).unwrap();
+        assert!(move_pet(&db, wallet, id, false, None, paused).unwrap().is_ok());
+        let settings = PetSettings::load(&crate::config::Settings::default());
+        let fed = feed_owned_pet(&db, wallet, id, &settings, Some(1)).unwrap().ok().unwrap();
+        assert_eq!(fed.pet.inactive_since, Some(paused));
+        assert_eq!(collect_pets(&db, wallet, 24, paused + 3600.0).unwrap(), Ok((2, fed.balance + 2)));
+    }
+
+    #[test]
+    fn pet_operations_reject_ids_outside_the_players_inventory_without_side_effects() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 500 };
+        let own = db.add_pet(7, 1, "valera", 0.0, 500).unwrap();
+        let foreign = db.add_pet(7, 2, "arkady", 0.0, 2000).unwrap();
+        let other_guild = db.add_pet(8, 1, "valera", 0.0, 500).unwrap();
+        assert!(move_pet(&db, wallet, own, false, None, 3600.0).unwrap().is_ok());
+        let accounts = [(7, 1), (7, 2), (8, 1)];
+        let snapshots = accounts.map(|(guild, user)| db.user_pets(guild, user).unwrap());
+        let settings = PetSettings::load(&crate::config::Settings::default());
+        for id in [foreign, other_guild] {
+            assert!(move_pet(&db, wallet, id, false, None, 7200.0).unwrap().is_err());
+            assert!(move_pet(&db, wallet, own, true, Some(id), 7200.0).unwrap().is_err());
+            assert!(feed_owned_pet(&db, wallet, id, &settings, Some(1)).unwrap().is_err());
+            assert!(sell_inventory_pets(&db, wallet, &[own, id].into(), 24, || 7200.0).unwrap().is_err());
+            assert!(upgrade_pet(&db, wallet, &[(own, 1), (id, 1)].into(), kind("vasily"), 24,
+                || panic!("unowned stake was rolled")).unwrap().is_err());
+        }
+        assert_eq!(accounts.map(|(guild, user)| db.user_pets(guild, user).unwrap()), snapshots);
+        assert_eq!(wallet.open(&db.lock()).unwrap().0, 500);
+    }
+
+    #[test]
+    fn upgrade_uses_value_at_the_current_level_and_consumes_one_owned_stake() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
+        let stake = kind("valera");
+        let target = kind("vasily");
+        let first = db.add_pet(7, 1, stake.key, db::now(), 500).unwrap();
+        db.feed_pet(first, 200, db::now()).unwrap();
+        let other = db.add_pet(7, 2, stake.key, db::now(), 500).unwrap();
+        let upgrade = |id, level, target, roll| upgrade_pet(&db, wallet, &[(id, level)].into(), target, 24, || roll).unwrap();
+        assert!(upgrade(other, 1, target, 0).is_err());
+        assert!(upgrade(first, 1, target, 0).is_err());
+        assert!(upgrade(first, 2, kind("stellochka"), 0).is_err());
+        let chance = (value(stake, 2) * 10_000 / value(target, 1)) as u32;
+        let won = upgrade(first, 2, target, chance - 1).unwrap();
+        assert!(won.won);
+        assert_eq!(won.chance, chance);
+        assert!(upgrade(first, 2, target, 0).is_err());
+        let only = db.user_pets(7, 1).unwrap();
+        assert_eq!((only.len(), only[0].species.as_str(), only[0].level), (1, target.key, 1));
+        let second = db.add_pet(7, 1, stake.key, db::now(), 500).unwrap();
+        let lost = upgrade(second, 1, target, 9999).unwrap();
+        assert!(!lost.won);
+        assert!(db.own_pet(second, 7, 1).unwrap().is_none());
+        assert!(db.own_pet(other, 7, 2).unwrap().is_some());
+    }
+
+    #[test]
+    fn multi_pet_upgrade_uses_the_sum_and_validates_every_pet_before_spending() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
+        let now = db::now();
+        let first = db.add_pet(7, 1, "valera", now, 500).unwrap();
+        let second = db.add_pet(7, 1, "valera", now, 500).unwrap();
+        let other = db.add_pet(7, 2, "valera", now, 500).unwrap();
+        db.feed_pet(first, 200, now).unwrap();
+        assert!(move_pet(&db, wallet, second, false, None, now).unwrap().is_ok());
+        let target = kind("vasily");
+        let invalid = [(first, 2), (other, 1)].into();
+        assert!(upgrade_pet(&db, wallet, &invalid, target, 24, || panic!("invalid stake was rolled"))
+            .unwrap().is_err());
+        assert_eq!(db.user_pets(7, 1).unwrap().len(), 2);
+
+        let stakes = [(first, 2), (second, 1)].into();
+        let value = value(kind("valera"), 2) + value(kind("valera"), 1);
+        let chance = (value * 10_000 / target.sale_price) as u32;
+        let result = upgrade_pet(&db, wallet, &stakes, target, 24, || chance - 1).unwrap().unwrap();
+        assert_eq!((result.won, result.chance), (true, chance));
+        assert!(upgrade_pet(&db, wallet, &stakes, target, 24, || 0).unwrap().is_err());
+        let pets = db.user_pets(7, 1).unwrap();
+        assert_eq!(pets.len(), 1);
+        assert_eq!(pets[0].species, target.key);
+        assert!(pets[0].inactive_since.is_none());
+        assert!(db.own_pet(other, 7, 2).unwrap().is_some());
+    }
+
+    #[test]
+    fn collecting_inventory_income_pays_the_owner_once_and_clears_income_for_sale() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
+        let id = db.add_pet(7, 1, "valera", 0.0, 500).unwrap();
+        db.add_pet(7, 1, "valera", 1800.0, 500).unwrap();
+        let other_player = db.add_pet(7, 2, "valera", 0.0, 500).unwrap();
+        let other_server = db.add_pet(8, 1, "valera", 0.0, 500).unwrap();
+
+        let collect = || collect_pets(&db, wallet, 24, 3600.0).unwrap();
+        assert_eq!(collect(), Ok((15, 115)));
+        assert!(collect().is_err());
+        assert_eq!(db.own_pet(other_player, 7, 2).unwrap().unwrap().last_collect, 0.0);
+        assert_eq!(db.own_pet(other_server, 8, 1).unwrap().unwrap().last_collect, 0.0);
+
+        let sale = sell_inventory_pets(&db, wallet, &[id].into(), 24, || 3600.0).unwrap().unwrap();
+        assert_eq!(sale.earned, 0);
+        assert_eq!(sale.balance, 115 + kind("valera").sale_price);
+    }
+
+    #[test]
+    fn sale_pays_the_level_adjusted_price_and_unpaid_income_once() {
         let db = Database::in_memory().unwrap();
         let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
         let species = kind("valera");
@@ -1045,10 +1343,10 @@ mod tests {
 
         assert_eq!(sell(&stale), None);
         assert_eq!(sell(&first), Some((20, 320)));
-        assert_eq!(sell(&second), Some((24, 544)));
+        assert_eq!(sell(&second), Some((24, 594)));
         assert_eq!(sell(&second), None);
         assert!(db.user_pets(7, 1).unwrap().is_empty());
-        assert_eq!(db.wallet(7, 1, "Alice", 100).unwrap().0, 544);
+        assert_eq!(db.wallet(7, 1, "Alice", 100).unwrap().0, 594);
     }
 
     #[test]
@@ -1135,7 +1433,7 @@ mod tests {
 
     #[test]
     fn strongest_first() {
-        let pet = |id, species: &str, level| Pet { id, species: species.to_string(), level, last_collect: 0.0, spent: 0 };
+        let pet = |id, species: &str, level| Pet { id, species: species.to_string(), level, last_collect: 0.0, spent: 0, inactive_since: None };
         let pets = sorted_pets(vec![pet(1, "valera", 1), pet(2, "sergey", 1), pet(3, "igor", 3), pet(4, "нет такого", 1), pet(5, "tolik", 2)]);
         let order: Vec<i64> = pets.iter().map(|(pet, _)| pet.id).collect();
         assert_eq!(order, [2, 3, 1, 5]); // у котика и голубя доход 10 — раньше тот, кто раньше появился

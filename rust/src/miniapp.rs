@@ -15,7 +15,7 @@ use base64::Engine;
 use poise::serenity_prelude as serenity;
 use rand::distr::{Alphanumeric, SampleString};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -141,7 +141,7 @@ async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Respon
     match name.as_str() {
         "style.css" | "cases.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
             file(&app, &name, "text/css; charset=utf-8").await,
-        "app.js" | "audio.js" | "game_avatars.js" | "cases.js" | "cases-inventory.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
+        "app.js" | "audio.js" | "game_avatars.js" | "cases.js" | "cases-inventory.js" | "cases-upgrade.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         "lobby-games.webp" | "pet-cases.webp" | "secret-pet-silhouette.webp" => file(&app, &name, "image/webp").await,
         "menu-ambient.mp3" | "case-opening.mp3" | "case-secret.mp3" =>
@@ -375,25 +375,82 @@ async fn cases_inventory(State(app): State<App>, headers: HeaderMap) -> Reply {
     };
     let animals: Vec<_> = owned.iter().map(|(pet, species)| {
         let level = pet.level.max(1);
+        let active = pet.inactive_since.is_none();
+        let income_rate = pets::income(species, level);
         let upgrade_price = (level < app.data.pets.max_level)
             .then(|| crate::text::money_text(pets::feed_cost(species, level)));
         json!({
             "id": pet.id.to_string(),
             "pet": case_pet(species),
             "level": level.to_string(),
-            "income": format!("{}/ч", crate::text::money_text(pets::income(species, level))),
+            "active": active,
+            "income": format!("{}/ч", crate::text::money_text(if active { income_rate } else { 0 })),
+            "income_rate": format!("{}/ч", crate::text::money_text(income_rate)),
             "upgrade_price": upgrade_price,
-            "sale_price": species.sale_price.to_string(),
+            "sale_price": pets::value(species, level).to_string(),
         })
     }).collect();
+    let targets: Vec<_> = pets::SPECIES.iter().filter(|species| species.rarity != "secret").map(|species| json!({
+        "pet": case_pet(species), "sale_price": pets::value(species, 1).to_string(),
+        "income": format!("{}/ч", crate::text::money_text(pets::income(species, 1))),
+    })).collect();
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(json!({
         "pets": animals, "balance": crate::text::number(balance), "secret_sprite": secret_sprite,
-        "inventory_full": full,
+        "inventory_full": full, "capacity": app.data.pets.max_pets, "active_limit": pets::ACTIVE_PET_LIMIT,
+        "upgrade_targets": targets,
     }))).into_response())
+}
+
+async fn cases_inventory_move(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let bad = || json_error("Выбери питомца и группу.", StatusCode::BAD_REQUEST);
+    let id = body.get("id").and_then(positive_integer).ok_or_else(bad)?;
+    let active = body.get("active").and_then(Value::as_bool).ok_or_else(bad)?;
+    let replace = body.get("replace").map(|value| positive_integer(value).ok_or_else(bad)).transpose()?;
+    let (_, session) = app.authorized(&headers, Some("pets"), true).await?;
+    pets::move_pet(&app.data.db, session.wallet(&app.data), id, active, replace, crate::db::now())
+        .map_err(failed)?.map_err(|message| json_error(message, StatusCode::CONFLICT))?;
+    Ok(Json(json!({ "moved": true })).into_response())
+}
+
+async fn cases_pet_upgrade(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let bad = || json_error("Выбери питомцев для ставки и цель.", StatusCode::BAD_REQUEST);
+    let entries = match body.get("stakes") {
+        Some(stakes) => stakes.as_array().ok_or_else(bad)?.as_slice(),
+        None => std::slice::from_ref(&body),
+    };
+    if entries.is_empty() || entries.len() > pets::MAX_PET_LIMIT {
+        return Err(bad());
+    }
+    let stakes = entries.iter().map(|entry| Some((
+        positive_integer(entry.get("id")?)?, positive_integer(entry.get("level")?)?,
+    ))).collect::<Option<BTreeMap<_, _>>>().ok_or_else(bad)?;
+    if entries.len() != stakes.len() {
+        return Err(bad());
+    }
+    let target = body.get("target").and_then(Value::as_str).and_then(pets::find_species).ok_or_else(bad)?;
+    let (_, session) = app.authorized(&headers, Some("case"), true).await?;
+    let result = pets::upgrade_pet(&app.data.db, session.wallet(&app.data), &stakes, target,
+        app.data.pets.collect_cap_hours, || rand::random_range(0..pets::UPGRADE_SCALE))
+        .map_err(failed)?.map_err(|message| json_error(message, StatusCode::CONFLICT))?;
+    Ok(Json(json!({
+        "won": result.won, "chance": result.chance, "roll": result.roll, "pet": case_pet(result.target),
+        "balance": crate::text::number(result.balance), "inventory_full": inventory_full(&app.data, &session)?,
+    })).into_response())
 }
 
 fn positive_integer(value: &Value) -> Option<i64> {
     value.as_str()?.parse::<i64>().ok().filter(|number| *number > 0)
+}
+
+async fn cases_inventory_collect(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, Some("pets_collect"), true).await?;
+    let (total, balance) = pets::collect_pets(
+        &app.data.db, session.wallet(&app.data), app.data.pets.collect_cap_hours, crate::db::now(),
+    ).map_err(failed)?.map_err(|message| json_error(message, StatusCode::CONFLICT))?;
+    Ok(Json(json!({
+        "payout": crate::text::money_text(total),
+        "balance": crate::text::number(balance),
+    })).into_response())
 }
 
 async fn cases_inventory_upgrade(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
@@ -705,6 +762,9 @@ pub fn router(app: App) -> axum::Router {
         .route("/api/cases", get(cases_catalogue))
         .route("/api/cases/open", post(cases_open).layer(DefaultBodyLimit::max(1024)))
         .route("/api/cases/inventory", get(cases_inventory))
+        .route("/api/cases/inventory/collect", post(cases_inventory_collect))
+        .route("/api/cases/inventory/move", post(cases_inventory_move).layer(DefaultBodyLimit::max(1024)))
+        .route("/api/cases/inventory/transform", post(cases_pet_upgrade).layer(DefaultBodyLimit::max(4096)))
         .route("/api/cases/inventory/upgrade", post(cases_inventory_upgrade).layer(DefaultBodyLimit::max(1024)))
         .route("/api/cases/inventory/sell", post(cases_inventory_sell))
         .route("/api/cases/avatar.png", get(cases_avatar))

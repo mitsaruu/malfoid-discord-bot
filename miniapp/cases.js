@@ -96,6 +96,8 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   const warehousePanel = root.querySelector("#cases-warehouse");
   const warehouseTitle = root.querySelector("#cases-warehouse-title");
   const upgradeTab = root.querySelector("#cases-upgrade");
+  const upgradePanel = root.querySelector("#cases-upgrade-panel");
+  const upgradeTitle = root.querySelector("#cases-upgrade-title");
   const contractTab = root.querySelector("#cases-contract");
   const developmentPanel = root.querySelector("#cases-development");
   const developmentTitle = root.querySelector("#cases-development-title");
@@ -105,6 +107,8 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   const petsGrid = root.querySelector("#cases-pets");
   const petTemplate = root.querySelector("#cases-pet-template");
   const openButton = root.querySelector("#cases-open");
+  const openActions = root.querySelector("#cases-open-actions");
+  const fastButton = openActions.querySelector("[data-fast-open]");
   const openLabel = root.querySelector("#cases-open-label");
   const openPrice = root.querySelector("#cases-open-price");
   const openUnit = root.querySelector(".case-open-unit");
@@ -121,7 +125,6 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   const resultSalePrice = root.querySelector("#cases-result-sale-price");
   const resultActions = root.querySelector("#cases-result-actions");
   const againButton = root.querySelector("#cases-open-again");
-  const againPrice = root.querySelector("#cases-again-price");
   const historyList = root.querySelector("#cases-history-list");
   const historyStatus = root.querySelector("#cases-history-status");
   const openingTemplate = root.querySelector("#cases-opening-template");
@@ -140,9 +143,10 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   let purchaseBusy = false;
   let purchaseResult = null;
   let purchaseMessage = null;
-  let activeReel = null;
+  let activeOpening = null;
   let stopCaseSound;
   let secretVideoLoad;
+  let revealVersion = 0;
   let secretUnlocked = false;
   let secretSprite = null;
   let balanceVersion = 0;
@@ -154,8 +158,17 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     request: inventoryRequest,
     showPetArt,
     balanceVersion: () => balanceVersion,
-    canMutate: () => !purchaseBusy,
-    onSettled: showPurchase,
+    canMutate: () => !purchaseBusy && !upgrade.isMutating(),
+    onSettled: () => { showPurchase(); upgrade.reload(); },
+    updateAccount,
+  });
+  const upgrade = createCasesUpgrade({
+    root: upgradePanel,
+    request: inventoryRequest,
+    showPetArt,
+    balanceVersion: () => balanceVersion,
+    canMutate: () => !purchaseBusy && !warehouse.isMutating(),
+    onSettled: () => { showPurchase(); warehouse.reload(); },
     updateAccount,
   });
 
@@ -217,8 +230,13 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
 
   function showSection(panel, title, tab = casesHome) {
     if (panel !== warehousePanel) warehouse.hide();
-    if (panel !== casePanel) stopCaseEffects();
-    for (const section of [cataloguePanel, casePanel, warehousePanel, developmentPanel]) section.hidden = section !== panel;
+    if (panel !== upgradePanel) upgrade.hide();
+    if (panel !== casePanel) {
+      selectedCase = null;
+      stopOpening();
+      resetResult();
+    }
+    for (const section of [cataloguePanel, casePanel, warehousePanel, upgradePanel, developmentPanel]) section.hidden = section !== panel;
     for (const button of [casesHome, warehouseTab, upgradeTab, contractTab]) {
       if (button === tab) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
@@ -237,12 +255,13 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   }
 
   function prepareSecretVideo() {
-    if (secretVideoLoad || reducedMotion.matches) return;
+    if (secretVideoLoad || reducedMotion.matches) return secretVideoLoad;
     secretVideoLoad = (async () => {
       const response = await fetch("static/case-secret-explosion.mp4");
       if (!response.ok) throw new Error("Secret reveal video unavailable");
       secretVideo.src = URL.createObjectURL(await response.blob());
     })().catch(() => { secretVideoLoad = undefined; });
+    return secretVideoLoad;
   }
 
   function stopSecretVideo() {
@@ -253,39 +272,49 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   }
 
   function stopCaseEffects() {
+    revealVersion += 1;
     stopSound();
     stopSecretVideo();
   }
 
-  function showSecretReveal() {
+  function resetResult() {
+    if (purchaseResult) showPetArt(resultPanel, { emoji: "" }, null);
+    purchaseResult = null;
+    stopCaseEffects();
+  }
+
+  async function showSecretReveal(withSound) {
     stopSound();
+    const version = revealVersion;
+    await prepareSecretVideo();
+    if (version !== revealVersion) return;
     if (document.hidden) return;
     if (reducedMotion.matches || !secretVideo.src) {
-      playSound("secret");
+      if (withSound) playSound("secret");
       return;
     }
     secretVideo.hidden = false;
     void secretVideo.play().then(
-      () => { if (!secretVideo.hidden) playSound("secret"); },
+      () => { if (version === revealVersion && withSound && !secretVideo.hidden) playSound("secret"); },
       () => {
-        if (secretVideo.hidden) return;
+        if (version !== revealVersion || secretVideo.hidden) return;
         stopSecretVideo();
-        playSound("secret");
+        if (withSound) playSound("secret");
       },
     );
   }
 
-  function stopReel() {
-    if (!activeReel) return;
-    activeReel.animation.stop();
-    activeReel = null;
-    reelTrack.replaceChildren();
+  function stopOpening() {
+    const animation = activeOpening?.animation;
+    activeOpening = null;
+    if (animation) {
+      animation.stop();
+      reelTrack.replaceChildren();
+    }
   }
 
   function showCatalogueScreen(focus = false) {
     const previous = selectedCase?.id;
-    selectedCase = null;
-    stopReel();
     showSection(cataloguePanel, catalogueTitle);
     if (focus) {
       const card = previous && grid.querySelector(`[data-case="${CSS.escape(previous)}"] button`);
@@ -294,19 +323,21 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   }
 
   function showDevelopment(name, tab) {
-    selectedCase = null;
-    stopReel();
     developmentTitle.textContent = name;
     showSection(developmentPanel, developmentTitle, tab);
     developmentTitle.focus();
   }
 
   function showWarehouse() {
-    selectedCase = null;
-    stopReel();
     showSection(warehousePanel, warehouseTitle, warehouseTab);
     warehouse.show();
     warehouseTitle.focus();
+  }
+
+  function showUpgrade() {
+    showSection(upgradePanel, upgradeTitle, upgradeTab);
+    upgrade.show();
+    upgradeTitle.focus();
   }
 
   function showSecretSilhouette(container) {
@@ -341,17 +372,15 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
 
   function showCase(item, focus = false) {
     if (selectedCase?.id !== item.id) {
-      stopReel();
-      stopCaseEffects();
+      stopOpening();
+      resetResult();
     }
     if (item.pets.some((pet) => pet.rarity === "secret")) prepareSecretVideo();
     selectedCase = item;
     casePanel.dataset.case = item.id;
     caseTitle.textContent = `${item.name} кейс`;
     openPrice.textContent = item.price;
-    const unit = coinForms[plural.select(Number(item.cost.slice(-2)))];
-    openUnit.textContent = unit;
-    againPrice.textContent = `${item.price} ${unit}`;
+    openUnit.textContent = coinForms[plural.select(Number(item.cost.slice(-2)))];
     renderContents(item);
     showSection(casePanel, caseTitle);
     showPurchase();
@@ -365,19 +394,20 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     if (!selectedCase) return;
     const current = pendingPurchase?.case === selectedCase.id;
     const anotherCase = pendingPurchase && !current;
-    const rolling = activeReel?.caseId === selectedCase.id;
-    const result = !rolling && purchaseResult?.caseId === selectedCase.id ? purchaseResult : null;
+    const opening = activeOpening?.caseId === selectedCase.id;
+    const rolling = opening && Boolean(activeOpening.animation);
+    const result = !opening && purchaseResult?.caseId === selectedCase.id ? purchaseResult : null;
     caseArt.hidden = rolling || Boolean(result);
-    openButton.hidden = rolling || Boolean(result);
+    openActions.hidden = opening || Boolean(result);
     reelPanel.hidden = !rolling;
     resultPanel.hidden = !result;
     resultActions.hidden = !result;
     const full = inventoryFull && !current;
-    openButton.disabled = purchaseBusy || warehouse.isMutating() || Boolean(anotherCase) || full;
-    againButton.disabled = openButton.disabled;
+    openButton.disabled = purchaseBusy || warehouse.isMutating() || upgrade.isMutating() || Boolean(anotherCase) || full;
+    fastButton.disabled = openButton.disabled;
     openLabel.textContent = current ? (purchaseBusy ? "Открываем…" : "Повторить запрос") : "Открыть";
     let message = purchaseMessage?.caseId === selectedCase.id ? purchaseMessage.text : "";
-    if (rolling) {
+    if (opening) {
       message = "Открываем кейс…";
     } else if (full) {
       message = fullMessage;
@@ -393,6 +423,7 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     if (result) {
       const { pet, sprite, income, sale_price: salePrice } = result;
       resultPanel.dataset.rarity = pet.rarity;
+      resultPanel.toggleAttribute("data-fast", result.fast);
       resultName.textContent = pet.name;
       resultRarity.textContent = pet.rarity_name;
       resultIncome.textContent = income;
@@ -401,8 +432,8 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     }
   }
 
-  async function purchase() {
-    if (!pending || !selectedCase || purchaseBusy || warehouse.isMutating() ||
+  async function purchase(fast = false) {
+    if (!pending || !selectedCase || purchaseBusy || warehouse.isMutating() || upgrade.isMutating() ||
         (pendingPurchase && pendingPurchase.case !== selectedCase.id)) return;
     const item = selectedCase;
     const isRetry = Boolean(pendingPurchase);
@@ -410,12 +441,12 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     const order = pendingPurchase || { case: item.id, request_id: crypto.randomUUID(), expected_price: item.cost };
     rememberPurchase(order);
     purchaseBusy = true;
-    purchaseResult = null;
+    resetResult();
     purchaseMessage = null;
-    const reel = { caseId: item.id, animation: createCaseReel(reelTrack, item.pets, renderReelCard) };
-    activeReel = reel;
-    stopSecretVideo();
-    playSound("opening");
+    const animation = fast ? null : createCaseReel(reelTrack, item.pets, renderReelCard);
+    const opening = { caseId: item.id, animation };
+    activeOpening = opening;
+    if (!fast) playSound("opening");
     showPurchase();
     try {
       const response = await openCase(order);
@@ -423,15 +454,15 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
       rememberPurchase(null);
       updateAccount(response);
       const wonSecret = response.pet.rarity === "secret";
-      await reel.animation.land(response.pet, wonSecret ? (duration) => stopCaseSound?.(duration) : undefined);
-      purchaseResult = { ...response, caseId: item.id };
+      if (animation) await animation.land(response.pet, wonSecret ? (duration) => stopCaseSound?.(duration) : undefined);
+      if (activeOpening === opening) purchaseResult = { ...response, caseId: item.id, fast };
       if (wonSecret) {
         secretUnlocked = true;
         secretSprite = response.sprite || secretSprite;
         if (selectedCase?.id === item.id) renderContents(selectedCase);
       }
     } catch (error) {
-      if (activeReel === reel) stopSound();
+      if (activeOpening === opening) stopSound();
       if (error.status === 400 || error.status === 409 || (!isRetry && [401, 403].includes(error.status))) {
         rememberPurchase(null);
       }
@@ -445,12 +476,13 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
       };
       if (error.status === 409 && pending) loadCatalogue(pending.signal);
     } finally {
-      const visible = activeReel === reel;
-      if (visible) stopReel();
+      const visible = activeOpening === opening;
+      if (visible) stopOpening();
       purchaseBusy = false;
       showPurchase();
-      if (visible && purchaseResult?.pet.rarity === "secret") showSecretReveal();
+      if (visible && purchaseResult?.pet.rarity === "secret") void showSecretReveal(!fast);
       warehouse.reload();
+      upgrade.reload();
     }
   }
 
@@ -548,7 +580,7 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     try {
       const data = await catalogue(signal);
       if (signal.aborted) return;
-      if (data.secret_unlocked && (secretUnlocked || activeReel?.caseId !== "secret")) {
+      if (data.secret_unlocked && (secretUnlocked || activeOpening?.caseId !== "secret")) {
         secretUnlocked = true;
         secretSprite = data.secret_sprite || secretSprite;
       }
@@ -597,12 +629,17 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     showCatalogueScreen(true);
   });
   warehouseTab.addEventListener("click", showWarehouse);
-  upgradeTab.addEventListener("click", () => showDevelopment("Апгрейд", upgradeTab));
+  upgradeTab.addEventListener("click", showUpgrade);
   contractTab.addEventListener("click", () => showDevelopment("Контракт", contractTab));
   root.querySelector("#cases-back").addEventListener("click", () => showCatalogueScreen(true));
   root.querySelector("#cases-result-back").addEventListener("click", () => showCatalogueScreen(true));
-  openButton.addEventListener("click", purchase);
-  againButton.addEventListener("click", purchase);
+  openButton.addEventListener("click", () => purchase());
+  againButton.addEventListener("click", () => {
+    if (!selectedCase) return;
+    resetResult();
+    showCase(selectedCase, true);
+  });
+  fastButton.addEventListener("click", () => purchase(true));
   secretVideo.addEventListener("ended", stopSecretVideo);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stopCaseEffects();
