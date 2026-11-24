@@ -2,6 +2,7 @@
 //! себя; страницу и ответы на ходы отдаёт этот веб-сервер. Снаружи до него Discord достучится через туннель
 //! (например, cloudflared) — см. README.
 
+use crate::pets::{self, Case};
 use crate::wordboard::{self, Player};
 use crate::words::{self, Lang};
 use crate::{rocket, Shared};
@@ -10,10 +11,11 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
+use base64::Engine;
 use poise::serenity_prelude as serenity;
 use rand::distr::{Alphanumeric, SampleString};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,14 @@ struct Session {
     created: Instant,
     checked: Instant,
     lang: Lang,
+}
+
+impl Session {
+    fn wallet(&self, data: &crate::Data) -> crate::db::Wallet<'_> {
+        crate::db::Wallet {
+            guild: self.guild, user: self.user, name: &self.name, start: data.economy.start_balance,
+        }
+    }
 }
 
 pub struct Miniapp {
@@ -129,14 +139,23 @@ async fn index(State(app): State<App>) -> Response {
 /// Разрешённые файлы интерфейса.
 async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Response {
     match name.as_str() {
-        "style.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
+        "style.css" | "cases.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
             file(&app, &name, "text/css; charset=utf-8").await,
-        "app.js" | "audio.js" | "game_avatars.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
+        "app.js" | "audio.js" | "game_avatars.js" | "cases.js" | "cases-inventory.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
-        "lobby-games.webp" => file(&app, &name, "image/webp").await,
-        "menu-ambient.mp3" => file(&app, &name, "audio/mpeg").await,
+        "lobby-games.webp" | "pet-cases.webp" | "secret-pet-silhouette.webp" => file(&app, &name, "image/webp").await,
+        "menu-ambient.mp3" | "case-opening.mp3" | "case-secret.mp3" =>
+            file(&app, &name, "audio/mpeg").await,
+        "case-secret-explosion.mp4" => file(&app, &name, "video/mp4").await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn pet_art(State(app): State<App>, Path(name): Path<String>) -> Response {
+    let Some(pet) = name.strip_suffix(".webp").and_then(pets::find_species).filter(|pet| pet.rarity != "secret") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    file(&app, &format!("pets/{}.webp", pet.key), "image/webp").await
 }
 
 async fn file(app: &Miniapp, name: &str, content_type: &'static str) -> Response {
@@ -263,7 +282,184 @@ async fn token(State(app): State<App>, Json(body): Json<Value>) -> Reply {
         }
         sessions.insert(pass.clone(), session);
     }
-    Ok(Json(json!({ "access_token": access_token, "session": pass, "name": name, "user_id": user.to_string(), "game": game })).into_response())
+    Ok(Json(json!({
+        "access_token": access_token, "session": pass, "name": name, "user_id": user.to_string(), "game": game,
+    })).into_response())
+}
+
+fn case_pet(pet: &pets::Species) -> Value {
+    json!({
+        "key": pet.key, "name": pet.name, "emoji": pet.emoji,
+        "rarity": pet.rarity, "rarity_name": pets::rarity_of(pet).name,
+    })
+}
+
+fn inventory_full(data: &crate::Data, session: &Session) -> Result<bool, Response> {
+    let count = crate::db::Database::pet_count_on(&data.db.lock(), session.guild, session.user).map_err(failed)?;
+    Ok(count >= data.pets.max_pets)
+}
+
+async fn cases_catalogue(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let balance = words::balance(&app.data, session.guild, session.user).map_err(failed)?;
+    let secret_unlocked = pets::has_opened_stellochka(&app.data.db, session.guild, session.user).map_err(failed)?;
+    let secret_sprite = if secret_unlocked {
+        pets::secret_pet_art(&app.data).await.map(|art| base64::engine::general_purpose::STANDARD.encode(art))
+    } else {
+        None
+    };
+    let cases = Case::ALL.map(|case| {
+        let price = app.data.pets.case_prices[case as usize];
+        let pets: Vec<_> = case.species().map(case_pet).collect();
+        json!({
+            "id": case.key(),
+            "name": case.title(),
+            "price": crate::text::number(price),
+            "cost": price.to_string(),
+            "species_count": pets.len(),
+            "pets": pets,
+        })
+    });
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(json!({
+        "name": session.name, "balance": crate::text::number(balance), "cases": cases,
+        "secret_unlocked": secret_unlocked, "secret_sprite": secret_sprite,
+        "inventory_full": inventory_full(&app.data, &session)?,
+    }))).into_response())
+}
+
+async fn cases_open(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let bad = || json_error("Некорректный запрос открытия кейса.", StatusCode::BAD_REQUEST);
+    let kind = body.get("case").and_then(Value::as_str)
+        .and_then(|key| Case::ALL.into_iter().find(|case| case.key() == key)).ok_or_else(bad)?;
+    let id = body.get("request_id").and_then(Value::as_str)
+        .filter(|id| id.len() == 36 && id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-'))
+        .ok_or_else(bad)?;
+    let price = body.get("expected_price").and_then(Value::as_str).and_then(|price| price.parse::<i64>().ok())
+        .filter(|price| *price > 0).ok_or_else(bad)?;
+
+    let (_, session) = app.authorized(&headers, Some("case"), true).await?;
+    let wallet = session.wallet(&app.data);
+    let opening = pets::buy_case(&app.data.db, wallet, &session.face, &app.data.pets, kind,
+        Some(pets::CaseRequest { id, price }))
+        .map_err(failed)?;
+    let full = inventory_full(&app.data, &session)?;
+    let (pet, balance) = opening.map_err(|message| json_error(
+        if full { "у вас полный склад, продайте лишних питомцев" } else { &message },
+        StatusCode::CONFLICT,
+    ))?;
+    let mut response = json!({
+        "pet": case_pet(pet),
+        "balance": crate::text::number(balance),
+        "income": format!("{}/ч", crate::text::money_text(pets::income(pet, 1))),
+        "sale_price": crate::text::money_text(pet.sale_price),
+        "inventory_full": full,
+    });
+    if pet.rarity == "secret" {
+        if let Some(art) = pets::secret_pet_art(&app.data).await {
+            response["sprite"] = json!(base64::engine::general_purpose::STANDARD.encode(art));
+        }
+    }
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(response)).into_response())
+}
+
+async fn cases_inventory(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let balance = words::balance(&app.data, session.guild, session.user).map_err(failed)?;
+    let owned = app.data.db.user_pets(session.guild, session.user).map_err(failed)?;
+    let full = owned.len() as i64 >= app.data.pets.max_pets;
+    let owned = pets::sorted_pets(owned);
+    let secret_sprite = if owned.iter().any(|(_, species)| species.rarity == "secret") {
+        pets::secret_pet_art(&app.data).await.map(|art| base64::engine::general_purpose::STANDARD.encode(art))
+    } else {
+        None
+    };
+    let animals: Vec<_> = owned.iter().map(|(pet, species)| {
+        let level = pet.level.max(1);
+        let upgrade_price = (level < app.data.pets.max_level)
+            .then(|| crate::text::money_text(pets::feed_cost(species, level)));
+        json!({
+            "id": pet.id.to_string(),
+            "pet": case_pet(species),
+            "level": level.to_string(),
+            "income": format!("{}/ч", crate::text::money_text(pets::income(species, level))),
+            "upgrade_price": upgrade_price,
+            "sale_price": species.sale_price.to_string(),
+        })
+    }).collect();
+    Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(json!({
+        "pets": animals, "balance": crate::text::number(balance), "secret_sprite": secret_sprite,
+        "inventory_full": full,
+    }))).into_response())
+}
+
+fn positive_integer(value: &Value) -> Option<i64> {
+    value.as_str()?.parse::<i64>().ok().filter(|number| *number > 0)
+}
+
+async fn cases_inventory_upgrade(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let bad = || json_error("Выбери питомца и актуальный уровень.", StatusCode::BAD_REQUEST);
+    let id = body.get("id").and_then(positive_integer).ok_or_else(bad)?;
+    let level = body.get("level").and_then(positive_integer).ok_or_else(bad)?;
+    let (_, session) = app.authorized(&headers, Some("pet_feed"), true).await?;
+    let result = pets::feed_owned_pet(&app.data.db, session.wallet(&app.data), id, &app.data.pets, Some(level))
+        .map_err(failed)?.map_err(|message| json_error(&message, StatusCode::CONFLICT))?;
+    Ok(Json(json!({
+        "name": result.species.name,
+        "level": result.pet.level.to_string(),
+        "balance": crate::text::number(result.balance),
+    })).into_response())
+}
+
+async fn cases_inventory_sell(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
+    let bad = || json_error("Выбери питомцев для продажи.", StatusCode::BAD_REQUEST);
+    let list = body.get("ids").and_then(Value::as_array).filter(|list| !list.is_empty()).ok_or_else(bad)?;
+    let ids = list.iter().map(positive_integer).collect::<Option<BTreeSet<_>>>().ok_or_else(bad)?;
+    if ids.len() != list.len() {
+        return Err(bad());
+    }
+    let (_, session) = app.authorized(&headers, Some("pet_sell"), true).await?;
+    let sale = pets::sell_inventory_pets(&app.data.db, session.wallet(&app.data), &ids,
+        app.data.pets.collect_cap_hours, crate::db::now)
+        .map_err(failed)?.map_err(|message| json_error(message, StatusCode::CONFLICT))?;
+    Ok(Json(json!({
+        "payout": crate::text::money_text(sale.payout), "balance": crate::text::number(sale.balance),
+        "inventory_full": inventory_full(&app.data, &session)?,
+    })).into_response())
+}
+
+async fn cases_avatar(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    case_avatar_image(&app, &session.face).await
+}
+
+async fn cases_history(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let openings = pets::case_history(&app.data.db, session.guild, session.user).map_err(failed)?;
+    let openings: Vec<_> = openings.into_iter().filter_map(|opening| {
+        let pet = pets::find_species(&opening.species)?;
+        Some(json!({
+            "id": opening.id.to_string(),
+            "name": opening.name,
+            "pet": case_pet(pet),
+        }))
+    }).collect();
+    Ok(Json(json!({ "openings": openings })).into_response())
+}
+
+async fn cases_history_avatar(State(app): State<App>, Path(file): Path<String>, headers: HeaderMap) -> Reply {
+    let missing = || StatusCode::NOT_FOUND.into_response();
+    let id = file.strip_suffix(".png").and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id > 0).ok_or_else(missing)?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let face = pets::case_opening_avatar(&app.data.db, session.guild, session.user, id)
+        .map_err(failed)?.ok_or_else(missing)?;
+    case_avatar_image(&app, &face).await
+}
+
+async fn case_avatar_image(app: &Miniapp, face: &str) -> Reply {
+    let bytes = wordboard::cached_avatar(&app.data, face).await
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response())
 }
 
 async fn rocket_state(State(app): State<App>, headers: HeaderMap) -> Reply {
@@ -285,7 +481,7 @@ async fn rocket_start(State(app): State<App>, headers: HeaderMap, Json(body): Js
         _ => return Err(bad()),
     };
     let (_, session) = app.authorized(&headers, Some("rocket"), true).await?;
-    let state = rocket::start(&app.data, (session.guild, session.user), &session.name, bet, auto, expected)
+    let state = rocket::start(&app.data, (session.guild, session.user), &session.name, &session.face, bet, auto, expected)
         .map_err(failed)?.map_err(|error| json_error(&error, StatusCode::CONFLICT))?;
     Ok(Json(state).into_response())
 }
@@ -297,6 +493,16 @@ async fn rocket_cashout(State(app): State<App>, headers: HeaderMap, Json(body): 
     let state = rocket::cash_out(&app.data, (session.guild, session.user), id)
         .map_err(failed)?.map_err(|error| json_error(&error, StatusCode::CONFLICT))?;
     Ok(Json(state).into_response())
+}
+
+async fn rocket_avatar(State(app): State<App>, Path(file): Path<String>, headers: HeaderMap) -> Reply {
+    let missing = || StatusCode::NOT_FOUND.into_response();
+    let user = file.strip_suffix(".png").and_then(discord_id).ok_or_else(missing)?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let face = rocket::history_avatar(&app.data.db, session.guild, user)
+        .map_err(failed)?.ok_or_else(missing)?;
+    let bytes = wordboard::cached_avatar(&app.data, &face).await.ok_or_else(missing)?;
+    Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response())
 }
 
 async fn casino_action(
@@ -489,15 +695,25 @@ pub fn router(app: App) -> axum::Router {
     axum::Router::new()
         .route("/", get(index))
         .route("/static/{name}", get(static_file))
+        .route("/static/pets/{name}", get(pet_art))
         .route("/api/config", get(config))
         .route("/api/token", post(token))
         .route("/api/state", get(state))
         .route("/api/guess", post(guess))
         .route("/api/new", post(new_game))
         .route("/api/players", get(players))
+        .route("/api/cases", get(cases_catalogue))
+        .route("/api/cases/open", post(cases_open).layer(DefaultBodyLimit::max(1024)))
+        .route("/api/cases/inventory", get(cases_inventory))
+        .route("/api/cases/inventory/upgrade", post(cases_inventory_upgrade).layer(DefaultBodyLimit::max(1024)))
+        .route("/api/cases/inventory/sell", post(cases_inventory_sell))
+        .route("/api/cases/avatar.png", get(cases_avatar))
+        .route("/api/cases/history", get(cases_history))
+        .route("/api/cases/history/{file}", get(cases_history_avatar))
         .route("/api/rocket/state", get(rocket_state))
         .route("/api/rocket/start", post(rocket_start))
         .route("/api/rocket/cashout", post(rocket_cashout))
+        .route("/api/rocket/avatar/{file}", get(rocket_avatar))
         .route("/api/games/{game}/{action}", post(casino_action).layer(DefaultBodyLimit::max(2048)))
         .route("/api/avatar/{guild}/{file}", get(avatar))
         .route("/api/durak/avatar/{room}/{file}", get(durak_avatar))

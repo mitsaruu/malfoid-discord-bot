@@ -146,6 +146,22 @@ impl Database {
                  last_collect REAL,
                  spent        INTEGER DEFAULT 0
              );
+             CREATE TABLE IF NOT EXISTS case_openings (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 guild_id INTEGER NOT NULL,
+                 user_id  INTEGER NOT NULL,
+                 name     TEXT NOT NULL,
+                 face     TEXT NOT NULL,
+                 species  TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS case_opening_requests (
+                 guild_id   INTEGER NOT NULL,
+                 user_id    INTEGER NOT NULL,
+                 request_id TEXT NOT NULL,
+                 case_key   TEXT NOT NULL,
+                 opening_id INTEGER NOT NULL REFERENCES case_openings(id),
+                 PRIMARY KEY (guild_id, user_id, request_id)
+             );
              CREATE TABLE IF NOT EXISTS levels (
                  guild_id     INTEGER,
                  user_id      INTEGER,
@@ -265,7 +281,9 @@ impl Database {
              CREATE INDEX IF NOT EXISTS word_daily_guild_day ON word_daily(guild_id, day);
              CREATE INDEX IF NOT EXISTS word_daily_ru_guild_day ON word_daily_ru(guild_id, day);
              CREATE INDEX IF NOT EXISTS levels_guild_xp ON levels(guild_id, xp DESC);
-             CREATE INDEX IF NOT EXISTS economy_guild_balance ON economy(guild_id, balance DESC);",
+             CREATE INDEX IF NOT EXISTS economy_guild_balance ON economy(guild_id, balance DESC);
+             CREATE INDEX IF NOT EXISTS case_openings_guild_id ON case_openings(guild_id, id DESC);
+             CREATE INDEX IF NOT EXISTS case_openings_player_species ON case_openings(guild_id, user_id, species);",
         )?;
         let database = Self { connection: Mutex::new(connection) };
         crate::wordsummary::prepare(&database)?;
@@ -273,6 +291,7 @@ impl Database {
         crate::shop::prepare(&database)?;
         crate::music_channels::prepare(&database)?;
         crate::wagers::prepare(&database)?;
+        crate::rocket::prepare_history(&database)?;
         #[cfg(feature = "voice")]
         crate::music_queue::prepare(&database)?;
         #[cfg(feature = "voice")]
@@ -344,6 +363,14 @@ impl Database {
     /// Питомцы человека в том порядке, в каком они появились.
     pub fn user_pets(&self, guild: u64, user: u64) -> rusqlite::Result<Vec<Pet>> {
         Self::pets_on(&self.lock(), guild, user)
+    }
+
+    pub(crate) fn pet_count_on(connection: &Connection, guild: u64, user: u64) -> rusqlite::Result<i64> {
+        connection.query_row(
+            "SELECT COUNT(*) FROM pets WHERE guild_id = ?1 AND user_id = ?2",
+            params![guild as i64, user as i64],
+            |row| row.get(0),
+        )
     }
 
     pub(crate) fn pets_on(connection: &Connection, guild: u64, user: u64) -> rusqlite::Result<Vec<Pet>> {

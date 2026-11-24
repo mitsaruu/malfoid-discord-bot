@@ -7,7 +7,7 @@ use crate::text::{hours_text, money_text, number};
 use crate::{Context, Error};
 use poise::serenity_prelude as serenity;
 use rand::Rng;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, Transaction};
 
 /// Настройки из settings.ini, раздел [pets].
 pub struct PetSettings {
@@ -46,14 +46,28 @@ pub enum Case {
 }
 
 impl Case {
-    const ALL: [Case; 4] = [Case::Cheap, Case::Medium, Case::Expensive, Case::Secret];
+    pub(crate) const ALL: [Case; 4] = [Case::Cheap, Case::Medium, Case::Expensive, Case::Secret];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Cheap => "cheap",
+            Self::Medium => "medium",
+            Self::Expensive => "expensive",
+            Self::Secret => "secret",
+        }
+    }
 
     fn emoji(self) -> &'static str {
         ["📦", "🎁", "💎", "🔮"][self as usize]
     }
 
-    fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         ["Дешёвый", "Средний", "Дорогой", "Секретный"][self as usize]
+    }
+
+    pub(crate) fn species(self) -> impl Iterator<Item = &'static Species> {
+        RARITIES.iter().rev().filter(move |rarity| rarity.chances[self as usize] > 0.0)
+            .flat_map(|rarity| SPECIES.iter().filter(move |species| species.rarity == rarity.key))
     }
 }
 
@@ -117,8 +131,14 @@ pub fn find_species(key: &str) -> Option<&'static Species> {
     SPECIES.iter().find(|species| species.key == key)
 }
 
-fn rarity_of(species: &Species) -> &'static Rarity {
+pub(crate) fn rarity_of(species: &Species) -> &'static Rarity {
     RARITIES.iter().find(|rarity| rarity.key == species.rarity).unwrap()
+}
+
+const SECRET_PET_FILENAME: &str = "stellochka.webp";
+
+pub(crate) async fn secret_pet_art(data: &crate::Data) -> Option<Vec<u8>> {
+    tokio::fs::read(data.dir.join("miniapp/pets").join(SECRET_PET_FILENAME)).await.ok()
 }
 
 fn needs_sale_confirmation(species: &Species) -> bool {
@@ -167,7 +187,7 @@ pub fn roll_pet(case: Case, roll: f64, pick: usize) -> &'static Species {
 }
 
 /// Питомцы человека вместе с видом, от самого доходного к самому слабому (вид, которого больше нет, пропускаем).
-fn sorted_pets(pets: Vec<Pet>) -> Vec<(Pet, &'static Species)> {
+pub(crate) fn sorted_pets(pets: Vec<Pet>) -> Vec<(Pet, &'static Species)> {
     let mut pets: Vec<(Pet, &'static Species)> =
         pets.into_iter().filter_map(|pet| find_species(&pet.species).map(|species| (pet, species))).collect();
     pets.sort_by_key(|(pet, species)| (-income(species, pet.level), pet.id));
@@ -175,33 +195,121 @@ fn sorted_pets(pets: Vec<Pet>) -> Vec<(Pet, &'static Species)> {
 }
 
 fn buy_pet(
-    database: &Database,
+    tx: &Transaction<'_>,
     wallet: Wallet<'_>,
+    face: &str,
     species: &Species,
     price: i64,
     max_pets: i64,
-) -> rusqlite::Result<Result<(), String>> {
+) -> rusqlite::Result<Result<(i64, i64), String>> {
+    let count = Database::pet_count_on(tx, wallet.guild, wallet.user)?;
+    if count >= max_pets {
+        return Ok(Err(format!(
+            "🏠 У тебя уже {max_pets} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell")));
+    }
+    let (balance, _) = wallet.open(tx)?;
+    if balance < price {
+        return Ok(Err(insufficient_money(balance, price, "цена кейса")));
+    }
+    let balance = db::change_balance(tx, wallet.guild, wallet.user, -price)?;
+    tx.execute(
+        "INSERT INTO pets (guild_id, user_id, species, level, last_collect, spent) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+        params![wallet.guild as i64, wallet.user as i64, species.key, db::now(), price],
+    )?;
+    tx.execute(
+        "INSERT INTO case_openings (guild_id, user_id, name, face, species) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![wallet.guild as i64, wallet.user as i64, wallet.name, face, species.key],
+    )?;
+    Ok(Ok((tx.last_insert_rowid(), balance)))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CaseRequest<'a> {
+    pub id: &'a str,
+    pub price: i64,
+}
+
+pub(crate) fn buy_case(
+    database: &Database,
+    wallet: Wallet<'_>,
+    face: &str,
+    settings: &PetSettings,
+    kind: Case,
+    request: Option<CaseRequest<'_>>,
+) -> rusqlite::Result<Result<(&'static Species, i64), String>> {
     database.transaction(|tx| {
-        let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM pets WHERE guild_id = ?1 AND user_id = ?2",
-            params![wallet.guild as i64, wallet.user as i64],
-            |row| row.get(0),
-        )?;
-        if count >= max_pets {
-            return Ok(Err(format!(
-                "🏠 У тебя уже {max_pets} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell")));
+        let price = settings.case_prices[kind as usize];
+        if let Some(request) = request {
+            let earlier: Option<(String, String)> = tx.query_row(
+                "SELECT requests.case_key, openings.species FROM case_opening_requests AS requests
+                 JOIN case_openings AS openings ON openings.id = requests.opening_id
+                 WHERE requests.guild_id = ?1 AND requests.user_id = ?2 AND requests.request_id = ?3",
+                params![wallet.guild as i64, wallet.user as i64, request.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((case_key, species)) = earlier {
+                if case_key != kind.key() {
+                    return Ok(Err("Этот запрос уже использован для другого кейса.".into()));
+                }
+                let species = find_species(&species).ok_or(rusqlite::Error::InvalidQuery)?;
+                return Ok(Ok((species, wallet.open(tx)?.0)));
+            }
+            if request.price != price {
+                return Ok(Err("Цена кейса изменилась. Проверь новую цену.".into()));
+            }
         }
-        let (balance, _) = wallet.open(tx)?;
-        if balance < price {
-            return Ok(Err(insufficient_money(balance, price, "цена кейса")));
+
+        let mut rng = rand::rng();
+        let species = roll_pet(kind, rng.random_range(0.0..100.0), rng.random_range(0..usize::MAX));
+        let (opening_id, balance) = match buy_pet(tx, wallet, face, species, price, settings.max_pets)? {
+            Ok(opening) => opening,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        if let Some(request) = request {
+            tx.execute(
+                "INSERT INTO case_opening_requests (guild_id, user_id, request_id, case_key, opening_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![wallet.guild as i64, wallet.user as i64, request.id, kind.key(), opening_id],
+            )?;
         }
-        db::change_balance(tx, wallet.guild, wallet.user, -price)?;
-        tx.execute(
-            "INSERT INTO pets (guild_id, user_id, species, level, last_collect, spent) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-            params![wallet.guild as i64, wallet.user as i64, species.key, db::now(), price],
-        )?;
-        Ok(Ok(()))
+        Ok(Ok((species, balance)))
     })
+}
+
+pub(crate) struct CaseOpening {
+    pub id: i64,
+    pub name: String,
+    pub species: String,
+}
+
+pub(crate) fn case_history(database: &Database, guild: u64, viewer: u64) -> rusqlite::Result<Vec<CaseOpening>> {
+    let connection = database.lock();
+    let mut statement = connection.prepare(
+        "SELECT id, name, species FROM case_openings
+         WHERE guild_id = ?1 AND user_id != ?2 ORDER BY id DESC LIMIT 12",
+    )?;
+    let openings = statement.query_map(params![guild as i64, viewer as i64], |row| {
+        Ok(CaseOpening { id: row.get(0)?, name: row.get(1)?, species: row.get(2)? })
+    })?.collect();
+    openings
+}
+
+pub(crate) fn case_opening_avatar(database: &Database, guild: u64, viewer: u64, opening: i64) -> rusqlite::Result<Option<String>> {
+    database.lock().query_row(
+        "SELECT face FROM case_openings WHERE id = ?1 AND guild_id = ?2 AND user_id != ?3",
+        params![opening, guild as i64, viewer as i64],
+        |row| row.get(0),
+    ).optional()
+}
+
+pub(crate) fn has_opened_stellochka(database: &Database, guild: u64, user: u64) -> rusqlite::Result<bool> {
+    database.lock().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM case_openings WHERE guild_id = ?1 AND user_id = ?2 AND species = 'stellochka'
+         )",
+        params![guild as i64, user as i64],
+        |row| row.get(0),
+    )
 }
 
 fn collect_pets(
@@ -234,13 +342,20 @@ fn collect_pets(
     })
 }
 
-type Feeding = (Pet, &'static Species, i64);
+pub(crate) struct Feeding {
+    pub pet: Pet,
+    pub species: &'static Species,
+    pub previous_level: i64,
+    pub cost: i64,
+    pub balance: i64,
+}
 
-fn feed_owned_pet(
+pub(crate) fn feed_owned_pet(
     database: &Database,
     wallet: Wallet<'_>,
     id: i64,
     settings: &PetSettings,
+    expected_level: Option<i64>,
 ) -> rusqlite::Result<Result<Feeding, String>> {
     database.transaction(|tx| {
         let found = Database::own_pet_on(tx, id, wallet.guild, wallet.user)?
@@ -248,6 +363,9 @@ fn feed_owned_pet(
         let Some((pet, species)) = found else {
             return Ok(Err("Такого питомца у тебя нет — выбери из списка.".into()));
         };
+        if expected_level.is_some_and(|level| level != pet.level.max(1)) {
+            return Ok(Err("Уровень питомца уже изменился. Проверь новый уровень и стоимость.".into()));
+        }
         if pet.level >= settings.max_level {
             return Ok(Err(format!("{} уже вырос до максимума!", title(species, pet.level))));
         }
@@ -261,12 +379,16 @@ fn feed_owned_pet(
         let saved = pending(species, pet.level, pet.last_collect, now, settings.collect_cap_hours);
         let new_level = pet.level.max(1) + 1;
         let last_collect = now - saved as f64 / income(species, new_level) as f64 * 3600.0;
-        db::change_balance(tx, wallet.guild, wallet.user, -cost)?;
+        let balance = db::change_balance(tx, wallet.guild, wallet.user, -cost)?;
         tx.execute(
             "UPDATE pets SET level = ?2, spent = ?3, last_collect = ?4 WHERE id = ?1",
             params![pet.id, new_level, spent, last_collect],
         )?;
-        Ok(Ok((pet, species, cost)))
+        Ok(Ok(Feeding {
+            previous_level: pet.level,
+            pet: Pet { level: new_level, spent, last_collect, ..pet },
+            species, cost, balance,
+        }))
     })
 }
 
@@ -304,17 +426,15 @@ fn owned_pet_autocomplete(ctx: Context<'_>, partial: &str, show_sale_price: bool
 #[poise::command(slash_command, guild_only, rename = "case")]
 pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс открыть"] kind: Case) -> Result<(), Error> {
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let price = data.pets.case_prices[kind as usize];
-    let (roll, pick) = {
-        let mut rng = rand::rng();
-        (rng.random_range(0.0..100.0), rng.random_range(0..usize::MAX))
+    let (name, face) = match ctx.author_member().await {
+        Some(member) => (member.display_name().to_string(), member.face()),
+        None => (user_name(ctx.author()), ctx.author().face()),
     };
-    let species = roll_pet(kind, roll, pick);
-    let name = display_name(ctx).await;
     let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
-    if let Err(reason) = buy_pet(&data.db, wallet, species, price, data.pets.max_pets)? {
-        return whisper(ctx, reason).await;
-    }
+    let (species, _) = match buy_case(&data.db, wallet, &face, &data.pets, kind, None)? {
+        Ok(opening) => opening,
+        Err(reason) => return whisper(ctx, reason).await,
+    };
 
     let no_pings = serenity::CreateAllowedMentions::new();
     let message = ctx
@@ -325,14 +445,21 @@ pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс о
     tokio::time::sleep(std::time::Duration::from_secs(2)).await; // немного интриги
     let rarity = rarity_of(species);
     let ending = if rarity.key == "secret" { "!!! Самый редкий в игре!" } else { "!" };
-    let embed = serenity::CreateEmbed::new()
+    let mut embed = serenity::CreateEmbed::new()
         .color(rarity.color)
         .title(format!("{} {}", species.emoji, species.name))
         .description(format!(
             "**{}** питомец{ending}\nПриносит **{} в час**.", rarity.name, money_text(income(species, 1))))
         .author(serenity::CreateEmbedAuthor::new(name).icon_url(ctx.author().face()))
         .footer(serenity::CreateEmbedFooter::new("Забрать доход — /pets_collect · вырастить — /pet_feed"));
-    message.edit(ctx, poise::CreateReply::default().content("").embed(embed).allowed_mentions(no_pings)).await?;
+    let mut reply = poise::CreateReply::default().content("").allowed_mentions(no_pings);
+    if rarity.key == "secret" {
+        if let Some(art) = secret_pet_art(data).await {
+            embed = embed.image(format!("attachment://{SECRET_PET_FILENAME}"));
+            reply = reply.attachment(serenity::CreateAttachment::bytes(art, SECRET_PET_FILENAME));
+        }
+    }
+    message.edit(ctx, reply.embed(embed)).await?;
     Ok(())
 }
 
@@ -406,7 +533,7 @@ pub async fn show_pets(
         lines.push(format!(
             "`{}.` {} — {}/ч, накопил {}, {feed}", index + 1, title(species, pet.level), money_text(hourly), number(saved)));
     }
-    let embed = serenity::CreateEmbed::new()
+    let mut embed = serenity::CreateEmbed::new()
         .color(0x22C55E)
         .title(format!("🐾 Питомцы {owner_name} ({}/{})", pets.len(), data.pets.max_pets))
         .description(lines.join("\n"))
@@ -414,7 +541,14 @@ pub async fn show_pets(
         .field("Можно забрать", money_text(total_pending), true)
         .footer(serenity::CreateEmbedFooter::new(format!(
             "Доход копится до {} — потом питомцы ждут, пока заберёшь", hours_text(cap * 3600))));
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    let mut reply = poise::CreateReply::default();
+    if own && pets.iter().any(|(_, species)| species.rarity == "secret") {
+        if let Some(art) = secret_pet_art(data).await {
+            embed = embed.thumbnail(format!("attachment://{SECRET_PET_FILENAME}"));
+            reply = reply.ephemeral(true).attachment(serenity::CreateAttachment::bytes(art, SECRET_PET_FILENAME));
+        }
+    }
+    ctx.send(reply.embed(embed)).await?;
     Ok(())
 }
 
@@ -443,14 +577,14 @@ pub async fn pet_feed(
     let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
     let name = display_name(ctx).await;
     let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
-    let (pet, species, cost) = match feed_owned_pet(&data.db, wallet, pet, &data.pets)? {
+    let Feeding { pet, species, cost, previous_level, .. } = match feed_owned_pet(&data.db, wallet, pet, &data.pets, None)? {
         Ok(result) => result,
         Err(reason) => return whisper(ctx, reason).await,
     };
     let max_level = data.pets.max_level;
-    let new_level = pet.level.max(1) + 1;
+    let new_level = pet.level;
     let new_income = income(species, new_level);
-    let grown = if stage(new_level) != stage(pet.level) {
+    let grown = if stage(new_level) != stage(previous_level) {
         format!(" и теперь он **{}**!", stage(new_level))
     } else {
         String::new()
@@ -477,13 +611,59 @@ fn sell_owned_pet(
         if Database::own_pet_on(tx, pet.id, wallet.guild, wallet.user)?.as_ref() != Some(pet) {
             return Ok(None);
         }
-        let earned = pending(species, pet.level, pet.last_collect, now(), cap_hours);
-        let payout = species.sale_price.checked_add(earned)
-            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, earned))?;
-        wallet.open(tx)?;
+        let sale = commit_pet_sale(tx, wallet, [(pet, species)], cap_hours, now())?;
+        Ok(Some((sale.earned, sale.balance)))
+    })
+}
+
+pub(crate) struct PetSale {
+    pub earned: i64,
+    pub payout: i64,
+    pub balance: i64,
+}
+
+fn commit_pet_sale<'a>(
+    tx: &Transaction<'_>,
+    wallet: Wallet<'_>,
+    pets: impl IntoIterator<Item = (&'a Pet, &'a Species)>,
+    cap_hours: i64,
+    now: f64,
+) -> rusqlite::Result<PetSale> {
+    let mut earned = 0_i64;
+    let mut payout = 0_i64;
+    for (pet, species) in pets {
+        let saved = pending(species, pet.level, pet.last_collect, now, cap_hours);
+        earned = earned.checked_add(saved).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, earned))?;
+        payout = payout.checked_add(species.sale_price).and_then(|amount| amount.checked_add(saved))
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, payout))?;
         tx.execute("DELETE FROM pets WHERE id = ?1", [pet.id])?;
-        let balance = db::change_balance(tx, wallet.guild, wallet.user, payout)?;
-        Ok(Some((earned, balance)))
+    }
+    wallet.open(tx)?;
+    let balance = db::change_balance(tx, wallet.guild, wallet.user, payout)?;
+    Ok(PetSale { earned, payout, balance })
+}
+
+pub(crate) fn sell_inventory_pets(
+    database: &Database,
+    wallet: Wallet<'_>,
+    ids: &std::collections::BTreeSet<i64>,
+    cap_hours: i64,
+    now: impl FnOnce() -> f64,
+) -> rusqlite::Result<Result<PetSale, &'static str>> {
+    database.transaction(|tx| {
+        if ids.is_empty() {
+            return Ok(Err("Выбери питомцев для продажи."));
+        }
+        let mut animals = Vec::with_capacity(ids.len());
+        for id in ids {
+            let animal = Database::own_pet_on(tx, *id, wallet.guild, wallet.user)?
+                .and_then(|pet| find_species(&pet.species).map(|species| (pet, species)));
+            let Some(animal) = animal else {
+                return Ok(Err("Один из питомцев уже продан или передан. Проверь склад."));
+            };
+            animals.push(animal);
+        }
+        commit_pet_sale(tx, wallet, animals.iter().map(|(pet, species)| (pet, *species)), cap_hours, now()).map(Ok)
     })
 }
 
@@ -651,6 +831,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn case_history_shows_only_successful_openings_by_other_players_on_the_same_server() {
+        let db = Database::in_memory().unwrap();
+        db.add_pet(7, 4, "valera", 0.0, 500).unwrap();
+        let buy = |guild, user, name, face, species, price| {
+            let wallet = Wallet { guild, user, name, start: 500 };
+            db.transaction(|tx| buy_pet(tx, wallet, face, kind(species), price, 10)).unwrap()
+        };
+        assert!(buy(7, 1, "Алиса", "alice.png", "valera", 500).is_ok());
+        assert!(buy(7, 2, "Борис", "boris.png", "arkady", 500).is_ok());
+        assert!(buy(8, 3, "Вера", "vera.png", "frog", 500).is_ok());
+        assert!(buy(7, 4, "Глеб", "gleb.png", "frog", 7500).is_err());
+        db.delete_pet(db.user_pets(7, 2).unwrap()[0].id).unwrap();
+
+        let openings = case_history(&db, 7, 4).unwrap();
+        assert_eq!(openings.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["Борис", "Алиса"]);
+        let history = case_history(&db, 7, 1).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!((history[0].name.as_str(), history[0].species.as_str()), ("Борис", "arkady"));
+        let id = history[0].id;
+        assert_eq!(case_opening_avatar(&db, 7, 1, id).unwrap().as_deref(), Some("boris.png"));
+        assert_eq!(case_opening_avatar(&db, 7, 2, id).unwrap(), None);
+        assert_eq!(case_opening_avatar(&db, 8, 1, id).unwrap(), None);
+    }
+
+    #[test]
+    fn failure_to_record_case_opening_rolls_back_purchase() {
+        let db = Database::in_memory().unwrap();
+        db.lock().execute_batch(
+            "CREATE TEMP TRIGGER reject_case_opening BEFORE INSERT ON case_openings
+             BEGIN SELECT RAISE(ABORT, 'history unavailable'); END;",
+        ).unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Алиса", start: 500 };
+        wallet.open(&db.lock()).unwrap();
+        assert!(db.transaction(|tx| buy_pet(tx, wallet, "alice.png", kind("valera"), 500, 10)).is_err());
+        assert_eq!(wallet.open(&db.lock()).unwrap().0, 500);
+        assert!(db.user_pets(7, 1).unwrap().is_empty());
+        assert!(case_history(&db, 7, 2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stellochka_reveal_belongs_to_the_opener_even_after_selling_the_pet() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Алиса", start: 25_000 };
+        db.add_pet(7, 2, "stellochka", 0.0, 0).unwrap();
+        assert!(!has_opened_stellochka(&db, 7, 2).unwrap());
+        assert!(!has_opened_stellochka(&db, 7, 1).unwrap());
+
+        db.transaction(|tx| buy_pet(tx, wallet, "", kind("stellochka"), 25_000, 10)).unwrap().unwrap();
+        assert!(has_opened_stellochka(&db, 7, 1).unwrap());
+        assert!(!has_opened_stellochka(&db, 7, 2).unwrap());
+        assert!(!has_opened_stellochka(&db, 8, 1).unwrap());
+        db.delete_pet(db.user_pets(7, 1).unwrap()[0].id).unwrap();
+        assert!(has_opened_stellochka(&db, 7, 1).unwrap());
+    }
+
+    #[test]
+    fn case_purchase_replays_the_original_pet_after_price_changes_and_respects_the_purchase_limit() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Алиса", start: 1000 };
+        let mut settings = PetSettings::load(&crate::config::Settings::default());
+        settings.max_pets = 1;
+        let request = CaseRequest { id: "first", price: 500 };
+        let (pet, balance) = buy_case(&db, wallet, "alice.png", &settings, Case::Cheap, Some(request))
+            .unwrap().unwrap();
+        assert_eq!(balance, 500);
+        assert!(Case::Cheap.species().any(|allowed| allowed.key == pet.key));
+
+        settings.case_prices[Case::Cheap as usize] = 600;
+        let (replayed, balance) = buy_case(&db, wallet, "alice.png", &settings, Case::Cheap, Some(request))
+            .unwrap().unwrap();
+        assert_eq!((replayed.key, balance), (pet.key, 500));
+        assert!(buy_case(&db, wallet, "alice.png", &settings, Case::Medium, Some(request)).unwrap().is_err());
+        let second = Some(CaseRequest { id: "second", price: 600 });
+        assert!(buy_case(&db, wallet, "alice.png", &settings, Case::Cheap, second).unwrap().is_err());
+
+        let other = Wallet { user: 2, name: "Борис", ..wallet };
+        assert!(buy_case(&db, other, "boris.png", &settings, Case::Cheap, Some(request)).unwrap().is_err());
+        assert_eq!(other.open(&db.lock()).unwrap().0, 1000);
+        assert!(db.user_pets(7, 2).unwrap().is_empty());
+        assert_eq!(db.user_pets(7, 1).unwrap().len(), 1);
+        assert_eq!(case_history(&db, 7, 2).unwrap().len(), 1);
+        assert_eq!(wallet.open(&db.lock()).unwrap().0, 500);
+    }
+
+    #[test]
     fn secret_case_price_choices_and_catalogue() {
         let defaults = PetSettings::load(&crate::config::Settings::default());
         assert_eq!(defaults.case_prices, [500, 2000, 7500, 25000]);
@@ -724,6 +989,19 @@ mod tests {
     }
 
     #[test]
+    fn case_contents_are_ordered_from_the_rarest_available_pets() {
+        for case in Case::ALL {
+            let eligible: Vec<_> = case.species().collect();
+            assert_eq!(eligible.len(), [16, 16, 12, 10][case as usize]);
+            assert!(eligible.windows(2).all(|pair| {
+                let rank = |species: &Species| RARITIES.iter().position(|rarity| rarity.key == species.rarity);
+                rank(pair[0]) >= rank(pair[1])
+            }));
+        }
+        assert_eq!(Case::Secret.species().next().map(|species| species.key), Some("stellochka"));
+    }
+
+    #[test]
     fn income_and_costs_match_python() {
         // Те же числа, что даёт bot.py: round(base * (1 + 0.25 * (level - 1)))
         assert_eq!(income(kind("valera"), 1), 10);
@@ -786,6 +1064,40 @@ mod tests {
             Err(rusqlite::Error::IntegralValueOutOfRange(..))));
         assert_eq!(db.own_pet(id, 7, 1).unwrap(), Some(pet));
         assert_eq!(db.wallet(7, 1, "Alice", 0).unwrap().0, i64::MAX);
+    }
+
+    #[test]
+    fn inventory_sale_checks_the_whole_selection_and_pays_once() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
+        let first = db.add_pet(7, 1, "valera", 0.0, 500).unwrap();
+        let second = db.add_pet(7, 1, "valera", 0.0, 500).unwrap();
+        let foreign = db.add_pet(7, 2, "valera", 0.0, 500).unwrap();
+        let invalid = [first, foreign].into();
+        let selected = [first, second].into();
+        let sell = |ids| sell_inventory_pets(&db, wallet, ids, 24, || 3600.0).unwrap();
+
+        assert!(sell(&invalid).is_err());
+        assert_eq!(db.user_pets(7, 1).unwrap().len(), 2);
+        let paid = sell(&selected).unwrap();
+        assert_eq!((paid.payout, paid.earned, paid.balance), (420, 20, 520));
+        assert!(sell(&selected).is_err());
+        assert_eq!(db.user_pets(7, 2).unwrap()[0].id, foreign);
+        assert_eq!(db.wallet(7, 1, "Alice", 0).unwrap().0, 520);
+    }
+
+    #[test]
+    fn inventory_upgrade_with_a_stale_level_cannot_charge_twice() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 1000 };
+        let settings = PetSettings::load(&crate::config::Settings::default());
+        let id = db.add_pet(7, 1, "valera", 0.0, 500).unwrap();
+        let upgrade = || feed_owned_pet(&db, wallet, id, &settings, Some(1)).unwrap();
+
+        let first = upgrade().unwrap();
+        assert_eq!((first.pet.level, first.cost, first.balance), (2, 200, 800));
+        assert!(upgrade().is_err());
+        assert_eq!(db.wallet(7, 1, "Alice", 0).unwrap().0, 800);
     }
 
     #[test]

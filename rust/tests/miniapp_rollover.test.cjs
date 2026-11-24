@@ -181,7 +181,7 @@ test('a guess crossing midnight carries its old date and clears stale input', as
 
 test('switching games hides the previous view and stops refreshing word data', async () => {
   const panels = Object.fromEntries(
-    ['app', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip', 'durak']
+    ['app', 'cases', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip', 'durak']
       .map(id => [id, { hidden: true }]),
   );
   const calls = [];
@@ -195,6 +195,8 @@ test('switching games hides the previous view and stops refreshing word data', a
     casinoViews: new Map(),
     helpEl: {}, playersEl: {}, gameLobby: { hidden: false }, gameSwitch: { querySelectorAll: () => [] },
     rocket: { show() { calls.push('show rocket'); }, hide() { calls.push('hide rocket'); } },
+    casesRoot: panels.cases,
+    casesView: { show() { calls.push('show cases'); }, hide() { calls.push('hide cases'); } },
     window: { CasinoGames: { roulette: mount('roulette'), coinflip: mount('coinflip') } },
     api: (path) => { calls.push(path); return Promise.resolve({}); },
   });
@@ -217,4 +219,10 @@ test('switching games hides the previous view and stops refreshing word data', a
   assert.equal(document.body.dataset.game, 'lobby');
   assert.equal(panels.rocket.hidden, true);
   assert.equal(calls.at(-1), 'hide rocket');
+  vm.runInContext('openGame("cases")', context);
+  assert.equal(panels.cases.hidden, false);
+  assert.equal(context.gameLobby.hidden, true);
+  vm.runInContext('openGame("lobby")', context);
+  assert.equal(panels.cases.hidden, true);
+  assert.deepEqual(calls.slice(-2), ['show cases', 'hide cases']);
 });

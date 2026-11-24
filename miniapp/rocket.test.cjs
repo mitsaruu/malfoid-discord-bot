@@ -8,6 +8,7 @@ const source = readFileSync(join(__dirname, 'rocket.js'), 'utf8');
 const context = vm.createContext({});
 vm.runInContext(source, context);
 const createRocketFeed = vm.runInContext('createRocketFeed', context);
+const rocketHistoryPeakTier = vm.runInContext('rocketHistoryPeakTier', context);
 
 function snapshot(flight = emptyRound(), balance = 500) {
   return { balance, min_bet: 10, max_bet: 1000, flight };
@@ -97,6 +98,9 @@ function viewFixture(reducedMotion = false) {
   class Element extends EventTarget {
     dataset = {};
     children = [];
+    scrollLeft = 0;
+    scrollWidth = 0;
+    clientWidth = 0;
     value = '';
     attributes = new Map();
     setAttribute(name, value) { this.attributes.set(name, value); }
@@ -106,6 +110,7 @@ function viewFixture(reducedMotion = false) {
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.children = children; }
     insertBefore(child, reference) { this.children.splice(this.children.indexOf(reference), 0, child); }
+    getBoundingClientRect() { return { left: 0 }; }
     getContext() { return canvas; }
   }
   const html = readFileSync(join(__dirname, 'index.html'), 'utf8');
@@ -146,6 +151,64 @@ function viewFixture(reducedMotion = false) {
     },
   };
 }
+
+test('history peak colors change at the exact hundredth', () => {
+  const bands = [
+    ['red', [100, 129, 130]],
+    ['orange', [131, 149]],
+    ['yellow', [150, 199]],
+    ['dark-green', [200, 399]],
+    ['green', [400, 699]],
+    ['light-green', [700, 120000]],
+  ];
+  for (const [tier, peaks] of bands) {
+    for (const peak of peaks) assert.equal(rocketHistoryPeakTier(peak), tier, String(peak));
+  }
+});
+
+test('history shows recorded peaks and player outcomes with new rounds at the right end', async () => {
+  const f = viewFixture();
+  f.view.show();
+  const viewport = f.elements.get('rocket-history-scroll');
+  const list = f.elements.get('rocket-history-list');
+  const empty = f.elements.get('rocket-history-empty');
+  await f.reply(f.requests[0], snapshot());
+  assert.equal(viewport.hidden, true);
+  assert.equal(empty.hidden, false);
+
+  const cinematic = {
+    id: '11', crash: 320, peak: 9000, more_players: true, players: [
+      { id: '1', name: 'Лена', outcome: 'won', cashout_multiplier: 281 },
+      { id: '3', name: 'Ира', outcome: 'won', cashout_multiplier: 105 },
+      { id: '2', name: 'Саша', outcome: 'lost', cashout_multiplier: null },
+    ],
+  };
+  const first = { ...snapshot(), history: [cinematic, { id: '10', crash: 131, peak: 131, players: [] }] };
+  await f.poll(first);
+  const [older, card] = list.children;
+  const [heading, players, more] = card.children;
+  assert.equal(heading.children[0].textContent, '90,00×');
+  assert.equal(card.dataset.tier, 'light-green');
+  assert.equal(heading.children.length, 1);
+  assert.deepEqual(players.children.map(({ children: [avatar, factor] }) =>
+    [avatar.dataset.outcome, avatar.textContent, factor.textContent]),
+    [['won', 'Л', '2,81×'], ['won', 'И', '1,05×'], ['lost', 'С', '✕']]);
+  assert.match(players.children[2].children[0].getAttribute('aria-label'), /Саша.*проиграл/);
+  assert.equal(more.textContent, '…');
+  assert.equal(older.children[0].children[0].textContent, '1,31×');
+  assert.equal(older.dataset.tier, 'orange');
+  assert.equal(older.children[1].textContent, 'Без ставок');
+  assert.equal(viewport.hidden, false);
+
+  await f.poll(first);
+  assert.equal(list.children[1], card);
+  await f.poll({ ...snapshot(), history: [{ id: '12', crash: 200, peak: 200, players: [] }, cinematic] });
+  assert.equal(list.children[1].children[0].children[0].textContent, '2,00×');
+  assert.equal(list.children[0], card);
+  f.view.hide();
+  assert.equal(viewport.hidden, true);
+  assert.equal(list.children.length, 0);
+});
 
 function recordRocketAudio(view, withIntensity = true) {
   const sounds = [];
@@ -880,17 +943,15 @@ test('the chart has the same grace and accelerating growth as Rust', () => {
   assert.equal(multiplierAt(100000), 100000);
 });
 
-test('round summary displays independent player cashout and newest-first history', async () => {
+test('the round summary keeps the personal cashout apart from the final multiplier', async () => {
   const f = viewFixture();
   const data = snapshot(flight('crashed', { payout: 125, cashout_multiplier: 125, multiplier: 327, final_multiplier: 327 }));
   data.bets = [{ id: '10', name: 'Талия', stake: 100, status: 'paid', multiplier: 125, payout: 125 }];
-  data.history = [{ id: 'current', multiplier: 327 }, { id: 'previous', multiplier: 105 }];
   f.view.show();
   await f.reply(f.requests[0], data);
   const bet = f.elements.get('rocket-bet-list').children[0];
   assert.equal(bet.children[0].children[0].textContent, 'Талия');
   assert.match(bet.children[0].children[1].textContent, /1,25×.*125/);
-  assert.deepEqual(f.elements.get('rocket-history-list').children.map(row => row.textContent), ['3,27×', '1,05×']);
   assert.equal(f.elements.get('rocket-final').textContent, '3,27×');
 });
 test('reduced motion paints confirmed positions once and reveals the confirmed peak at crash', async () => {

@@ -3,6 +3,7 @@
 const ROCKET_POLL_MS = 500;
 const ROCKET_RETRY_POLL_MS = 2400;
 const ROCKET_MAX_REPEAT_ROUNDS = 10;
+const ROCKET_HISTORY_PLAYER_LIMIT = 3;
 // Match the server curve. The chart never leads a confirmed flight sample.
 const ROCKET_GRACE_MS = 1200;
 const ROCKET_GROWTH_MS = 7000;
@@ -442,7 +443,189 @@ function createRocketChart(canvas) {
   };
 }
 
-function createRocketView(request, avatar) {
+function rocketHistoryPeakTier(peak) {
+  if (peak <= 130) return "red";
+  if (peak < 150) return "orange";
+  if (peak < 200) return "yellow";
+  if (peak < 400) return "dark-green";
+  if (peak < 700) return "green";
+  return "light-green";
+}
+
+function createRocketHistory(viewport, list, empty, requestAvatar, format, motion) {
+  const avatars = new Map();
+  let cards = new Map();
+  let newest = null;
+  let finishSlide = null;
+
+  motion.addEventListener("change", () => {
+    if (motion.matches) finishSlide?.();
+  });
+
+  function forgetAvatar(id, entry) {
+    avatars.delete(id);
+    if (entry.url) URL.revokeObjectURL(entry.url);
+  }
+
+  function avatarFor(player) {
+    const avatar = document.createElement("span");
+    const outcome = { won: "забрал монеты", lost: "проиграл", refund: "возврат ставки" }[player.outcome];
+    const label = player.name + " — " + outcome;
+    avatar.className = "rocket-history-avatar";
+    avatar.dataset.outcome = player.outcome;
+    avatar.textContent = Array.from(player.name.trim())[0]?.toUpperCase() || "?";
+    avatar.title = label;
+    avatar.setAttribute("role", "img");
+    avatar.setAttribute("aria-label", label);
+    if (!requestAvatar) return avatar;
+
+    let entry = avatars.get(player.id);
+    if (!entry) {
+      entry = { url: null };
+      avatars.set(player.id, entry);
+      entry.ready = Promise.resolve().then(() => {
+        if (avatars.get(player.id) === entry) return requestAvatar(player.id);
+      }).then((blob) => {
+        if (blob && avatars.get(player.id) === entry) entry.url = URL.createObjectURL(blob);
+      }).catch(() => {});
+    }
+    entry.ready.then(() => {
+      if (!entry.url || avatars.get(player.id) !== entry) return;
+      const image = document.createElement("img");
+      image.alt = "";
+      image.decoding = "async";
+      image.addEventListener("error", () => image.remove(), { once: true });
+      image.src = entry.url;
+      avatar.append(image);
+    });
+    return avatar;
+  }
+
+  function makeCard(round) {
+    const card = document.createElement("li");
+    card.className = "rocket-history-card";
+    card.dataset.tier = rocketHistoryPeakTier(round.peak);
+    const heading = document.createElement("div");
+    heading.className = "rocket-history-peak";
+    const peak = document.createElement("strong");
+    peak.textContent = format(round.peak);
+    heading.append(peak);
+    card.append(heading);
+    if (round.players.length) {
+      const players = document.createElement("div");
+      players.className = "rocket-history-players";
+      for (const player of round.players.slice(0, ROCKET_HISTORY_PLAYER_LIMIT)) {
+        const row = document.createElement("div");
+        row.className = "rocket-history-player";
+        const amount = document.createElement("span");
+        amount.className = "rocket-history-cashout";
+        if (player.outcome === "lost") {
+          amount.textContent = "✕";
+          amount.title = "Ставка проиграна";
+        } else if (Number.isFinite(player.cashout_multiplier)) {
+          amount.textContent = format(player.cashout_multiplier);
+        } else {
+          amount.textContent = "—";
+          amount.title = player.outcome === "won" ? "Коэффициент недоступен" : "Без вывода";
+        }
+        row.append(avatarFor(player), amount);
+        players.append(row);
+      }
+      card.append(players);
+      if (round.more_players || round.players.length > ROCKET_HISTORY_PLAYER_LIMIT) {
+        const more = document.createElement("span");
+        more.className = "rocket-history-more";
+        more.textContent = "…";
+        more.setAttribute("aria-label", "Ещё участники");
+        more.title = "Ещё участники";
+        card.append(more);
+      }
+    } else {
+      const noBets = document.createElement("span");
+      noBets.className = "rocket-history-no-bets";
+      noBets.textContent = "Без ставок";
+      card.append(noBets);
+    }
+    return card;
+  }
+
+  function place(items, anchor, left) {
+    list.replaceChildren(...items);
+    viewport.scrollLeft = anchor
+      ? viewport.scrollLeft + anchor.getBoundingClientRect().left - left
+      : viewport.scrollWidth;
+  }
+
+  function discardOldAvatars(rounds) {
+    const visiblePlayers = new Set(rounds.flatMap((round) =>
+      round.players.slice(0, ROCKET_HISTORY_PLAYER_LIMIT).map((player) => player.id)));
+    for (const [id, entry] of avatars) {
+      if (!visiblePlayers.has(id)) forgetAvatar(id, entry);
+    }
+  }
+
+  function slide(next, previousNewest, oldLeft, rounds) {
+    const outgoing = [...cards].filter(([id]) => !next.has(id)).map(([, card]) => card);
+    for (const card of outgoing) card.setAttribute("aria-hidden", "true");
+    // Keep the old left edge in the track until it has moved out of view.
+    place([...outgoing, ...next.values()]);
+    const shift = oldLeft - previousNewest.getBoundingClientRect().left;
+    if (shift <= 0) return false;
+    const animation = list.animate([
+      { transform: `translateX(${shift}px)` },
+      { transform: "translateX(0px)" },
+    ], { duration: 220, easing: "cubic-bezier(.22,.7,.3,1)" });
+    const settle = () => {
+      finishSlide = null;
+      animation.cancel();
+      place(next.values(), previousNewest, previousNewest.getBoundingClientRect().left);
+      discardOldAvatars(rounds);
+    };
+    finishSlide = settle;
+    animation.finished.then(() => {
+      if (finishSlide === settle) settle();
+    }, () => {});
+    return true;
+  }
+
+  return {
+    render(rounds) {
+      const head = rounds[0]?.id;
+      if (head === newest) return;
+      finishSlide?.();
+      const following = viewport.scrollWidth - viewport.clientWidth - viewport.scrollLeft <= 2;
+      const previousNewest = cards.get(newest);
+      const oldLeft = previousNewest?.getBoundingClientRect().left;
+      const next = new Map(rounds.slice().reverse().map((round) => [
+        round.id, cards.get(round.id) ?? makeCard(round),
+      ]));
+      viewport.hidden = !head;
+      empty.hidden = Boolean(head);
+      empty.textContent = "Завершённых полётов пока нет.";
+      const retained = next.get(newest);
+      const animated = following && retained && !motion.matches && typeof list.animate === "function" &&
+        slide(next, retained, oldLeft, rounds);
+      if (!animated) {
+        place(next.values(), following ? null : retained, oldLeft);
+        discardOldAvatars(rounds);
+      }
+      cards = next;
+      newest = head;
+    },
+    clear() {
+      finishSlide?.();
+      for (const [id, entry] of avatars) forgetAvatar(id, entry);
+      list.replaceChildren();
+      viewport.hidden = true;
+      empty.hidden = false;
+      empty.textContent = "Загрузка истории…";
+      cards.clear();
+      newest = null;
+    },
+  };
+}
+
+function createRocketView(request, requestAvatar, avatar) {
   const get = (name) => document.getElementById("rocket-" + name);
   const root = document.getElementById("rocket");
   const chart = get("chart");
@@ -463,9 +646,13 @@ function createRocketView(request, avatar) {
   const factor = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const seconds = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
-  get("bets").open = get("history").open = !window.matchMedia("(max-width: 860px)").matches;
+  get("bets").open = !window.matchMedia("(max-width: 860px)").matches;
   const avatars = window.createGameAvatars?.(avatar);
   const draw = createRocketChart(chart);
+  const historyViewport = get("history-scroll");
+  const history = historyViewport && createRocketHistory(
+    historyViewport, get("history-list"), get("history-empty"), requestAvatar, displayFactor, motion,
+  );
   const feed = createRocketFeed({ request, onChange: update, canAutoStart });
   let current = { snapshot: null, sampledAt: 0, needsSync: true };
   let shown = false;
@@ -482,7 +669,6 @@ function createRocketView(request, avatar) {
   let fieldError = "";
   let connectionError = "";
   let betsKey;
-  let historyKey;
 
   const repeatPanel = document.createElement("section");
   repeatPanel.className = "rocket-repeat";
@@ -531,11 +717,9 @@ function createRocketView(request, avatar) {
     return factor.format(multiplier / 100) + "×";
   }
 
-  function renderRoundLists(snapshot) {
+  function renderBetList(snapshot) {
     const bets = snapshot?.bets ?? [];
-    const history = snapshot?.history ?? [];
     const nextBets = JSON.stringify(bets);
-    const nextHistory = JSON.stringify(history);
     function empty(text) {
       const row = document.createElement("li");
       row.className = "rocket-list-empty";
@@ -563,15 +747,6 @@ function createRocketView(request, avatar) {
         return row;
       });
       get("bet-list").replaceChildren(...(rows.length ? rows : [empty("Ставок пока нет.")]));
-    }
-    if (historyKey !== nextHistory) {
-      historyKey = nextHistory;
-      const rows = history.map(entry => {
-        const item = document.createElement("li");
-        item.textContent = displayFactor(entry.multiplier);
-        return item;
-      });
-      get("history-list").replaceChildren(...(rows.length ? rows : [empty("Пока нет завершённых раундов.")]));
     }
   }
 
@@ -800,7 +975,8 @@ function createRocketView(request, avatar) {
       }
     }
     current = view;
-    renderRoundLists(view.snapshot);
+    renderBetList(view.snapshot);
+    if (!view.needsSync && view.snapshot) history?.render(view.snapshot.history ?? []);
     renderControls();
     invalidate();
   }
@@ -926,7 +1102,7 @@ function createRocketView(request, avatar) {
   return {
     show() {
       shown = true;
-      renderRoundLists(current.snapshot);
+      renderBetList(current.snapshot);
       resume();
     },
     hide() {
@@ -934,10 +1110,12 @@ function createRocketView(request, avatar) {
       avatars?.clear();
       betsKey = undefined;
       suspend();
+      history?.clear();
     },
     disconnect(reason) {
       connectionError = reason;
       suspend();
+      history?.clear();
       renderControls();
       invalidate();
     },

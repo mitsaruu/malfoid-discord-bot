@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Игры Malfoid</title>
   <link rel="stylesheet" href="static/style.css?v=5">
-  <link rel="stylesheet" href="static/rocket.css?v=3">
+  <link rel="stylesheet" href="static/cases.css?v=18">
+  <link rel="stylesheet" href="static/rocket.css?v=9">
   <link rel="stylesheet" href="static/casino.css?v=3">
   <link rel="stylesheet" href="static/roulette.css?v=3">
   <link rel="stylesheet" href="static/coinflip.css?v=2">
@@ -29,6 +30,7 @@
       <div class="activity-brand"><span class="brand-mark" aria-hidden="true">M</span>Malfoid</div>
       <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru">
         <button type="button" data-game="lobby" aria-controls="game-lobby" aria-pressed="false"><span aria-hidden="true">▦</span>Все игры</button>
+        <button type="button" data-game="cases" aria-controls="cases" aria-pressed="false"><span aria-hidden="true">⬡</span>Кейсы</button>
         <button type="button" data-game="words" aria-controls="app" aria-pressed="false"><span aria-hidden="true">Aa</span>Слово дня</button>
         <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false"><span aria-hidden="true">↗</span>Ракетка</button>
         <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false"><span aria-hidden="true">◇</span>Минное поле</button>
@@ -52,6 +54,10 @@
           <button type="button" class="game-card game-card-feature" data-game="rocket">
             <span class="game-cover" aria-hidden="true"></span>
             <span class="game-card-info"><strong>Ракетка</strong><small>Заберите монеты, пока растёт коэффициент.</small><span class="play-label">Играть <span aria-hidden="true">↗</span></span></span>
+          </button>
+          <button type="button" class="game-card game-card-cases" data-game="cases">
+            <span class="game-cover" aria-hidden="true"></span>
+            <span class="game-card-info"><strong>Кейсы</strong><small>Коллекция питомцев Malfoid.</small></span>
           </button>
           <button type="button" class="game-card" data-game="words">
             <span class="game-cover" aria-hidden="true"></span>
@@ -112,6 +118,175 @@
         </div>
       </main>
 
+      <main class="pet-cases" id="cases" aria-labelledby="cases-title" lang="ru" hidden>
+        <header class="cases-header">
+          <nav class="cases-nav" aria-label="Разделы кейсов">
+            <a id="cases-home" href="#cases-title" aria-current="page"><span aria-hidden="true">⬡</span> Кейсы</a>
+            <button type="button" id="cases-warehouse-tab" aria-controls="cases-warehouse"><span aria-hidden="true">▦</span> Склад</button>
+            <button type="button" id="cases-upgrade" aria-controls="cases-development"><span aria-hidden="true">⇧</span> Апгрейд</button>
+            <button type="button" id="cases-contract" aria-controls="cases-development"><span aria-hidden="true">▤</span> Контракт</button>
+          </nav>
+          <div class="cases-profile">
+            <span class="cases-avatar" aria-hidden="true">
+              <span id="cases-initial">?</span>
+              <img id="cases-avatar" alt="" hidden>
+            </span>
+            <div class="cases-profile-text">
+              <strong id="cases-name">Игрок Discord</strong>
+              <span class="cases-balance" role="group" aria-label="Баланс в монетах"><span class="cases-coin" aria-hidden="true"></span><span id="cases-balance">—</span></span>
+            </div>
+          </div>
+        </header>
+
+        <div class="cases-layout">
+          <aside class="cases-history" aria-labelledby="cases-history-title">
+            <h2 id="cases-history-title">История открытий</h2>
+            <p class="cases-history-status" id="cases-history-status" role="status">Загружаем историю…</p>
+            <ul class="cases-history-list" id="cases-history-list" role="list"></ul>
+            <template id="cases-opening-template">
+              <li class="case-opening">
+                <div class="case-opening-player">
+                  <span class="cases-avatar case-opening-avatar" aria-hidden="true">
+                    <span class="case-opening-initial"></span>
+                    <img alt="" hidden>
+                  </span>
+                  <strong class="case-opening-name"></strong>
+                </div>
+                <div class="case-opening-pet" role="img">
+                  <span class="case-opening-chest" aria-hidden="true"></span>
+                  <span class="case-opening-arrow" aria-hidden="true"></span>
+                  <span class="case-opening-art" aria-hidden="true">
+                    <span class="case-opening-emoji" data-pet-emoji></span>
+                    <img class="case-opening-image" data-pet-image alt="" hidden>
+                  </span>
+                </div>
+              </li>
+            </template>
+          </aside>
+
+          <section class="cases-catalogue" id="cases-catalogue" aria-labelledby="cases-title">
+            <h1 id="cases-title" tabindex="-1">Кейсы с питомцами</h1>
+            <p class="cases-status" id="cases-status" role="status">Загружаем каталог…</p>
+            <button class="cases-retry" id="cases-retry" type="button" hidden>Обновить каталог</button>
+            <ul class="cases-grid" id="cases-grid" aria-label="Каталог кейсов"></ul>
+            <template id="cases-card-template">
+              <li class="case-card case-theme">
+                <button class="case-card-button" type="button">
+                  <strong class="case-name"></strong>
+                  <span class="case-art" aria-hidden="true"></span>
+                  <span class="case-price" title="Цена в монетах"><span class="cases-coin" aria-hidden="true"></span><span class="case-amount"></span></span>
+                </button>
+              </li>
+            </template>
+          </section>
+
+          <section class="case-view cases-inventory" id="cases-warehouse" aria-labelledby="cases-warehouse-title" hidden>
+            <h1 id="cases-warehouse-title" tabindex="-1">Склад</h1>
+            <p class="inventory-status" id="inventory-status" role="status"></p>
+            <button class="cases-retry" id="inventory-retry" type="button" hidden>Обновить склад</button>
+            <ul class="case-pets inventory-pets" id="inventory-pets" role="list" aria-label="Питомцы на складе"></ul>
+            <template id="inventory-pet-template">
+              <li class="case-pet inventory-pet">
+                <button class="inventory-pick" type="button" disabled>
+                  <span class="inventory-sale-coin cases-coin" aria-hidden="true" hidden></span>
+                  <span class="case-pet-art" aria-hidden="true">
+                    <span data-pet-emoji></span><img data-pet-image alt="" hidden>
+                  </span>
+                  <strong class="case-pet-name"></strong>
+                </button>
+                <dl class="inventory-stats">
+                  <div><dt>Доход</dt><dd class="inventory-income"></dd></div>
+                  <div><dt>Уровень</dt><dd class="inventory-level"></dd></div>
+                </dl>
+                <button class="inventory-upgrade" type="button"></button>
+                <span class="inventory-sale-price" hidden><span class="cases-coin" aria-hidden="true"></span><span></span></span>
+                <span class="case-pet-rarity"></span>
+              </li>
+            </template>
+            <div class="inventory-actions" id="inventory-actions" hidden>
+              <p class="inventory-selection" id="inventory-selection" aria-live="polite" hidden></p>
+              <div class="inventory-buttons">
+                <button class="inventory-cancel" id="inventory-cancel" type="button" hidden>Отмена</button>
+                <button class="inventory-sell" id="inventory-sell" type="button">Продать</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="case-view cases-development" id="cases-development" aria-labelledby="cases-development-title" hidden>
+            <h1 id="cases-development-title" tabindex="-1"></h1>
+            <p>В разработке</p>
+          </section>
+
+          <section class="case-view case-theme" id="cases-case" aria-labelledby="cases-case-title" hidden>
+            <button class="case-back" id="cases-back" type="button"><span aria-hidden="true">←</span> К списку кейсов</button>
+            <div class="case-stage">
+              <h1 id="cases-case-title" tabindex="-1"></h1>
+              <div class="case-art case-stage-art" aria-hidden="true"></div>
+              <button class="case-open-button" id="cases-open" type="button">
+                <span id="cases-open-label">Открыть</span>
+                <span class="case-open-price">
+                  <span class="cases-coin" aria-hidden="true"></span>
+                  <span id="cases-open-price"></span>
+                  <span class="case-open-unit">монет</span>
+                </span>
+              </button>
+              <div class="case-reel" id="cases-reel" aria-hidden="true" hidden>
+                <div class="case-reel-window">
+                  <div class="case-reel-track" id="cases-reel-track"></div>
+                </div>
+                <span class="case-reel-marker"></span>
+                <template id="cases-reel-card-template">
+                  <div class="case-reel-card">
+                    <span class="case-reel-art">
+                      <span data-pet-emoji></span><img data-pet-image alt="" hidden>
+                    </span>
+                  </div>
+                </template>
+              </div>
+              <p class="case-open-status" id="cases-open-status" role="status" hidden></p>
+              <div class="case-result" id="cases-result" role="status" hidden>
+                <span class="case-result-media" aria-hidden="true">
+                  <video class="case-result-video" id="cases-secret-video" preload="auto" muted playsinline hidden></video>
+                  <span class="case-result-art">
+                    <span data-pet-emoji></span><img data-pet-image alt="" hidden>
+                  </span>
+                </span>
+                <span class="case-result-info">
+                  <span>Выпал питомец</span>
+                  <strong id="cases-result-name"></strong>
+                  <span class="case-result-rarity" id="cases-result-rarity"></span>
+                </span>
+                <dl class="case-result-values">
+                  <div><dt>Доход</dt><dd id="cases-result-income"></dd></div>
+                  <div><dt>Цена продажи</dt><dd id="cases-result-sale-price"></dd></div>
+                </dl>
+              </div>
+              <div class="case-result-actions" id="cases-result-actions" hidden>
+                <button class="case-open-button" id="cases-open-again" type="button">
+                  <span>Открыть снова</span>
+                  <span class="case-open-price"><span class="cases-coin" aria-hidden="true"></span><span id="cases-again-price"></span></span>
+                </button>
+                <button class="case-back" id="cases-result-back" type="button">В меню кейсов</button>
+              </div>
+            </div>
+
+            <section class="case-contents" aria-labelledby="cases-contents-title">
+              <h2 id="cases-contents-title">Содержимое кейса</h2>
+              <ul class="case-pets" id="cases-pets" role="list"></ul>
+              <template id="cases-pet-template">
+                <li class="case-pet">
+                  <span class="case-pet-art" aria-hidden="true">
+                    <span data-pet-emoji></span><img data-pet-image alt="" hidden>
+                  </span>
+                  <strong class="case-pet-name"></strong>
+                  <span class="case-pet-rarity"></span>
+                </li>
+              </template>
+            </section>
+          </section>
+        </div>
+      </main>
+
   <!-- Кто сегодня играет на сервере: аватарка и цвета догадок, обновляется само -->
   <aside class="players" id="players" aria-label="Игроки" hidden></aside>
 
@@ -151,17 +326,27 @@
         <summary>Ставки раунда</summary>
         <ul class="rocket-bet-list" id="rocket-bet-list"></ul>
       </details>
-      <section class="rocket-scene" aria-label="Телеметрия полёта">
-        <div class="rocket-hud">
-          <div class="rocket-phase"><i aria-hidden="true"></i><span id="rocket-phase" role="status">Подключение</span></div>
-          <div class="rocket-clock"><span id="rocket-time-label">Время полёта</span><strong id="rocket-time">—</strong></div>
-          <div class="rocket-readout">
-            <span id="rocket-multiplier-caption">Коэффициент</span>
-            <strong id="rocket-multiplier">1,00×</strong>
+      <div class="rocket-telemetry">
+        <section class="rocket-scene" aria-label="Телеметрия полёта">
+          <div class="rocket-hud">
+            <div class="rocket-phase"><i aria-hidden="true"></i><span id="rocket-phase" role="status">Подключение</span></div>
+            <div class="rocket-clock"><span id="rocket-time-label">Время полёта</span><strong id="rocket-time">—</strong></div>
+            <div class="rocket-readout">
+              <span id="rocket-multiplier-caption">Коэффициент</span>
+              <strong id="rocket-multiplier">1,00×</strong>
+            </div>
           </div>
-        </div>
-        <canvas class="rocket-chart" id="rocket-chart" aria-hidden="true"></canvas>
-      </section>
+          <canvas class="rocket-chart" id="rocket-chart" aria-hidden="true"></canvas>
+        </section>
+
+        <section class="rocket-history" aria-labelledby="rocket-history-title">
+          <h2 id="rocket-history-title">Прошлые полёты</h2>
+          <p id="rocket-history-empty">Загрузка истории…</p>
+          <div class="rocket-history-scroll" id="rocket-history-scroll" role="region" aria-label="Прокрутка прошлых полётов" tabindex="0" hidden>
+            <ol class="rocket-history-list" id="rocket-history-list" role="list" aria-labelledby="rocket-history-title"></ol>
+          </div>
+        </section>
+      </div>
 
       <section class="rocket-controls" aria-labelledby="rocket-controls-title">
         <h2 id="rocket-controls-title">Управление полётом</h2>
@@ -200,10 +385,6 @@
           <button class="rocket-primary" id="rocket-action" type="submit" aria-disabled="true">Подключение…</button>
         </form>
       </section>
-      <details class="rocket-history" id="rocket-history">
-        <summary>История раундов</summary>
-        <ul class="rocket-history-list" id="rocket-history-list"></ul>
-      </details>
     </div>
   </main>
 
@@ -230,9 +411,9 @@
       <button class="mode" id="help-close">Понятно</button>
     </div>
   </div>
-  <script src="static/audio.js"></script>
+  <script src="static/audio.js?v=4"></script>
   <script src="static/game_avatars.js"></script>
-  <script src="static/rocket.js?v=2"></script>
+  <script src="static/rocket.js?v=6"></script>
   <script src="static/mines.js"></script>
   <script src="static/poker.js?v=2"></script>
   <script src="static/casino_slots.js"></script>
@@ -241,6 +422,8 @@
   <script src="static/coinflip.js"></script>
   <script src="static/durak_online.js?v=3"></script>
   <script src="static/durak.js?v=4"></script>
-  <script src="static/app.js?v=6"></script>
+  <script src="static/cases-inventory.js?v=4"></script>
+  <script src="static/cases.js?v=15"></script>
+  <script src="static/app.js?v=11"></script>
 </body>
 </html>

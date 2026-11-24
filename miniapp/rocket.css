@@ -50,15 +50,13 @@
 
 .rocket-layout {
   display: grid;
-  grid-template: "bets scene controls" auto "bets scene history" 1fr / minmax(154px, .75fr) minmax(0, 1.8fr) minmax(215px, 1fr);
+  grid-template: "bets telemetry controls" / minmax(154px, .75fr) minmax(0, 1.8fr) minmax(215px, 1fr);
   gap: 14px;
   align-items: start;
 }
 .rocket-bets { grid-area: bets; }
-.rocket-history { grid-area: history; }
-.rocket-scene { grid-area: scene; }
 .rocket-controls { grid-area: controls; }
-.rocket-bets, .rocket-history {
+.rocket-bets {
   min-width: 0;
   padding: 13px;
   border: 1px solid var(--rocket-line);
@@ -66,33 +64,23 @@
   background: var(--surface);
 }
 .rocket-layout summary { cursor: pointer; font-size: .88rem; font-weight: 720; }
-.rocket-bet-list, .rocket-history-list { margin: 11px 0 0; padding: 0; list-style: none; }
+.rocket-bet-list { margin: 11px 0 0; padding: 0; list-style: none; }
 .rocket-bet-list { display: grid; gap: 8px; max-height: 420px; overflow-y: auto; }
 .rocket-bet-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; }
 .rocket-bet-row strong, .rocket-bet-row small { display: block; overflow-wrap: anywhere; }
 .rocket-bet-row strong { font-size: .78rem; }
 .rocket-bet-row small, .rocket-list-empty { color: var(--muted); font-size: .73rem; }
 .rocket-bet-row[data-status="paid"] small { color: var(--mint); }
-.rocket-history-list { display: flex; flex-wrap: wrap; gap: 6px; }
-.rocket-history-list li:not(.rocket-list-empty) {
-  padding: 4px 7px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--inset);
-  color: var(--muted);
-  font-size: .74rem;
-  font-variant-numeric: tabular-nums;
-}
-.rocket-history-list li:first-child:not(.rocket-list-empty) { color: var(--mint); }
+.rocket-telemetry { grid-area: telemetry; display: grid; min-width: 0; gap: 10px; }
 
-.rocket-scene {
+.rocket-scene, .rocket-history {
   border: 1px solid var(--rocket-line);
   border-radius: 18px;
   overflow: hidden;
   background: radial-gradient(ellipse at 75% 4%, #26332c, transparent 65%), var(--inset);
-  transition: border-color .24s ease;
 }
 
+.rocket-scene { transition: border-color .24s ease; }
 .rocket[data-phase="crashed"] .rocket-scene { border-color: #7f514d; }
 .rocket-hud { position: relative; display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 17px 19px 0; }
 .rocket-phase { display: flex; gap: 7px; align-items: center; align-self: start; color: var(--rocket-muted); font-size: 12px; }
@@ -103,6 +91,89 @@
 .rocket-readout { grid-column: 1 / -1; text-align: center; min-width: 0; }
 .rocket-readout strong { display: block; margin: 3px 0 0; font-size: clamp(44px, 8vw, 83px); letter-spacing: -.062em; line-height: 1; color: var(--rocket-accent); }
 .rocket-chart { display: block; width: 100%; height: clamp(210px, 42vh, 405px); }
+
+.rocket-history h2 { margin: 10px 12px 3px; color: var(--text); font-size: 13px; text-align: center; }
+.rocket-history p { margin: 8px 12px 12px; color: var(--rocket-muted); font-size: 12px; }
+.rocket-history-scroll {
+  overflow-x: auto;
+  overflow-anchor: none;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+.rocket-history-scroll:focus-visible { outline: 2px solid var(--mint); outline-offset: -2px; }
+.rocket-history-list {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  padding: 5px 10px 9px;
+  list-style: none;
+}
+.rocket-history-card {
+  --rocket-card-edge: #48594d;
+  display: flex;
+  flex: 0 0 78px;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 130px;
+  padding: 7px 6px 3px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, #242c26, #1a211c 43%, #151a16 74%, #151a1600) padding-box,
+    linear-gradient(180deg, var(--rocket-card-edge), transparent 74%) border-box;
+}
+.rocket-history-card[data-tier="red"] { --rocket-card-edge: #ff8388; }
+.rocket-history-card[data-tier="orange"] { --rocket-card-edge: #ffad74; }
+.rocket-history-card[data-tier="yellow"] { --rocket-card-edge: #f5d96e; }
+.rocket-history-card[data-tier="dark-green"] { --rocket-card-edge: #3da35e; }
+.rocket-history-card[data-tier="green"] { --rocket-card-edge: #74d487; }
+.rocket-history-card[data-tier="light-green"] { --rocket-card-edge: #b6ff28; }
+.rocket-history-peak { text-align: center; }
+.rocket-history-peak strong { color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rocket-history-players { display: grid; gap: 4px; }
+.rocket-history-player {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+}
+.rocket-history-cashout {
+  color: var(--rocket-muted);
+  font-size: 11px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  white-space: nowrap;
+}
+.rocket-history-avatar[data-outcome="won"] + .rocket-history-cashout { color: #8ff4ca; }
+.rocket-history-avatar[data-outcome="lost"] + .rocket-history-cashout { color: #ff8388; }
+.rocket-history-more { color: var(--rocket-muted); font-size: 13px; line-height: 1; text-align: center; }
+.rocket-history-no-bets {
+  align-self: center;
+  margin-block: auto;
+  padding: 4px 5px;
+  border-radius: 5px;
+  background: #a9dec00e;
+  color: var(--rocket-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.rocket-history-avatar {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: var(--inset);
+  font: 650 10px system-ui, sans-serif;
+}
+.rocket-history-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 
 .rocket-controls {
   min-width: 0;
@@ -194,11 +265,11 @@
 
 @media (max-width: 1080px) {
   .rocket-layout {
-    grid-template: "scene controls" auto "bets history" auto / minmax(0, 1fr) minmax(215px, .65fr);
+    grid-template: "telemetry controls" "bets controls" / minmax(0, 1fr) minmax(215px, .65fr);
   }
 }
 @media (max-width: 860px) {
-  .rocket-layout { grid-template: "scene" "controls" "bets" "history" / minmax(0, 1fr); gap: 10px; }
+  .rocket-layout { grid-template: "telemetry" "controls" "bets" / minmax(0, 1fr); gap: 10px; }
   .rocket[data-phase="flying"] .rocket-scene { position: sticky; top: 0; z-index: 2; }
   .rocket-header { margin-bottom: 13px; }
   .rocket-chart { height: clamp(160px, 32vh, 290px); }

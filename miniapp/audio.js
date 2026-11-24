@@ -6,6 +6,7 @@
   const slider = document.getElementById("game-audio-volume");
   const storageKey = "malfoid-game-audio";
   const clips = new Map();
+  const caseClips = new Map();
   const active = new Set();
   const loops = new Set();
   const lastCue = new Map();
@@ -58,6 +59,10 @@
     "mines.blast": [tone(.215, .145, 90, 43), noise(.25, .16, 300)],
     "coin.launch": [noise(.123, .054, 760), tone(.14, .061, 243, 339)],
     "coin.land": [...wood(.067, 324), tone(.116, .040, 221, 193, .065)],
+    "inventory.sell": [
+      noise(.028, .11, 4200), tone(.21, .17, 1568), tone(.13, .10, 2640),
+      tone(.11, .08, 2093, 2093, .044),
+    ],
     "rocket.count": [tone(.085, .047, 135)],
     "rocket.launch": [noise(.36, .12, 405), tone(.325, .102, 65, 96)],
     "rocket.cashout": warmPair(164.81, 246.94),
@@ -67,6 +72,10 @@
   const quietCues = new Set(["ui.hover", "ui.click", "roulette.tick", "slots.stop",
     "cards.deal", "cards.place", "cards.flip", "cards.bet", "rocket.count"]);
   const minGap = { "ui.hover": .045, "ui.click": .040, "roulette.tick": .065 };
+  const caseSounds = {
+    opening: { file: "case-opening.mp3", level: 1 },
+    secret: { file: "case-secret.mp3", level: .16 },
+  };
 
   function renderSettings() {
     if (toggle) {
@@ -198,6 +207,45 @@
     }
   }
 
+  function loadCaseSound(name) {
+    if (!caseClips.has(name)) {
+      const load = (async () => {
+        const response = await fetch(`static/${caseSounds[name].file}`);
+        if (!response.ok) throw new Error("Case sound unavailable");
+        return context.decodeAudioData(await response.arrayBuffer());
+      })().catch(() => {
+        caseClips.delete(name);
+        return null;
+      });
+      caseClips.set(name, load);
+    }
+    return caseClips.get(name);
+  }
+
+  function prepareCaseSounds() {
+    prepareAudio();
+    if (!context) return;
+    for (const name of Object.keys(caseSounds)) void loadCaseSound(name);
+  }
+
+  function playCaseSound(name) {
+    if (!enabled || !volume || document.hidden || !Object.hasOwn(caseSounds, name)) return;
+    const started = performance.now();
+    let cancelled = false;
+    let voice;
+    void unlock().then(async () => {
+      if (cancelled || !canPlay()) return;
+      const buffer = await loadCaseSound(name);
+      const offset = name === "opening" ? (performance.now() - started) / 1000 : 0;
+      if (cancelled || !canPlay() || !buffer || offset >= buffer.duration) return;
+      voice = startSound(`case.${name}`, context.currentTime, false, caseSounds[name].level, { buffer, offset });
+    });
+    return (fadeMs = 0) => {
+      cancelled = true;
+      if (voice) stop(voice, fadeMs / 4000);
+    };
+  }
+
   function canPlay() {
     return enabled && volume > 0 && !document.hidden && context?.state === "running";
   }
@@ -235,12 +283,11 @@
     if (includeUi) lastCue.clear();
   }
 
-  function startSound(name, start, loop, level) {
+  function startSound(name, start, loop, level, { buffer = clipFor(name), offset = 0 } = {}) {
     const source = context.createBufferSource();
     const gain = context.createGain();
-    const buffer = clipFor(name);
     const filter = name === "rocket.flight" ? context.createBiquadFilter?.() : undefined;
-    const voice = { source, gain, filter, name, start, end: loop ? Infinity : start + buffer.duration };
+    const voice = { source, gain, filter, name, start, end: loop ? Infinity : start + buffer.duration - offset };
     source.buffer = buffer;
     source.loop = loop;
     gain.gain.value = loop ? 0 : level;
@@ -253,7 +300,7 @@
     gain.connect(mix);
     source.onended = () => disconnect(voice);
     active.add(voice);
-    source.start(start);
+    source.start(start, offset);
     return voice;
   }
 
@@ -326,12 +373,19 @@
   }
 
   function buttonAt(target) {
+    if (document.body?.dataset.game === "cases") return null;
     const button = target?.closest?.("button, summary, [role='button']");
+    if (button?.dataset?.game === "cases") return null;
     return button && !button.disabled && button.getAttribute?.("aria-disabled") !== "true" ? button : null;
   }
 
   window.GameAudio = {
-    play, startLoop,
+    play, startLoop, prepareCaseSounds, playCaseSound,
+    async inventorySold(signal) {
+      if (!enabled || !volume || document.hidden) return;
+      await unlock();
+      if (!signal.aborted) play("inventory.sell");
+    },
     stopGame() { loops.clear(); stopSounds(false); },
     setLobby(value) { inLobby = value; refreshLobby(); },
     menuReady() {
@@ -345,7 +399,7 @@
     if (!event.isTrusted) return;
     const button = buttonAt(event.target);
     await unlock();
-    if (button && button !== toggle) play("ui.click");
+    if (button && button !== toggle && document.body?.dataset.game !== "cases") play("ui.click");
   }, true);
   document.addEventListener("pointerdown", (event) => {
     if (event.isTrusted) inputWithKeyboard = false;
@@ -378,7 +432,7 @@
     save();
     if (enabled) {
       await unlock();
-      play("ui.click");
+      if (document.body?.dataset.game !== "cases") play("ui.click");
     }
   });
   slider?.addEventListener("input", () => {

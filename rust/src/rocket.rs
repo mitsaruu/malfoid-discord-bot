@@ -3,9 +3,9 @@
 use crate::{config::Settings, economy::MAX_BET};
 use crate::{wagers, Data, Shared};
 use poise::serenity_prelude as s;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ops::{Range, RangeInclusive};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -21,7 +21,8 @@ const CRASH_CAP: u32 = 100_000;
 const GRACE_MS: f64 = 1_200.0;
 const DOUBLE_MS: f64 = 7_000.0;
 const GROWTH_POWER: f64 = 1.35;
-const HISTORY_LIMIT: usize = 16;
+const HISTORY_LIMIT: i64 = 10;
+const HISTORY_PLAYER_LIMIT: usize = 3;
 const PPM: u32 = 1_000_000;
 const REACH_TIERS: [(u32, &str, u32); 5] = [
     (200, "reach_x2_ppm", 485_000),
@@ -53,6 +54,7 @@ struct Wager {
     stake: i64,
     auto: Option<u32>,
     outcome: Outcome,
+    face: String,
 }
 
 #[derive(Clone, Copy)]
@@ -67,7 +69,7 @@ struct ReachOdds([u32; REACH_TIERS.len()]);
 struct Game {
     round: Round,
     odds: ReachOdds,
-    history: VecDeque<(u64, u32)>,
+    history_recorded: bool,
     wagers: HashMap<Player, Wager>,
     refunds: Vec<Wager>,
     receipts: HashMap<Player, (Round, Wager)>,
@@ -97,7 +99,7 @@ impl State {
                     &odds,
                 ),
                 odds,
-                history: VecDeque::with_capacity(HISTORY_LIMIT),
+                history_recorded: false,
                 wagers: HashMap::new(),
                 refunds: Vec::new(),
                 receipts: HashMap::new(),
@@ -110,6 +112,88 @@ impl State {
     fn game(&self) -> MutexGuard<'_, Game> {
         self.game.lock().unwrap_or_else(|error| error.into_inner())
     }
+}
+
+pub fn prepare_history(db: &crate::db::Database) -> rusqlite::Result<()> {
+    db.transaction(|tx| {
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rocket_history (
+                 sequence INTEGER PRIMARY KEY,
+                 round_id INTEGER NOT NULL UNIQUE,
+                 crash INTEGER NOT NULL,
+                 peak INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS rocket_history_players (
+                 round_id INTEGER NOT NULL,
+                 guild_id INTEGER NOT NULL,
+                 user_id INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 face TEXT NOT NULL,
+                 outcome TEXT NOT NULL,
+                 cashout_multiplier INTEGER,
+                 PRIMARY KEY (round_id, guild_id, user_id)
+             );",
+        )?;
+        let has_cashout: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('rocket_history_players')
+                 WHERE name = 'cashout_multiplier'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_cashout {
+            tx.execute("ALTER TABLE rocket_history_players ADD COLUMN cashout_multiplier INTEGER", [])?;
+        }
+        Ok(())
+    })
+}
+
+fn recent_history(connection: &Connection, guild: u64) -> rusqlite::Result<Vec<Value>> {
+    let mut rounds = connection.prepare_cached(
+        "SELECT round_id, crash, peak FROM rocket_history ORDER BY sequence DESC LIMIT ?1",
+    )?;
+    let mut players = connection.prepare_cached(
+        "SELECT user_id, name, outcome, cashout_multiplier FROM rocket_history_players
+         WHERE round_id = ?1 AND guild_id = ?2
+         ORDER BY cashout_multiplier DESC,
+                  CASE outcome WHEN 'won' THEN 0 WHEN 'lost' THEN 1 ELSE 2 END,
+                  user_id
+         LIMIT ?3",
+    )?;
+    let rounds = rounds.query_map([HISTORY_LIMIT], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?))
+    })?;
+    rounds.map(|round| {
+        let (id, crash, peak) = round?;
+        let mut participants = players
+            .query_map(params![id, guild as i64, (HISTORY_PLAYER_LIMIT + 1) as i64], |row| {
+                Ok(json!({
+                    "id": (row.get::<_, i64>(0)? as u64).to_string(),
+                    "name": row.get::<_, String>(1)?,
+                    "outcome": row.get::<_, String>(2)?,
+                    "cashout_multiplier": row.get::<_, Option<u32>>(3)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let more_players = participants.len() > HISTORY_PLAYER_LIMIT;
+        participants.truncate(HISTORY_PLAYER_LIMIT);
+        Ok(json!({
+            "id": (id as u64).to_string(), "crash": crash, "peak": peak,
+            "players": participants, "more_players": more_players,
+        }))
+    }).collect()
+}
+
+pub fn history_avatar(db: &crate::db::Database, guild: u64, user: u64) -> rusqlite::Result<Option<String>> {
+    db.lock().query_row(
+        "SELECT player.face FROM rocket_history AS round
+         JOIN rocket_history_players AS player ON player.round_id = round.round_id
+         WHERE player.guild_id = ?1 AND player.user_id = ?2
+         ORDER BY round.sequence DESC LIMIT 1",
+        params![guild as i64, user as i64],
+        |row| row.get(0),
+    ).optional()
 }
 
 pub fn start_cleanup(data: Shared) {
@@ -359,6 +443,44 @@ impl Round {
 }
 
 impl Game {
+    fn record_history(&self, db: &crate::db::Database) -> rusqlite::Result<()> {
+        db.transaction(|tx| {
+            let id = self.round.id as i64;
+            tx.execute(
+                "INSERT INTO rocket_history (round_id, crash, peak) VALUES (?1, ?2, ?3)",
+                params![id, self.round.crash_at, self.round.crash_at],
+            )?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO rocket_history_players
+                     (round_id, guild_id, user_id, name, face, outcome, cashout_multiplier)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (&(guild, user), wager) in &self.wagers {
+                let (outcome, cashout) = match wager.outcome {
+                    Outcome::Paid { multiplier, .. } => ("won", Some(multiplier)),
+                    Outcome::Crashed => ("lost", None),
+                    Outcome::Refunded | Outcome::RefundPending(_) => ("refund", None),
+                    Outcome::Open => continue,
+                };
+                insert.execute(params![
+                    id, guild as i64, user as i64, wager.name, wager.face, outcome, cashout,
+                ])?;
+            }
+            tx.execute(
+                "DELETE FROM rocket_history WHERE sequence <= (
+                     SELECT sequence FROM rocket_history ORDER BY sequence DESC LIMIT 1 OFFSET ?1
+                 )",
+                [HISTORY_LIMIT],
+            )?;
+            tx.execute(
+                "DELETE FROM rocket_history_players
+                 WHERE round_id NOT IN (SELECT round_id FROM rocket_history)",
+                [],
+            )?;
+            Ok(())
+        })
+    }
+
     fn advance(&mut self, data: &Data, now: Instant) {
         if now >= self.next_cleanup {
             self.receipts
@@ -397,12 +519,11 @@ impl Game {
             if now < end {
                 return;
             }
-            if self.history.front().map(|(id, _)| *id) != Some(self.round.id) {
-                if self.history.len() == HISTORY_LIMIT {
-                    self.history.pop_back();
+            if !self.history_recorded {
+                match self.record_history(&data.db) {
+                    Ok(()) => self.history_recorded = true,
+                    Err(error) => eprintln!("Ракетка {}: не удалось сохранить полёт: {error}", self.round.id),
                 }
-                self.history
-                    .push_front((self.round.id, self.round.crash_at));
             }
             if now < end + CRASH_HOLD {
                 return;
@@ -426,6 +547,7 @@ impl Game {
                 .max((following_launch - previous_launch).as_secs() / period_secs);
             let launch = previous_launch + Duration::from_secs(periods * period_secs);
             self.round = Round::new(self.round.id + periods, launch, &self.odds);
+            self.history_recorded = false;
         }
     }
 
@@ -494,9 +616,8 @@ impl Game {
         now: Instant,
         receipt: Option<&(Round, Wager)>,
     ) -> rusqlite::Result<Value> {
-        let balance = data
-            .db
-            .lock()
+        let connection = data.db.lock();
+        let balance = connection
             .query_row(
                 "SELECT balance FROM economy WHERE guild_id = ?1 AND user_id = ?2",
                 params![player.0 as i64, player.1 as i64],
@@ -520,11 +641,7 @@ impl Game {
                 .collect();
             (self.snapshot(player, now), bets)
         };
-        let history: Vec<_> = self
-            .history
-            .iter()
-            .map(|(id, multiplier)| json!({ "id": id.to_string(), "multiplier": multiplier }))
-            .collect();
+        let history = recent_history(&connection, player.0)?;
         Ok(json!({
             "balance": balance, "min_bet": data.economy.min_bet, "max_bet": MAX_BET,
             "flight": flight, "bets": bets, "history": history,
@@ -543,6 +660,7 @@ pub fn start(
     data: &Shared,
     player: Player,
     name: &str,
+    face: &str,
     bet: &str,
     auto: Option<&str>,
     expected: Option<u64>,
@@ -606,6 +724,7 @@ pub fn start(
             stake,
             auto,
             outcome: Outcome::Open,
+            face: face.to_owned(),
         },
     );
     game.receipts.remove(&player);
@@ -661,7 +780,7 @@ mod tests {
     }
 
     fn bet(data: &Shared, player: Player, id: u64, auto: Option<&str>) -> Value {
-        start(data, player, "pilot", "100", auto, Some(id))
+        start(data, player, "pilot", "", "100", auto, Some(id))
             .unwrap()
             .unwrap()
     }
@@ -690,12 +809,108 @@ mod tests {
     }
 
     #[test]
+    fn history_records_the_visible_crash_once_and_keeps_participants_on_their_server() {
+        let data = test_data();
+        let launch = Instant::now() + ROUND_PERIOD;
+        let id = set_round(&data, launch, 300);
+        let visitor = (7, PILOT.1);
+        start(&data, PILOT, "pilot", "pilot.png", "100", Some("2.00"), Some(id))
+            .unwrap().unwrap();
+        bet(&data, OTHER, id, None);
+        start(&data, visitor, "visitor", "visitor.png", "100", None, Some(id))
+            .unwrap().unwrap();
+
+        let mut game = data.rocket.game();
+        let end = game.round.end();
+        game.advance(&data, end - Duration::from_nanos(1));
+        assert!(recent_history(&data.db.lock(), PILOT.0).unwrap().is_empty());
+        game.advance(&data, end);
+        game.advance(&data, end + CRASH_HOLD);
+
+        let history = recent_history(&data.db.lock(), PILOT.0).unwrap();
+        assert_eq!(history, [json!({
+            "id": id.to_string(), "crash": 300, "peak": 300,
+            "players": [
+                { "id": "2", "name": "pilot", "outcome": "won", "cashout_multiplier": 200 },
+                { "id": "3", "name": "pilot", "outcome": "lost", "cashout_multiplier": null },
+            ],
+            "more_players": false,
+        })]);
+        assert_eq!(recent_history(&data.db.lock(), visitor.0).unwrap()[0]["players"],
+            json!([{ "id": "2", "name": "visitor", "outcome": "lost", "cashout_multiplier": null }]));
+        assert_eq!(history_avatar(&data.db, PILOT.0, PILOT.1).unwrap().as_deref(), Some("pilot.png"));
+        assert_eq!(history_avatar(&data.db, visitor.0, visitor.1).unwrap().as_deref(), Some("visitor.png"));
+        assert_eq!(history_avatar(&data.db, 8, PILOT.1).unwrap(), None);
+    }
+
+    #[test]
+    fn history_lists_the_three_highest_cashouts_first() {
+        let data = test_data();
+        let id = set_round(&data, Instant::now() + ROUND_PERIOD, 400);
+        bet(&data, PILOT, id, Some("1.80"));
+        bet(&data, OTHER, id, Some("3.15"));
+        bet(&data, SPECTATOR, id, None);
+        bet(&data, (PILOT.0, 5), id, Some("2.25"));
+        let mut game = data.rocket.game();
+        let end = game.round.end();
+        game.advance(&data, end);
+
+        let history = recent_history(&data.db.lock(), PILOT.0).unwrap();
+        assert_eq!(history[0]["more_players"], true);
+        let players = history[0]["players"].as_array().unwrap();
+        let cashouts: Vec<_> = players.iter().map(|player| player["cashout_multiplier"].as_u64()).collect();
+        assert_eq!(cashouts, [Some(315), Some(225), Some(180)]);
+    }
+
+    #[test]
+    fn history_can_read_older_winners_without_inventing_cashouts() {
+        let db = crate::db::Database::in_memory().unwrap();
+        db.lock().execute_batch(
+            "ALTER TABLE rocket_history_players DROP COLUMN cashout_multiplier;
+             INSERT INTO rocket_history (round_id, crash, peak) VALUES (1, 300, 300);
+             INSERT INTO rocket_history_players (round_id, guild_id, user_id, name, face, outcome)
+             VALUES (1, 1, 2, 'pilot', 'pilot.png', 'won');"
+        ).unwrap();
+        prepare_history(&db).unwrap();
+        prepare_history(&db).unwrap();
+
+        let history = recent_history(&db.lock(), 1).unwrap();
+        assert_eq!(history[0]["players"][0], json!({
+            "id": "2", "name": "pilot", "outcome": "won", "cashout_multiplier": null,
+        }));
+        assert_eq!(history_avatar(&db, 1, 2).unwrap().as_deref(), Some("pilot.png"));
+    }
+
+    #[test]
+    fn history_keeps_ten_rounds_including_empty_rounds_and_expires_their_avatars() {
+        let data = test_data();
+        let id = set_round(&data, Instant::now() + ROUND_PERIOD, 140);
+        bet(&data, PILOT, id, None);
+        let mut game = data.rocket.game();
+        for _ in 0..=HISTORY_LIMIT {
+            game.round.crash_at = 140;
+            let end = game.round.end();
+            game.advance(&data, end + CRASH_HOLD);
+        }
+        let connection = data.db.lock();
+        let history = recent_history(&connection, PILOT.0).unwrap();
+        assert_eq!(history.len(), HISTORY_LIMIT as usize);
+        assert_eq!(history[0]["id"], (id + HISTORY_LIMIT as u64).to_string());
+        assert_eq!(history[9]["id"], (id + 1).to_string());
+        assert!(history.iter().all(|round| round["players"] == json!([])));
+        let stored: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM rocket_history_players", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[test]
     fn countdown_takes_one_debit_per_player_and_late_bets_are_rejected() {
         let data = test_data();
         let launch = Instant::now() + ROUND_PERIOD;
         let id = set_round(&data, launch, 300);
         for expected in [None, Some(id - 1)] {
-            assert!(start(&data, PILOT, "pilot", "100", None, expected)
+            assert!(start(&data, PILOT, "pilot", "", "100", None, expected)
                 .unwrap()
                 .is_err());
         }
@@ -706,7 +921,7 @@ mod tests {
         assert_eq!(opened["flight"]["auto"], 200);
         assert_eq!(opened["flight"]["can_bet"], false);
         assert_eq!(opened["flight"]["can_cashout"], false);
-        assert!(start(&data, PILOT, "pilot", "100", None, Some(id))
+        assert!(start(&data, PILOT, "pilot", "", "100", None, Some(id))
             .unwrap()
             .is_err());
         assert_eq!(bet(&data, OTHER, id, None)["balance"], 400);
@@ -721,7 +936,7 @@ mod tests {
             false
         );
         assert!(cash_out(&data, SPECTATOR, id).unwrap().is_err());
-        assert!(start(&data, SPECTATOR, "pilot", "100", None, Some(id))
+        assert!(start(&data, SPECTATOR, "pilot", "", "100", None, Some(id))
             .unwrap()
             .is_err());
         assert_eq!(balance(&data, SPECTATOR), 500);
@@ -748,7 +963,7 @@ mod tests {
         std::thread::scope(|scope| {
             let place = || {
                 ready.wait();
-                start(&data, PILOT, "pilot", "100", None, Some(id))
+                start(&data, PILOT, "pilot", "", "100", None, Some(id))
                     .unwrap()
                     .is_ok()
             };
@@ -787,10 +1002,8 @@ mod tests {
         assert_eq!(late["balance"], 400);
         assert_eq!(game.snapshot(PILOT, end)["payout"], 200);
         assert_eq!(game.snapshot(PILOT, end)["automatic"], true);
-        assert_eq!(
-            late["history"],
-            json!([{ "id": id.to_string(), "multiplier": 400 }])
-        );
+        assert_eq!(late["history"][0]["id"], id.to_string());
+        assert_eq!(late["history"][0]["peak"], 400);
         game.advance(&data, end + CRASH_HOLD - Duration::from_nanos(1));
         assert_eq!(game.round.id, id);
         game.advance(&data, end + CRASH_HOLD);
@@ -832,10 +1045,8 @@ mod tests {
             assert_eq!(response["flight"]["payout"], 100_000);
             assert_eq!(response["flight"]["automatic"], true);
             assert_eq!(response["balance"], 100_400);
-            assert_eq!(
-                response["history"],
-                json!([{ "id": id.to_string(), "multiplier": 100_000 }])
-            );
+            assert_eq!(response["history"][0]["id"], id.to_string());
+            assert_eq!(response["history"][0]["peak"], 100_000);
         }
         assert_eq!(balance(&data, SPECTATOR), 100_399);
         assert_eq!(game.round.launch, launch + ROUND_PERIOD * 3);
@@ -849,7 +1060,7 @@ mod tests {
         let empty_id = set_round(&empty, launch, 500);
         let active_id = set_round(&active, launch, 500);
         bet(&active, PILOT, active_id, Some("2"));
-        start(&active, OTHER, "other", "250", None, Some(active_id))
+        start(&active, OTHER, "other", "", "250", None, Some(active_id))
             .unwrap()
             .unwrap();
         let mut empty_game = empty.rocket.game();
@@ -869,8 +1080,11 @@ mod tests {
             second.as_object_mut().unwrap().remove("id");
             assert_eq!(first, second);
         }
-        assert_eq!(empty_game.history.front(), Some(&(empty_id, 500)));
-        assert_eq!(active_game.history.front(), Some(&(active_id, 500)));
+        for (data, id) in [(&empty, empty_id), (&active, active_id)] {
+            let history = recent_history(&data.db.lock(), PILOT.0).unwrap();
+            assert_eq!(history[0]["id"], id.to_string());
+            assert_eq!(history[0]["peak"], 500);
+        }
         assert_eq!(balance(&active, PILOT), 600);
         assert_eq!(balance(&active, OTHER), 500);
     }
@@ -882,7 +1096,7 @@ mod tests {
         let id = set_round(&data, launch, 200);
         let remote = (2, PILOT.1);
         bet(&data, PILOT, id, None);
-        let accepted = start(&data, remote, "remote", "55", None, Some(id))
+        let accepted = start(&data, remote, "remote", "", "55", None, Some(id))
             .unwrap()
             .unwrap();
         assert_eq!(accepted["bets"].as_array().unwrap().len(), 1);
@@ -906,12 +1120,16 @@ mod tests {
         assert_eq!(lost["bets"].as_array().unwrap().len(), 1);
         assert_eq!(lost["bets"][0]["name"], "remote");
         assert_eq!(lost["bets"][0]["status"], "lost");
+        assert_eq!(lost["history"][0]["players"][0]["name"], "remote");
+        assert_eq!(lost["history"][0]["players"][0]["outcome"], "lost");
         let replay = game
             .cash_out(&data, PILOT, id, end + CRASH_HOLD)
             .unwrap()
             .unwrap();
         assert_eq!(replay["bets"], json!([]));
-        assert_eq!(replay["history"], lost["history"]);
+        assert_eq!(replay["history"][0]["id"], lost["history"][0]["id"]);
+        assert_eq!(replay["history"][0]["players"][0]["name"], "pilot");
+        assert_eq!(replay["history"][0]["players"][0]["cashout_multiplier"], 100);
         assert_eq!(replay["flight"]["payout"], 100);
     }
 
@@ -935,7 +1153,7 @@ mod tests {
         assert_eq!(replay["flight"]["status"], "crashed");
         assert_eq!(replay["flight"]["can_cashout"], false);
         assert_eq!(replay["balance"], paid["balance"]);
-        assert!(start(&data, PILOT, "pilot", "100", None, Some(id))
+        assert!(start(&data, PILOT, "pilot", "", "100", None, Some(id))
             .unwrap()
             .is_err());
         bet(&data, PILOT, id + 1, None);
@@ -1054,8 +1272,8 @@ mod tests {
         for (roll, band) in [
             (0, 100_000..=100_000),
             (299, 100_000..=100_000),
-            (300, 1_000..=99_999),
-            (89_999, 1_000..=99_999),
+            (300, 10_000..=99_999),
+            (89_999, 10_000..=99_999),
             (90_000, 500..=999),
             (149_999, 500..=999),
             (150_000, 200..=499),
@@ -1141,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn history_keeps_only_the_sixteen_most_recent_results() {
+    fn response_returns_the_ten_most_recent_results() {
         let data = test_data();
         let launch = Instant::now() + ROUND_PERIOD;
         let id = set_round(&data, launch, 100);
@@ -1152,7 +1370,7 @@ mod tests {
             game.advance(&data, end);
             game.advance(&data, end + CRASH_HOLD);
         }
-        let history: Vec<_> = (4..20)
+        let history: Vec<_> = (10..20)
             .rev()
             .map(|offset| ((id + offset).to_string(), 100 + offset))
             .collect();
@@ -1162,7 +1380,9 @@ mod tests {
         let entries = response["history"].as_array().unwrap();
         assert_eq!(entries.len(), history.len());
         for (entry, (id, multiplier)) in entries.iter().zip(history) {
-            assert_eq!(entry, &json!({ "id": id, "multiplier": multiplier }));
+            assert_eq!(entry, &json!({
+                "id": id, "crash": multiplier, "peak": multiplier, "players": [], "more_players": false,
+            }));
         }
     }
 

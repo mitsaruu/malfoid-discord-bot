@@ -39,6 +39,8 @@ let typed = "";       // что игрок сейчас набирает
 let busy = false;     // ждём ответа сервера
 let activeGame = null;
 let rocket = null;
+let casesView = null;
+const casesRoot = document.getElementById("cases");
 let reloadWords = false;
 const casinoTitles = {
   mines: "Минное поле", poker: "Техасский холдем", slots: "Слоты", blackjack: "Блэкджек",
@@ -83,6 +85,7 @@ window.addEventListener("message", (event) => {
     window.GameAudio?.stopGame();
     window.GameAudio?.setLobby(false);
     if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
+    else if (activeGame === "cases" && casesView) casesView.disconnect(reason);
     else if (casinoViews.has(activeGame)) {
       casinoViews.get(activeGame).hide();
       const root = document.getElementById(activeGame);
@@ -159,14 +162,18 @@ async function api(path, body, { signal = AbortSignal.timeout(path === "api/toke
     if (signal?.aborted) throw signal.reason;
     return {};
   });
-  if (!response.ok) throw new Error(data.error || "Сервер бота не ответил (" + response.status + ")");
+  if (!response.ok) {
+    const error = new Error(data.error || "Сервер бота не ответил (" + response.status + ")");
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
-async function loadGameAvatar(path) {
+async function loadGameAvatar(path, signal = AbortSignal.timeout(8000)) {
   if (!session) return null;
   const response = await fetch(path, {
-    headers: { Authorization: `Bearer ${session}` }, signal: AbortSignal.timeout(8000),
+    headers: { Authorization: `Bearer ${session}` }, signal,
   });
   return response.ok ? response.blob() : null;
 }
@@ -511,6 +518,7 @@ function openGame(game) {
   if (game === activeGame) return;
   window.GameAudio?.stopGame();
   if (activeGame === "rocket") rocket?.hide();
+  if (activeGame === "cases") casesView?.hide();
   casinoViews.get(activeGame)?.hide();
   activeGame = game;
   document.body.dataset.game = game;
@@ -520,6 +528,7 @@ function openGame(game) {
   document.getElementById("app").hidden = !words;
   playersEl.hidden = !words;
   document.getElementById("rocket").hidden = game !== "rocket";
+  if (casesRoot) casesRoot.hidden = game !== "cases";
   for (const id of Object.keys(casinoTitles)) {
     const view = document.getElementById(id);
     if (view) view.hidden = id !== game;
@@ -536,6 +545,11 @@ function openGame(game) {
     document.documentElement.lang = lang;
     reloadWords = true;
     loadWords();
+  } else if (game === "cases") {
+    document.title = "Кейсы с питомцами";
+    document.documentElement.lang = "ru";
+    if (casesView) casesView.show();
+    else document.getElementById("cases-status").textContent = "Не удалось загрузить каталог. Откройте Activity заново.";
   } else if (game === "rocket") {
     document.title = "Ракетка";
     document.documentElement.lang = "ru";
@@ -613,10 +627,29 @@ async function start() {
       activityProfile = { name: login.name, avatar: () => gameAvatar(login.user_id) };
     }
     await discordCommand("AUTHENTICATE", { access_token: login.access_token });
+    if (typeof createCasesView === "function" && casesRoot) {
+      casesView = createCasesView({
+        root: casesRoot,
+        name: login.name,
+        storageKey: login.user_id ? `malfoid:case-opening:${params.get("guild_id")}:${login.user_id}` : null,
+        catalogue: (signal) => api("api/cases", undefined, { signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) }),
+        inventoryRequest: (action, fields, signal) => api(
+          action ? `api/cases/inventory/${action}` : "api/cases/inventory",
+          fields,
+          signal ? { signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) } : undefined,
+        ),
+        openCase: (order) => api("api/cases/open", order),
+        history: (signal) => api("api/cases/history", undefined, { signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) }),
+        avatar: (signal, openingId) => loadGameAvatar(
+          openingId ? `api/cases/history/${encodeURIComponent(openingId)}.png` : "api/cases/avatar.png",
+          AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+        ),
+      });
+    }
     if (typeof createRocketView === "function") {
       rocket = createRocketView((path, body) => api(path, body, {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
-      }), gameAvatar);
+      }), (user) => loadGameAvatar(`api/rocket/avatar/${encodeURIComponent(user)}.png`), gameAvatar);
     }
     gameSwitch.hidden = false;
     document.getElementById("game-audio").hidden = false;
