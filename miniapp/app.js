@@ -546,7 +546,7 @@ function openGame(game) {
     reloadWords = true;
     loadWords();
   } else if (game === "cases") {
-    document.title = "Кейсы с питомцами";
+    document.title = "Зверушник";
     document.documentElement.lang = "ru";
     if (casesView) casesView.show();
     else document.getElementById("cases-status").textContent = "Не удалось загрузить каталог. Откройте Activity заново.";

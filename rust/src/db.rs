@@ -155,7 +155,8 @@ impl Database {
                  user_id  INTEGER NOT NULL,
                  name     TEXT NOT NULL,
                  face     TEXT NOT NULL,
-                 species  TEXT NOT NULL
+                 species  TEXT NOT NULL,
+                 case_key TEXT
              );
              CREATE TABLE IF NOT EXISTS case_opening_requests (
                  guild_id   INTEGER NOT NULL,
@@ -290,6 +291,7 @@ impl Database {
         )?;
         let database = Self { connection: Mutex::new(connection) };
         database.prepare_pet_activity()?;
+        database.prepare_case_history()?;
         crate::wordsummary::prepare(&database)?;
         crate::wordstats::prepare_duels(&database)?;
         crate::shop::prepare(&database)?;
@@ -393,6 +395,28 @@ impl Database {
                         ) WHERE slot > ?2
                     )",
                     params![now(), crate::pets::ACTIVE_PET_LIMIT],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn prepare_case_history(&self) -> rusqlite::Result<()> {
+        self.transaction(|tx| {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('case_openings') WHERE name = 'case_key')",
+                [], |row| row.get(0),
+            )?;
+            if !present {
+                tx.execute("ALTER TABLE case_openings ADD COLUMN case_key TEXT", [])?;
+                tx.execute(
+                    "UPDATE case_openings SET case_key = requests.case_key
+                     FROM case_opening_requests AS requests WHERE requests.opening_id = case_openings.id",
+                    [],
+                )?;
+                tx.execute(
+                    "UPDATE case_openings SET case_key = 'secret' WHERE case_key IS NULL AND species = 'stellochka'",
+                    [],
                 )?;
             }
             Ok(())
@@ -1489,6 +1513,31 @@ mod tests {
         let reopened = Database::open(&file.0).unwrap();
         assert_eq!(accounts.map(|(guild, user, _)| reopened.user_pets(guild, user).unwrap()), pets_after);
         assert_eq!(accounts.map(|(guild, user, _)| reopened.wallet(guild, user, "Player", 0).unwrap()), wallets_before);
+    }
+
+    #[test]
+    fn opening_an_old_database_recovers_known_case_types() {
+        use crate::pets::{case_history, Case};
+
+        let file = TestDatabaseFile::new();
+        let db = Database::open(&file.0).unwrap();
+        db.lock().execute_batch(
+            "ALTER TABLE case_openings DROP COLUMN case_key;
+             INSERT INTO case_openings (id, guild_id, user_id, name, face, species) VALUES
+                 (1, 7, 1, 'Алиса', 'alice.png', 'valera'),
+                 (2, 7, 2, 'Борис', 'boris.png', 'igor'),
+                 (3, 7, 3, 'Вера', 'vera.png', 'stellochka');
+             INSERT INTO case_opening_requests (guild_id, user_id, request_id, case_key, opening_id)
+                 VALUES (7, 2, 'request', 'expensive', 2);",
+        ).unwrap();
+        drop(db);
+
+        for _ in 0..2 {
+            let migrated = Database::open(&file.0).unwrap();
+            let openings = case_history(&migrated, 7, 4).unwrap();
+            assert_eq!(openings.iter().map(|entry| (entry.id, entry.kind)).collect::<Vec<_>>(),
+                [(3, Some(Case::Secret)), (2, Some(Case::Expensive)), (1, None)]);
+        }
     }
 
     #[test]

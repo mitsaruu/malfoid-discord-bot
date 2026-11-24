@@ -1,5 +1,7 @@
 "use strict";
 
+const UPGRADE_CHANCE_SCALE = 9_000n;
+
 function createCasesUpgrade({ root, request, showPetArt, balanceVersion, updateAccount, canMutate, onSettled }) {
   const owned = root.querySelector("#upgrade-owned");
   const targets = root.querySelector("#upgrade-targets");
@@ -40,7 +42,7 @@ function createCasesUpgrade({ root, request, showPetArt, balanceVersion, updateA
   function chanceFor(from, prize) {
     if (!from || !prize) return 0;
     const to = BigInt(prize.sale_price);
-    return from < to ? Number((from * 10_000n) / to) : 0;
+    return from < to ? Number((from * UPGRADE_CHANCE_SCALE) / to) : 0;
   }
 
   function byPriceDescending(first, second) {

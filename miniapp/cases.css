@@ -187,12 +187,22 @@ body[data-game="cases"] .activity-content { padding: 0; }
 }
 
 .case-opening-chest {
+  display: grid;
+  place-items: center;
   flex: none;
   width: 64px;
   height: 52px;
-  background: url("pet-cases.webp?v=4") right -3px bottom -4px / auto 120px no-repeat;
-  filter: sepia(.87) saturate(1.4);
   transform: scale(.94);
+}
+
+.case-opening-chest[data-case] {
+  background: url("pet-cases.webp?v=4") var(--case-x) var(--case-y) / 200% 200% no-repeat;
+}
+
+.case-opening-chest:not([data-case])::before {
+  content: "⬡";
+  color: var(--cases-muted);
+  font-size: 1.5rem;
 }
 
 .case-opening-arrow {

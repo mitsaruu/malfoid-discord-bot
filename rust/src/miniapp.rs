@@ -330,7 +330,7 @@ async fn cases_catalogue(State(app): State<App>, headers: HeaderMap) -> Reply {
 async fn cases_open(State(app): State<App>, headers: HeaderMap, Json(body): Json<Value>) -> Reply {
     let bad = || json_error("Некорректный запрос открытия кейса.", StatusCode::BAD_REQUEST);
     let kind = body.get("case").and_then(Value::as_str)
-        .and_then(|key| Case::ALL.into_iter().find(|case| case.key() == key)).ok_or_else(bad)?;
+        .and_then(Case::from_key).ok_or_else(bad)?;
     let id = body.get("request_id").and_then(Value::as_str)
         .filter(|id| id.len() == 36 && id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-'))
         .ok_or_else(bad)?;
@@ -351,7 +351,7 @@ async fn cases_open(State(app): State<App>, headers: HeaderMap, Json(body): Json
         "pet": case_pet(pet),
         "balance": crate::text::number(balance),
         "income": format!("{}/ч", crate::text::money_text(pets::income(pet, 1))),
-        "sale_price": crate::text::money_text(pet.sale_price),
+        "sale_price": crate::text::money_text(pets::value(pet, 1)),
         "inventory_full": full,
     });
     if pet.rarity == "secret" {
@@ -497,6 +497,8 @@ async fn cases_history(State(app): State<App>, headers: HeaderMap) -> Reply {
         Some(json!({
             "id": opening.id.to_string(),
             "name": opening.name,
+            "case_key": opening.kind.map(Case::key),
+            "case_name": opening.kind.map(Case::title),
             "pet": case_pet(pet),
         }))
     }).collect();

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Игры Malfoid</title>
   <link rel="stylesheet" href="static/style.css?v=5">
-  <link rel="stylesheet" href="static/cases.css?v=22">
+  <link rel="stylesheet" href="static/cases.css?v=23">
   <link rel="stylesheet" href="static/rocket.css?v=9">
   <link rel="stylesheet" href="static/casino.css?v=3">
   <link rel="stylesheet" href="static/roulette.css?v=3">
@@ -30,7 +30,7 @@
       <div class="activity-brand"><span class="brand-mark" aria-hidden="true">M</span>Malfoid</div>
       <nav class="game-switch" id="game-switch" aria-label="Выбор игры" lang="ru">
         <button type="button" data-game="lobby" aria-controls="game-lobby" aria-pressed="false"><span aria-hidden="true">▦</span>Все игры</button>
-        <button type="button" data-game="cases" aria-controls="cases" aria-pressed="false"><span aria-hidden="true">⬡</span>Кейсы</button>
+        <button type="button" data-game="cases" aria-controls="cases" aria-pressed="false"><span aria-hidden="true">⬡</span>Зверушник</button>
         <button type="button" data-game="words" aria-controls="app" aria-pressed="false"><span aria-hidden="true">Aa</span>Слово дня</button>
         <button type="button" data-game="rocket" aria-controls="rocket" aria-pressed="false"><span aria-hidden="true">↗</span>Ракетка</button>
         <button type="button" data-game="mines" aria-controls="mines" aria-pressed="false"><span aria-hidden="true">◇</span>Минное поле</button>
@@ -57,7 +57,7 @@
           </button>
           <button type="button" class="game-card game-card-cases" data-game="cases">
             <span class="game-cover" aria-hidden="true"></span>
-            <span class="game-card-info"><strong>Кейсы</strong><small>Коллекция питомцев Malfoid.</small></span>
+            <span class="game-card-info"><strong>Зверушник</strong><small>Коллекция питомцев Malfoid.</small></span>
           </button>
           <button type="button" class="game-card" data-game="words">
             <span class="game-cover" aria-hidden="true"></span>
@@ -120,8 +120,8 @@
 
       <main class="pet-cases" id="cases" aria-labelledby="cases-title" lang="ru" hidden>
         <header class="cases-header">
-          <nav class="cases-nav" aria-label="Разделы кейсов">
-            <a id="cases-home" href="#cases-title" aria-current="page"><span aria-hidden="true">⬡</span> Кейсы</a>
+          <nav class="cases-nav" aria-label="Разделы Зверушника">
+            <a id="cases-home" href="#cases-title" aria-current="page"><span aria-hidden="true">⬡</span> Зверушник</a>
             <button type="button" id="cases-warehouse-tab" aria-controls="cases-warehouse"><span aria-hidden="true">▦</span> Склад</button>
             <button type="button" id="cases-upgrade" aria-controls="cases-upgrade-panel"><span aria-hidden="true">⇧</span> Апгрейд</button>
             <button type="button" id="cases-contract" aria-controls="cases-development"><span aria-hidden="true">▤</span> Контракт</button>
@@ -153,7 +153,7 @@
                   <strong class="case-opening-name"></strong>
                 </div>
                 <div class="case-opening-pet" role="img">
-                  <span class="case-opening-chest" aria-hidden="true"></span>
+                  <span class="case-opening-chest case-theme" aria-hidden="true"></span>
                   <span class="case-opening-arrow" aria-hidden="true"></span>
                   <span class="case-opening-art" aria-hidden="true">
                     <span class="case-opening-emoji" data-pet-emoji></span>
@@ -165,7 +165,7 @@
           </aside>
 
           <section class="cases-catalogue" id="cases-catalogue" aria-labelledby="cases-title">
-            <h1 id="cases-title" tabindex="-1">Кейсы с питомцами</h1>
+            <h1 id="cases-title" tabindex="-1">Зверушник</h1>
             <p class="cases-status" id="cases-status" role="status">Загружаем каталог…</p>
             <button class="cases-retry" id="cases-retry" type="button" hidden>Обновить каталог</button>
             <ul class="cases-grid" id="cases-grid" aria-label="Каталог кейсов"></ul>
@@ -481,8 +481,8 @@
   <script src="static/durak_online.js?v=3"></script>
   <script src="static/durak.js?v=4"></script>
   <script src="static/cases-inventory.js?v=9"></script>
-  <script src="static/cases-upgrade.js?v=4"></script>
-  <script src="static/cases.js?v=18"></script>
-  <script src="static/app.js?v=11"></script>
+  <script src="static/cases-upgrade.js?v=5"></script>
+  <script src="static/cases.js?v=20"></script>
+  <script src="static/app.js?v=12"></script>
 </body>
 </html>

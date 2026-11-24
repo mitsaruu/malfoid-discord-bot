@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 pub(crate) const ACTIVE_PET_LIMIT: i64 = 10;
 pub(crate) const MAX_PET_LIMIT: usize = 40;
 pub(crate) const UPGRADE_SCALE: u32 = 10_000;
+const UPGRADE_CHANCE_SCALE: u32 = 9_000;
+const PET_VALUE_PER_HOUR: i64 = 30;
+const OLEG_FEED_COST: i64 = 1_000_000;
 const LEGACY_PET_LIMIT: i64 = 10;
 
 /// Настройки из settings.ini, раздел [pets].
@@ -33,10 +36,10 @@ impl PetSettings {
             max_level: settings.int("pets", "max_level", 20).max(1),
             collect_cap_hours: settings.int("pets", "collect_cap_hours", 24).max(1),
             case_prices: [
-                settings.int("pets", "cheap_case_price", 500).max(1),
-                settings.int("pets", "medium_case_price", 2000).max(1),
-                settings.int("pets", "expensive_case_price", 7500).max(1),
-                settings.int("pets", "secret_case_price", 25000).max(1),
+                settings.int("pets", "cheap_case_price", 1000).max(1),
+                settings.int("pets", "medium_case_price", 3000).max(1),
+                settings.int("pets", "expensive_case_price", 9000).max(1),
+                settings.int("pets", "secret_case_price", 30000).max(1),
             ],
         }
     }
@@ -56,6 +59,10 @@ pub enum Case {
 
 impl Case {
     pub(crate) const ALL: [Case; 4] = [Case::Cheap, Case::Medium, Case::Expensive, Case::Secret];
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|case| case.key() == key)
+    }
+
 
     pub(crate) fn key(self) -> &'static str {
         match self {
@@ -93,45 +100,46 @@ pub const RARITIES: [Rarity; 6] = [
     Rarity { key: "rare", name: "Редкий", color: 0x3B82F6, chances: [20.0, 38.0, 40.0, 0.0] },
     Rarity { key: "epic", name: "Эпический", color: 0xA855F7, chances: [4.5, 17.0, 40.0, 60.0] },
     Rarity { key: "legendary", name: "Легендарный", color: 0xF59E0B, chances: [0.49, 4.8, 18.5, 34.95] },
-    Rarity { key: "mythic", name: "Мифический", color: 0xEF4444, chances: [0.01, 0.2, 1.5, 5.0] },
-    Rarity { key: "secret", name: "Секретный", color: 0x22D3EE, chances: [0.0, 0.0, 0.0, 0.05] },
+    Rarity { key: "mythic", name: "Мифический", color: 0xEF4444, chances: [0.01, 0.2, 1.5, 4.95] },
+    Rarity { key: "secret", name: "Секретный", color: 0x22D3EE, chances: [0.0, 0.0, 0.0, 0.1] },
 ];
 
-/// Вид питомца: ключ из базы, эмодзи, название, редкость, базовый доход и цена продажи.
+/// Вид питомца: ключ из базы, эмодзи, название, редкость и базовый доход.
 pub struct Species {
     pub key: &'static str,
     pub emoji: &'static str,
     pub name: &'static str,
     pub rarity: &'static str,
     pub income: i64,
-    pub sale_price: i64,
 }
 
 const fn species(
-    key: &'static str, emoji: &'static str, name: &'static str, rarity: &'static str, income: i64, sale_price: i64,
+    key: &'static str, emoji: &'static str, name: &'static str, rarity: &'static str, income: i64,
 ) -> Species {
-    Species { key, emoji, name, rarity, income, sale_price }
+    Species { key, emoji, name, rarity, income }
 }
 
 // Средняя цена продажи выпавшего питомца ниже стандартной цены каждого кейса.
-pub const SPECIES: [Species; 17] = [
-    species("valera", "🐱", "котик", "common", 10, 200),
-    species("gena", "🐹", "хомяк", "common", 12, 240),
-    species("tolik", "🐦", "голубь", "common", 8, 160),
-    species("frog", "🐸", "лягушка", "common", 9, 180),
-    species("arkady", "🦊", "лисичка", "rare", 25, 600),
-    species("tamara", "🦉", "сова", "rare", 25, 650),
-    species("boris", "🐢", "черепаха", "rare", 22, 500),
-    species("igor", "🐺", "волк", "epic", 60, 1700),
-    species("edik", "🐧", "пингвин", "epic", 55, 1500),
-    species("zhorik", "🦝", "енот", "epic", 65, 1900),
-    species("vasily", "🐉", "дракон", "legendary", 150, 4800),
-    species("lyudmila", "🦄", "единорог", "legendary", 140, 4300),
-    species("lion", "🦁", "лев", "legendary", 160, 5300),
-    species("danya_dog", "🐕", "Даня собака", "legendary", 170, 5800),
-    species("sergey", "🐶", "собака Сергей", "mythic", 500, 10000),
-    species("foidka_romana", "🧚", "Фоидка романа", "mythic", 550, 12000),
-    species("stellochka", "🌟", "Стеллочка", "secret", 1500, 20000),
+pub const SPECIES: [Species; 19] = [
+    species("valera", "🐱", "котик", "common", 10),
+    species("gena", "🐹", "хомяк", "common", 12),
+    species("tolik", "🐦", "голубь", "common", 8),
+    species("frog", "🐸", "лягушка", "common", 9),
+    species("arkady", "🦊", "лисичка", "rare", 25),
+    species("tamara", "🦉", "сова", "rare", 25),
+    species("boris", "🐢", "черепаха", "rare", 22),
+    species("igor", "🐺", "волк", "epic", 60),
+    species("edik", "🐧", "пингвин", "epic", 55),
+    species("zhorik", "🦝", "енот", "epic", 65),
+    species("hermes", "👟", "Гермес", "epic", 62),
+    species("vasily", "🐉", "дракон", "legendary", 150),
+    species("lyudmila", "🦄", "единорог", "legendary", 140),
+    species("lion", "🦁", "лев", "legendary", 160),
+    species("danya_dog", "🐕", "Даня собака", "legendary", 170),
+    species("sergey", "🐶", "собака Сергей", "mythic", 500),
+    species("foidka_romana", "🧚", "Фоидка романа", "mythic", 550),
+    species("fat_oleg", "👤", "Жирный Олег", "mythic", 533),
+    species("stellochka", "🌟", "Стеллочка", "secret", 2000),
 ];
 
 const STAGES: [(i64, &str); 4] = [(1, "малыш"), (5, "подросток"), (10, "взрослый"), (15, "легенда района")];
@@ -160,20 +168,24 @@ pub fn stage(level: i64) -> &'static str {
 
 /// Монет в час у питомца этого вида и уровня (округление — как round() в Python: половинки к чётному).
 pub fn income(species: &Species, level: i64) -> i64 {
-    scaled_pet_stat(species.income, level)
+    let extra_levels = level.max(1) - 1;
+    if species.key == "fat_oleg" {
+        return species.income.saturating_add(extra_levels);
+    }
+    (species.income as f64 * (1.0 + 0.25 * extra_levels as f64)).round_ties_even() as i64
 }
 
 pub(crate) fn value(species: &Species, level: i64) -> i64 {
-    scaled_pet_stat(species.sale_price, level)
-}
-
-fn scaled_pet_stat(base: i64, level: i64) -> i64 {
-    (base as f64 * (1.0 + 0.25 * (level.max(1) - 1) as f64)).round_ties_even() as i64
+    income(species, level).saturating_mul(PET_VALUE_PER_HOUR)
 }
 
 /// Сколько стоит покормить питомца, чтобы он вырос с level до level + 1.
 pub fn feed_cost(species: &Species, level: i64) -> i64 {
-    (species.income * 20).saturating_mul(level.max(1))
+    if species.key == "fat_oleg" {
+        OLEG_FEED_COST
+    } else {
+        (species.income * 20).saturating_mul(level.max(1))
+    }
 }
 
 /// «🐱 котик (ур. 3, малыш)»
@@ -223,6 +235,7 @@ fn buy_pet(
     tx: &Transaction<'_>,
     wallet: Wallet<'_>,
     face: &str,
+    kind: Case,
     species: &Species,
     price: i64,
     max_pets: i64,
@@ -241,8 +254,8 @@ fn buy_pet(
     let active = Database::active_pet_count_on(tx, wallet.guild, wallet.user)? < ACTIVE_PET_LIMIT;
     insert_owned_pet(tx, wallet, species, now, price, active)?;
     tx.execute(
-        "INSERT INTO case_openings (guild_id, user_id, name, face, species) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![wallet.guild as i64, wallet.user as i64, wallet.name, face, species.key],
+        "INSERT INTO case_openings (guild_id, user_id, name, face, species, case_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![wallet.guild as i64, wallet.user as i64, wallet.name, face, species.key, kind.key()],
     )?;
     Ok(Ok((tx.last_insert_rowid(), balance)))
 }
@@ -315,7 +328,8 @@ pub(crate) fn upgrade_pet(
         if target.rarity == "secret" || source_value >= target_value {
             return Ok(Err("Выбери доступного питомца дороже ставки."));
         }
-        let chance = (source_value * i128::from(UPGRADE_SCALE) / target_value) as u32;
+        // На шкале из 10 000 исходов используем 90% от отношения стоимостей.
+        let chance = (source_value * i128::from(UPGRADE_CHANCE_SCALE) / target_value) as u32;
         if chance == 0 {
             return Ok(Err("Разница в стоимости слишком велика."));
         }
@@ -377,7 +391,7 @@ pub(crate) fn buy_case(
 
         let mut rng = rand::rng();
         let species = roll_pet(kind, rng.random_range(0.0..100.0), rng.random_range(0..usize::MAX));
-        let (opening_id, balance) = match buy_pet(tx, wallet, face, species, price, settings.max_pets)? {
+        let (opening_id, balance) = match buy_pet(tx, wallet, face, kind, species, price, settings.max_pets)? {
             Ok(opening) => opening,
             Err(reason) => return Ok(Err(reason)),
         };
@@ -396,16 +410,23 @@ pub(crate) struct CaseOpening {
     pub id: i64,
     pub name: String,
     pub species: String,
+    pub kind: Option<Case>,
 }
 
 pub(crate) fn case_history(database: &Database, guild: u64, viewer: u64) -> rusqlite::Result<Vec<CaseOpening>> {
     let connection = database.lock();
     let mut statement = connection.prepare(
-        "SELECT id, name, species FROM case_openings
+        "SELECT id, name, species, case_key FROM case_openings
          WHERE guild_id = ?1 AND user_id != ?2 ORDER BY id DESC LIMIT 12",
     )?;
     let openings = statement.query_map(params![guild as i64, viewer as i64], |row| {
-        Ok(CaseOpening { id: row.get(0)?, name: row.get(1)?, species: row.get(2)? })
+        let case_key: Option<String> = row.get(3)?;
+        Ok(CaseOpening {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            species: row.get(2)?,
+            kind: case_key.as_deref().and_then(Case::from_key),
+        })
     })?.collect();
     openings
 }
@@ -964,18 +985,19 @@ mod tests {
     fn case_history_shows_only_successful_openings_by_other_players_on_the_same_server() {
         let db = Database::in_memory().unwrap();
         db.add_pet(7, 4, "valera", 0.0, 500).unwrap();
-        let buy = |guild, user, name, face, species, price| {
-            let wallet = Wallet { guild, user, name, start: 500 };
-            db.transaction(|tx| buy_pet(tx, wallet, face, kind(species), price, 10)).unwrap()
+        let buy = |guild, user, name, face, case, species, price| {
+            let wallet = Wallet { guild, user, name, start: 3000 };
+            db.transaction(|tx| buy_pet(tx, wallet, face, case, kind(species), price, 10)).unwrap()
         };
-        assert!(buy(7, 1, "Алиса", "alice.png", "valera", 500).is_ok());
-        assert!(buy(7, 2, "Борис", "boris.png", "arkady", 500).is_ok());
-        assert!(buy(8, 3, "Вера", "vera.png", "frog", 500).is_ok());
-        assert!(buy(7, 4, "Глеб", "gleb.png", "frog", 7500).is_err());
+        assert!(buy(7, 1, "Алиса", "alice.png", Case::Cheap, "valera", 1000).is_ok());
+        assert!(buy(7, 2, "Борис", "boris.png", Case::Medium, "arkady", 3000).is_ok());
+        assert!(buy(8, 3, "Вера", "vera.png", Case::Cheap, "frog", 1000).is_ok());
+        assert!(buy(7, 4, "Глеб", "gleb.png", Case::Expensive, "zhorik", 9000).is_err());
         db.delete_pet(db.user_pets(7, 2).unwrap()[0].id).unwrap();
 
         let openings = case_history(&db, 7, 4).unwrap();
         assert_eq!(openings.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["Борис", "Алиса"]);
+        assert_eq!(openings.iter().map(|entry| entry.kind).collect::<Vec<_>>(), [Some(Case::Medium), Some(Case::Cheap)]);
         let history = case_history(&db, 7, 1).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!((history[0].name.as_str(), history[0].species.as_str()), ("Борис", "arkady"));
@@ -994,7 +1016,7 @@ mod tests {
         ).unwrap();
         let wallet = Wallet { guild: 7, user: 1, name: "Алиса", start: 500 };
         wallet.open(&db.lock()).unwrap();
-        assert!(db.transaction(|tx| buy_pet(tx, wallet, "alice.png", kind("valera"), 500, 10)).is_err());
+        assert!(db.transaction(|tx| buy_pet(tx, wallet, "alice.png", Case::Cheap, kind("valera"), 500, 10)).is_err());
         assert_eq!(wallet.open(&db.lock()).unwrap().0, 500);
         assert!(db.user_pets(7, 1).unwrap().is_empty());
         assert!(case_history(&db, 7, 2).unwrap().is_empty());
@@ -1008,7 +1030,7 @@ mod tests {
         assert!(!has_opened_stellochka(&db, 7, 2).unwrap());
         assert!(!has_opened_stellochka(&db, 7, 1).unwrap());
 
-        db.transaction(|tx| buy_pet(tx, wallet, "", kind("stellochka"), 25_000, 10)).unwrap().unwrap();
+        db.transaction(|tx| buy_pet(tx, wallet, "", Case::Secret, kind("stellochka"), 25_000, 10)).unwrap().unwrap();
         assert!(has_opened_stellochka(&db, 7, 1).unwrap());
         assert!(!has_opened_stellochka(&db, 7, 2).unwrap());
         assert!(!has_opened_stellochka(&db, 8, 1).unwrap());
@@ -1019,44 +1041,46 @@ mod tests {
     #[test]
     fn case_purchase_replays_the_original_pet_after_price_changes_and_respects_the_purchase_limit() {
         let db = Database::in_memory().unwrap();
-        let wallet = Wallet { guild: 7, user: 1, name: "Алиса", start: 1000 };
+        let wallet = Wallet { guild: 7, user: 1, name: "Алиса", start: 2000 };
         let mut settings = PetSettings::load(&crate::config::Settings::default());
         settings.max_pets = 1;
-        let request = CaseRequest { id: "first", price: 500 };
+        let request = CaseRequest { id: "first", price: 1000 };
         let (pet, balance) = buy_case(&db, wallet, "alice.png", &settings, Case::Cheap, Some(request))
             .unwrap().unwrap();
-        assert_eq!(balance, 500);
+        assert_eq!(balance, 1000);
         assert!(Case::Cheap.species().any(|allowed| allowed.key == pet.key));
 
-        settings.case_prices[Case::Cheap as usize] = 600;
+        settings.case_prices[Case::Cheap as usize] = 1100;
         let (replayed, balance) = buy_case(&db, wallet, "alice.png", &settings, Case::Cheap, Some(request))
             .unwrap().unwrap();
-        assert_eq!((replayed.key, balance), (pet.key, 500));
+        assert_eq!((replayed.key, balance), (pet.key, 1000));
         assert!(buy_case(&db, wallet, "alice.png", &settings, Case::Medium, Some(request)).unwrap().is_err());
-        let second = Some(CaseRequest { id: "second", price: 600 });
+        let second = Some(CaseRequest { id: "second", price: 1100 });
         assert!(buy_case(&db, wallet, "alice.png", &settings, Case::Cheap, second).unwrap().is_err());
 
         let other = Wallet { user: 2, name: "Борис", ..wallet };
         assert!(buy_case(&db, other, "boris.png", &settings, Case::Cheap, Some(request)).unwrap().is_err());
-        assert_eq!(other.open(&db.lock()).unwrap().0, 1000);
+        assert_eq!(other.open(&db.lock()).unwrap().0, 2000);
         assert!(db.user_pets(7, 2).unwrap().is_empty());
         assert_eq!(db.user_pets(7, 1).unwrap().len(), 1);
-        assert_eq!(case_history(&db, 7, 2).unwrap().len(), 1);
-        assert_eq!(wallet.open(&db.lock()).unwrap().0, 500);
+        let openings = case_history(&db, 7, 2).unwrap();
+        assert_eq!(openings.len(), 1);
+        assert_eq!(openings[0].kind, Some(Case::Cheap));
+        assert_eq!(wallet.open(&db.lock()).unwrap().0, 1000);
     }
 
     #[test]
     fn secret_case_price_choices_and_catalogue() {
         let defaults = PetSettings::load(&crate::config::Settings::default());
-        assert_eq!(defaults.case_prices, [500, 2000, 7500, 25000]);
-        let custom = PetSettings::load(&crate::config::Settings::parse("[pets]\nsecret_case_price = 30000\n"));
-        assert_eq!(custom.case_prices[Case::Secret as usize], 30000);
+        assert_eq!(defaults.case_prices, [1000, 3000, 9000, 30000]);
+        let custom = PetSettings::load(&crate::config::Settings::parse("[pets]\nsecret_case_price = 35000\n"));
+        assert_eq!(custom.case_prices[Case::Secret as usize], 35000);
         let command = open_case();
         let choices = &command.parameters[0].choices;
         assert_eq!(choices.iter().map(|choice| choice.name.as_ref()).collect::<Vec<_>>(),
                    ["📦 Дешёвый", "🎁 Средний", "💎 Дорогой", "🔮 Секретный"]);
         let catalogue = case_catalogue(defaults.case_prices);
-        for text in ["Секретный", "Стеллочка", "Фоидка романа", "Даня собака", "0.05%", "25 000"] {
+        for text in ["Секретный", "Стеллочка", "Фоидка романа", "Даня собака", "0.1%", "30 000"] {
             assert!(catalogue.contains(text), "missing {text}: {catalogue}");
         }
         assert!(catalogue.encode_utf16().count() <= 4096);
@@ -1069,11 +1093,11 @@ mod tests {
         assert_eq!(roll_pet(Case::Secret, 60.0, 0).rarity, "legendary");
         assert_eq!(roll_pet(Case::Secret, 94.949, 0).rarity, "legendary");
         assert_eq!(roll_pet(Case::Secret, 94.95, 0).rarity, "mythic");
-        assert_eq!(roll_pet(Case::Secret, 99.949, 0).rarity, "mythic");
-        for pick in 0..25 { assert_eq!(roll_pet(Case::Secret, 99.95, pick).key, "stellochka"); }
+        assert_eq!(roll_pet(Case::Secret, 99.899, 0).rarity, "mythic");
+        for pick in 0..25 { assert_eq!(roll_pet(Case::Secret, 99.9, pick).key, "stellochka"); }
         assert_eq!(roll_pet(Case::Secret, 99.99999, 3).key, "stellochka");
         let secret = RARITIES.iter().find(|rarity| rarity.key == "secret").unwrap();
-        assert_eq!(secret.chances, [0.0, 0.0, 0.0, 0.05]);
+        assert_eq!(secret.chances, [0.0, 0.0, 0.0, 0.1]);
         assert_eq!(SPECIES.iter().filter(|species| species.rarity == "secret").count(), 1);
         for case in [Case::Cheap, Case::Medium, Case::Expensive] {
             for step in 0..10000 { assert_ne!(roll_pet(case, step as f64 / 100.0, step).rarity, "secret"); }
@@ -1082,7 +1106,12 @@ mod tests {
 
     #[test]
     fn new_pet_economy_and_existing_keys_remain_compatible() {
-        for (key, rarity, hourly) in [("stellochka", "secret", 1500), ("foidka_romana", "mythic", 550), ("danya_dog", "legendary", 170)] {
+        for (key, rarity, hourly) in [
+            ("stellochka", "secret", 2000),
+            ("foidka_romana", "mythic", 550),
+            ("danya_dog", "legendary", 170),
+            ("hermes", "epic", 62),
+        ] {
             let species = kind(key);
             assert_eq!((species.rarity, income(species, 1)), (rarity, hourly));
             assert_eq!(pending(species, 1, 0.0, 3600.0, 24), hourly);
@@ -1122,7 +1151,7 @@ mod tests {
     fn case_contents_are_ordered_from_the_rarest_available_pets() {
         for case in Case::ALL {
             let eligible: Vec<_> = case.species().collect();
-            assert_eq!(eligible.len(), [16, 16, 12, 10][case as usize]);
+            assert_eq!(eligible.len(), [18, 18, 14, 12][case as usize]);
             assert!(eligible.windows(2).all(|pair| {
                 let rank = |species: &Species| RARITIES.iter().position(|rarity| rarity.key == species.rarity);
                 rank(pair[0]) >= rank(pair[1])
@@ -1256,16 +1285,16 @@ mod tests {
     fn upgrade_uses_value_at_the_current_level_and_consumes_one_owned_stake() {
         let db = Database::in_memory().unwrap();
         let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 100 };
-        let stake = kind("valera");
-        let target = kind("vasily");
+        let stake = kind("vasily");
+        let target = kind("sergey");
         let first = db.add_pet(7, 1, stake.key, db::now(), 500).unwrap();
-        db.feed_pet(first, 200, db::now()).unwrap();
+        db.feed_pet(first, feed_cost(stake, 1), db::now()).unwrap();
         let other = db.add_pet(7, 2, stake.key, db::now(), 500).unwrap();
         let upgrade = |id, level, target, roll| upgrade_pet(&db, wallet, &[(id, level)].into(), target, 24, || roll).unwrap();
         assert!(upgrade(other, 1, target, 0).is_err());
         assert!(upgrade(first, 1, target, 0).is_err());
         assert!(upgrade(first, 2, kind("stellochka"), 0).is_err());
-        let chance = (value(stake, 2) * 10_000 / value(target, 1)) as u32;
+        let chance = 3384;
         let won = upgrade(first, 2, target, chance - 1).unwrap();
         assert!(won.won);
         assert_eq!(won.chance, chance);
@@ -1273,8 +1302,8 @@ mod tests {
         let only = db.user_pets(7, 1).unwrap();
         assert_eq!((only.len(), only[0].species.as_str(), only[0].level), (1, target.key, 1));
         let second = db.add_pet(7, 1, stake.key, db::now(), 500).unwrap();
-        let lost = upgrade(second, 1, target, 9999).unwrap();
-        assert!(!lost.won);
+        let lost = upgrade(second, 1, target, 2700).unwrap();
+        assert_eq!((lost.won, lost.chance), (false, 2700));
         assert!(db.own_pet(second, 7, 1).unwrap().is_none());
         assert!(db.own_pet(other, 7, 2).unwrap().is_some());
     }
@@ -1296,8 +1325,7 @@ mod tests {
         assert_eq!(db.user_pets(7, 1).unwrap().len(), 2);
 
         let stakes = [(first, 2), (second, 1)].into();
-        let value = value(kind("valera"), 2) + value(kind("valera"), 1);
-        let chance = (value * 10_000 / target.sale_price) as u32;
+        let chance = 1320;
         let result = upgrade_pet(&db, wallet, &stakes, target, 24, || chance - 1).unwrap().unwrap();
         assert_eq!((result.won, result.chance), (true, chance));
         assert!(upgrade_pet(&db, wallet, &stakes, target, 24, || 0).unwrap().is_err());
@@ -1325,7 +1353,7 @@ mod tests {
 
         let sale = sell_inventory_pets(&db, wallet, &[id].into(), 24, || 3600.0).unwrap().unwrap();
         assert_eq!(sale.earned, 0);
-        assert_eq!(sale.balance, 115 + kind("valera").sale_price);
+        assert_eq!(sale.balance, 415);
     }
 
     #[test]
@@ -1342,11 +1370,11 @@ mod tests {
         let sell = |pet| sell_owned_pet(&db, wallet, pet, species, 24, || 7200.0).unwrap();
 
         assert_eq!(sell(&stale), None);
-        assert_eq!(sell(&first), Some((20, 320)));
-        assert_eq!(sell(&second), Some((24, 594)));
+        assert_eq!(sell(&first), Some((20, 420)));
+        assert_eq!(sell(&second), Some((24, 804)));
         assert_eq!(sell(&second), None);
         assert!(db.user_pets(7, 1).unwrap().is_empty());
-        assert_eq!(db.wallet(7, 1, "Alice", 100).unwrap().0, 594);
+        assert_eq!(db.wallet(7, 1, "Alice", 100).unwrap().0, 804);
     }
 
     #[test]
@@ -1378,10 +1406,10 @@ mod tests {
         assert!(sell(&invalid).is_err());
         assert_eq!(db.user_pets(7, 1).unwrap().len(), 2);
         let paid = sell(&selected).unwrap();
-        assert_eq!((paid.payout, paid.earned, paid.balance), (420, 20, 520));
+        assert_eq!((paid.payout, paid.earned, paid.balance), (620, 20, 720));
         assert!(sell(&selected).is_err());
         assert_eq!(db.user_pets(7, 2).unwrap()[0].id, foreign);
-        assert_eq!(db.wallet(7, 1, "Alice", 0).unwrap().0, 520);
+        assert_eq!(db.wallet(7, 1, "Alice", 0).unwrap().0, 720);
     }
 
     #[test]
@@ -1399,17 +1427,39 @@ mod tests {
     }
 
     #[test]
+    fn oleg_has_fixed_feed_cost_and_gains_one_coin_per_hour_at_each_level() {
+        let db = Database::in_memory().unwrap();
+        let wallet = Wallet { guild: 7, user: 1, name: "Alice", start: 2_000_000 };
+        let settings = PetSettings::load(&crate::config::Settings::default());
+        let species = kind("fat_oleg");
+        assert_eq!((species.rarity, income(species, 1), value(species, 1)), ("mythic", 533, 15_990));
+        let id = db.add_pet(7, 1, species.key, db::now(), 500).unwrap();
+        let upgrade = |level| feed_owned_pet(&db, wallet, id, &settings, Some(level)).unwrap();
+
+        let first = upgrade(1).unwrap();
+        assert_eq!((first.pet.level, first.cost, first.balance), (2, 1_000_000, 1_000_000));
+        assert_eq!(income(species, first.pet.level), 534);
+        let second = upgrade(2).unwrap();
+        assert_eq!((second.pet.level, second.cost, second.balance), (3, 1_000_000, 0));
+        assert_eq!(income(species, second.pet.level), 535);
+        assert!(upgrade(3).is_err());
+        assert_eq!(db.own_pet(id, 7, 1).unwrap().unwrap().level, 3);
+    }
+
+    #[test]
     fn sale_prices_follow_income_and_keep_resale_below_case_cost_on_average() {
-        let prices = SPECIES.iter().map(|species| species.sale_price).collect::<std::collections::HashSet<_>>();
-        assert_eq!(prices.len(), SPECIES.len());
-        assert!(prices.iter().all(|&price| price > 0));
+        for species in &SPECIES {
+            assert!(value(species, 1) > 0);
+            for level in 1..=20 {
+                assert_eq!(value(species, level), income(species, level) * 30);
+            }
+        }
+        assert_eq!(value(kind("stellochka"), 1), 60_000);
 
         let mut expected = [0.0; Case::ALL.len()];
         for rarity in &RARITIES {
-            let mut kinds: Vec<_> = SPECIES.iter().filter(|species| species.rarity == rarity.key).collect();
-            kinds.sort_by_key(|species| (species.income, species.sale_price));
-            assert!(kinds.windows(2).all(|pair| pair[0].sale_price < pair[1].sale_price), "{}", rarity.key);
-            let average = kinds.iter().map(|species| species.sale_price).sum::<i64>() as f64 / kinds.len() as f64;
+            let kinds: Vec<_> = SPECIES.iter().filter(|species| species.rarity == rarity.key).collect();
+            let average = kinds.iter().map(|species| value(species, 1)).sum::<i64>() as f64 / kinds.len() as f64;
             for (payout, chance) in expected.iter_mut().zip(rarity.chances) {
                 *payout += average * chance / 100.0;
             }
@@ -1425,7 +1475,9 @@ mod tests {
         assert_eq!(roll_pet(Case::Cheap, 0.0, 0).rarity, "common");
         assert_eq!(roll_pet(Case::Cheap, 74.9, 0).rarity, "common");
         assert_eq!(roll_pet(Case::Cheap, 75.0, 0).rarity, "rare");
+        assert_eq!(roll_pet(Case::Cheap, 95.1, 3).key, "hermes");
         assert_eq!(roll_pet(Case::Cheap, 99.995, 0).key, "sergey");
+        assert_eq!(roll_pet(Case::Cheap, 99.995, 2).key, "fat_oleg");
         assert_eq!(roll_pet(Case::Expensive, 0.0, 0).rarity, "rare"); // обычных в дорогом кейсе нет
         assert_eq!(roll_pet(Case::Expensive, 99.0, 5).rarity, "mythic");
         assert_eq!(roll_pet(Case::Medium, 50.0, 1).key, "tamara");

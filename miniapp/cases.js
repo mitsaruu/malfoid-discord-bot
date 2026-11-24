@@ -132,7 +132,8 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   const coinForms = { one: "монета", few: "монеты", many: "монет", other: "монеты" };
   const illustratedPets = new Set([
     "valera", "gena", "tolik", "frog", "arkady", "tamara", "boris",
-    "igor", "edik", "zhorik", "vasily", "lyudmila", "lion", "danya_dog", "sergey", "foidka_romana",
+    "igor", "edik", "zhorik", "hermes", "vasily", "lyudmila", "lion", "danya_dog",
+    "sergey", "foidka_romana", "fat_oleg",
   ]);
   let pending = null;
   let historyTimer = null;
@@ -535,9 +536,13 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
         nameEl.textContent = opening.name;
         nameEl.title = opening.name;
         row.querySelector(".case-opening-initial").textContent = firstLetter(opening.name);
+        const chest = row.querySelector(".case-opening-chest");
+        const caseName = opening.case_name ? `Кейс «${opening.case_name}»` : "Кейс";
+        chest.title = caseName;
+        if (opening.case_key) chest.dataset.case = opening.case_key;
         const secret = opening.pet.rarity === "secret";
-        row.querySelector(".case-opening-pet").setAttribute("aria-label",
-          secret ? "Из сундука выпал секретный питомец" : `Из сундука выпал питомец «${opening.pet.name}»`);
+        const petName = secret ? "Секретный питомец" : opening.pet.name;
+        row.querySelector(".case-opening-pet").setAttribute("aria-label", `${caseName} → ${petName}`);
         if (secret) showSecretSilhouette(row);
         else showPetArt(row, opening.pet);
         showAvatar(row.querySelector(".case-opening-avatar img"), signal, opening.id);
