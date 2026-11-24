@@ -1,4 +1,4 @@
-//! Экономика: /balance, /work, /daily, /give_money, /coinflip. Тексты и правила — как в bot.py.
+//! Экономика: /balance, /work, /daily, /give_money. Тексты и правила — как в bot.py.
 
 use crate::db::Wallet;
 use crate::reply::{display_name, insufficient_money, say, user_name, whisper};
@@ -167,16 +167,6 @@ fn transfer_money(
 }
 
 /// Результат мгновенной игры: множитель выплаты 0 проигрывает ставку, 1 возвращает её.
-fn settle_bet(
-    database: &db::Database,
-    wallet: Wallet<'_>,
-    input: &str,
-    minimum: i64,
-    multiplier: i64,
-) -> rusqlite::Result<Result<(i64, i64), String>> {
-    database.transaction(|tx| settle_bet_on(tx, wallet, input, minimum, multiplier))
-}
-
 pub(crate) fn settle_bet_on(
     tx: &rusqlite::Transaction<'_>,
     wallet: Wallet<'_>,
@@ -308,11 +298,9 @@ pub async fn give_money(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, poise::ChoiceParameter)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CoinSide {
-    #[name = "🦅 Орёл"]
     Heads,
-    #[name = "🪙 Решка"]
     Tails,
 }
 
@@ -332,32 +320,6 @@ impl CoinSide {
     pub(crate) fn payout_multiplier(self, result: Self) -> i64 {
         if self == result { 2 } else { 0 }
     }
-}
-
-/// Подбросить монету на ставку (угадал — ставка удваивается)
-#[poise::command(slash_command, guild_only)]
-pub async fn coinflip(
-    ctx: Context<'_>,
-    #[description = "Сколько монет поставить или all — все монеты"] bet: String,
-    #[description = "На что ставишь"] side: CoinSide,
-) -> Result<(), Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let (start, name) = (data.economy.start_balance, display_name(ctx).await);
-    let result = CoinSide::roll();
-    let wallet = Wallet { guild, user, name: &name, start };
-    let multiplier = side.payout_multiplier(result);
-    let (bet, new_balance) = match settle_bet(&data.db, wallet, &bet, data.economy.min_bet, multiplier)? {
-        Ok(result) => result,
-        Err(problem) => return whisper(ctx, problem).await,
-    };
-    let shown = if result == CoinSide::Heads { "Выпал **орёл** 🦅" } else { "Выпала **решка** 🪙" };
-    let text = if result == side {
-        format!("{shown}\n🎉 <@{user}> угадывает и выигрывает **+{}**!", money_text(bet))
-    } else {
-        let chosen = if side == CoinSide::Heads { "орёл" } else { "решка" };
-        format!("{shown}\n😔 <@{user}> ставил(а) на «{chosen}» и проигрывает {}.", money_text(bet))
-    };
-    say(ctx, format!("{text}\nБаланс: {}", money_text(new_balance))).await
 }
 
 #[cfg(test)]

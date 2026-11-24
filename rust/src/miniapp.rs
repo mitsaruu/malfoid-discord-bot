@@ -5,8 +5,8 @@
 use crate::pets::{self, Case};
 use crate::wordboard::{self, Player};
 use crate::words::{self, Lang};
-use crate::{rocket, Shared};
-use axum::extract::{DefaultBodyLimit, Path, State};
+use crate::{ai_activity, ai_math, rocket, Shared};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -139,9 +139,9 @@ async fn index(State(app): State<App>) -> Response {
 /// Разрешённые файлы интерфейса.
 async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Response {
     match name.as_str() {
-        "style.css" | "cases.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
+        "style.css" | "ai-chat.css" | "cases.css" | "rocket.css" | "casino.css" | "roulette.css" | "coinflip.css" | "durak.css" | "durak_online.css" =>
             file(&app, &name, "text/css; charset=utf-8").await,
-        "app.js" | "audio.js" | "game_avatars.js" | "cases.js" | "cases-inventory.js" | "cases-upgrade.js" | "cases-contract.js" | "cases-leaderboard.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
+        "app.js" | "ai-chat.js" | "audio.js" | "game_avatars.js" | "cases.js" | "cases-inventory.js" | "cases-upgrade.js" | "cases-contract.js" | "cases-leaderboard.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         "lobby-games.webp" | "pet-cases.webp" | "secret-pet-silhouette.webp" => file(&app, &name, "image/webp").await,
         "menu-ambient.mp3" | "case-opening.mp3" | "case-secret.mp3" =>
@@ -835,6 +835,56 @@ async fn session_avatar(app: &Miniapp, guild: u64, user: u64) -> Reply {
     Ok(([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "private, no-store")], bytes).into_response())
 }
 
+fn ai_activity_error(error: ai_activity::Error) -> Response {
+    if let ai_activity::Error::Storage(source) = &error {
+        eprintln!("Не удалось обработать чат Mini App: {source}");
+    }
+    ([(header::CACHE_CONTROL, "private, no-store")], json_error(error.message(), error.status())).into_response()
+}
+
+fn ai_json(body: Value) -> Response {
+    ([(header::CACHE_CONTROL, "private, no-store")], Json(body)).into_response()
+}
+
+async fn ai_overview(State(app): State<App>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let overview = ai_activity::overview(&app.data, session.user).map_err(ai_activity_error)?;
+    Ok(ai_json(overview))
+}
+
+async fn ai_chat(State(app): State<App>, Path(chat): Path<String>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let history = ai_activity::chat(&app.data, session.user, &chat).map_err(ai_activity_error)?;
+    Ok(ai_json(ai_math::render_activity_turns(history).await.map_err(failed)?))
+}
+
+async fn ai_send(State(app): State<App>, incoming: Request) -> Reply {
+    let (_, session) = app.authorized(incoming.headers(), None, false).await?;
+    let Json(body) = Json::<Value>::from_request(incoming, &app).await.map_err(|error| {
+        let status = error.status();
+        let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "Запрос слишком большой. Прикрепи изображение до 4 МБ."
+        } else {
+            "Не удалось прочитать сообщение. Попробуй отправить его ещё раз."
+        };
+        json_error(message, status)
+    })?;
+    let request = ai_activity::Request::from_json(&body).map_err(ai_activity_error)?;
+    drop(body);
+    let history = ai_activity::send(&app.data, session.user, request).await.map_err(ai_activity_error)?;
+    Ok(ai_json(ai_math::render_activity_turns(history).await.map_err(failed)?))
+}
+
+async fn ai_image(State(app): State<App>, Path(turn): Path<String>, headers: HeaderMap) -> Reply {
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let (mime, bytes) = ai_activity::image(&app.data, session.user, &turn).map_err(ai_activity_error)?;
+    Ok(([
+        (header::CONTENT_TYPE, mime.as_str()),
+        (header::CACHE_CONTROL, "private, no-store"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ], bytes).into_response())
+}
+
 pub fn router(app: App) -> axum::Router {
     axum::Router::new()
         .route("/", get(index))
@@ -842,6 +892,10 @@ pub fn router(app: App) -> axum::Router {
         .route("/static/pets/{name}", get(pet_art))
         .route("/api/config", get(config))
         .route("/api/token", post(token))
+        .route("/api/ai", get(ai_overview))
+        .route("/api/ai/chats/{chat}", get(ai_chat))
+        .route("/api/ai/send", post(ai_send).layer(DefaultBodyLimit::max(6 * 1024 * 1024)))
+        .route("/api/ai/image/{turn}", get(ai_image))
         .route("/api/state", get(state))
         .route("/api/guess", post(guess))
         .route("/api/new", post(new_game))

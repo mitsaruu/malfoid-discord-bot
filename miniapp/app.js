@@ -38,6 +38,7 @@ let state = null;     // состояние партии с сервера
 let typed = "";       // что игрок сейчас набирает
 let busy = false;     // ждём ответа сервера
 let activeGame = null;
+let aiChat = null;
 let rocket = null;
 let casesView = null;
 const casesRoot = document.getElementById("cases");
@@ -50,7 +51,10 @@ const casinoViews = new Map();
 
 const gameSwitch = document.getElementById("game-switch");
 const gameLobby = document.getElementById("game-lobby");
-const gameLinks = [...gameSwitch.querySelectorAll("button"), ...gameLobby.querySelectorAll("button[data-game]")];
+const aiLink = document.getElementById("activity-ai-link");
+const navLinks = [...gameSwitch.querySelectorAll("button[data-game]")];
+if (aiLink) navLinks.push(aiLink);
+const gameLinks = [...navLinks, ...gameLobby.querySelectorAll("button[data-game]")];
 const wordsRetry = document.getElementById("words-retry");
 
 // ---------- Связь с Discord (минимальный Embedded App SDK) ----------
@@ -82,6 +86,7 @@ window.addEventListener("message", (event) => {
     }
     pending.clear();
     session = null;
+    aiChat?.disconnect(reason);
     window.GameAudio?.stopGame();
     window.GameAudio?.setLobby(false);
     if (activeGame === "rocket" && rocket) rocket.disconnect(reason);
@@ -92,7 +97,7 @@ window.addEventListener("message", (event) => {
       root.textContent = reason;
     }
     else if (activeGame === "words") setStatus(reason, "error");
-    else gameLobby.querySelector("h1").textContent = reason;
+    else if (activeGame !== "ai") gameLobby.querySelector("h1").textContent = reason;
     for (const button of gameLinks) button.disabled = true;
     return;
   }
@@ -131,7 +136,7 @@ function connectToDiscord(clientId) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       onReady = null;
-      reject(new Error("Discord не подтвердил запуск Activity. Закрой игру и снова вызови /games."));
+      reject(new Error("Discord не подтвердил запуск Activity. Открой мини-приложение заново."));
     }, 15000);
     onReady = () => {
       clearTimeout(timer);
@@ -170,7 +175,7 @@ async function api(path, body, { signal = AbortSignal.timeout(path === "api/toke
   return data;
 }
 
-async function loadGameAvatar(path, signal = AbortSignal.timeout(8000)) {
+async function loadActivityImage(path, signal = AbortSignal.timeout(8000)) {
   if (!session) return null;
   const response = await fetch(path, {
     headers: { Authorization: `Bearer ${session}` }, signal,
@@ -178,7 +183,7 @@ async function loadGameAvatar(path, signal = AbortSignal.timeout(8000)) {
   return response.ok ? response.blob() : null;
 }
 
-const gameAvatar = user => loadGameAvatar(`api/game-avatar/${encodeURIComponent(user)}.png`);
+const gameAvatar = user => loadActivityImage(`api/game-avatar/${encodeURIComponent(user)}.png`);
 
 // ---------- Экран загрузки ----------
 function loading(text, percent) {
@@ -517,6 +522,7 @@ async function loadWords() {
 function openGame(game) {
   if (game === activeGame) return;
   window.GameAudio?.stopGame();
+  if (activeGame === "ai") aiChat?.hide();
   if (activeGame === "rocket") rocket?.hide();
   if (activeGame === "cases") casesView?.hide();
   casinoViews.get(activeGame)?.hide();
@@ -524,6 +530,8 @@ function openGame(game) {
   document.body.dataset.game = game;
   window.GameAudio?.setLobby(game === "lobby");
   const words = game === "words";
+  const aiRoot = document.getElementById("ai-chat");
+  if (aiRoot) aiRoot.hidden = game !== "ai";
   gameLobby.hidden = game !== "lobby";
   document.getElementById("app").hidden = !words;
   playersEl.hidden = !words;
@@ -534,10 +542,14 @@ function openGame(game) {
     if (view) view.hidden = id !== game;
   }
   helpEl.hidden = true;
-  for (const button of gameSwitch.querySelectorAll("button[aria-pressed]")) {
+  for (const button of navLinks) {
     button.setAttribute("aria-pressed", String(button.dataset.game === game));
   }
-  if (game === "lobby") {
+  if (game === "ai") {
+    document.title = "Чат с ИИ · Malfoid";
+    document.documentElement.lang = "ru";
+    aiChat?.show();
+  } else if (game === "lobby") {
     document.title = "Игры Malfoid";
     document.documentElement.lang = "ru";
   } else if (words) {
@@ -574,7 +586,7 @@ function openGame(game) {
         return api(`api/games/${game}/${action}`, fields);
       };
       const avatar = game === "durak"
-        ? (room, user) => loadGameAvatar(`api/durak/avatar/${encodeURIComponent(room)}/${encodeURIComponent(user)}.png`)
+        ? (room, user) => loadActivityImage(`api/durak/avatar/${encodeURIComponent(room)}/${encodeURIComponent(user)}.png`)
         : gameAvatar;
       casinoViews.set(game, mount({ root, request, avatar, profile: game === "durak" ? activityProfile : null }));
     }
@@ -586,11 +598,11 @@ for (const button of gameLinks) {
   button.addEventListener("click", () => {
     if (activeGame === button.dataset.game) return;
     openGame(button.dataset.game);
-    const navButton = gameSwitch.querySelector('[aria-pressed="true"]');
-    if (gameSwitch.scrollWidth > gameSwitch.clientWidth) {
+    const navButton = navLinks.find(link => link.dataset.game === activeGame);
+    if (navButton && gameSwitch.contains(navButton) && gameSwitch.scrollWidth > gameSwitch.clientWidth) {
       navButton.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
-    const heading = document.getElementById(navButton.getAttribute("aria-controls")).querySelector("h1");
+    const heading = document.getElementById(navButton?.getAttribute("aria-controls"))?.querySelector("h1");
     if (heading) {
       heading.tabIndex = -1;
       heading.focus();
@@ -607,7 +619,7 @@ async function start() {
   buildBoard();
   setLanguage("ru");
   if (!params.get("frame_id")) {
-    loadingFailed("Откройте мини-приложение внутри Discord через /games или меню приложений.");
+    loadingFailed("Откройте мини-приложение внутри Discord.");
     return;
   }
   try {
@@ -627,6 +639,19 @@ async function start() {
       activityProfile = { name: login.name, avatar: () => gameAvatar(login.user_id) };
     }
     await discordCommand("AUTHENTICATE", { access_token: login.access_token });
+    if (typeof createAiChat === "function" && document.getElementById("ai-chat")) {
+      aiChat = createAiChat({
+        request: (path, body, signal) => api(path, body, {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(path === "api/ai/send" ? 200000 : 15000)]),
+        }),
+        image: (turn, signal) => loadActivityImage(
+          `api/ai/image/${encodeURIComponent(turn)}`,
+          AbortSignal.any([signal, AbortSignal.timeout(8000)]),
+        ),
+        profile: activityProfile,
+      });
+      if (aiLink) aiLink.hidden = false;
+    }
     if (typeof createCasesView === "function" && casesRoot) {
       casesView = createCasesView({
         root: casesRoot,
@@ -643,7 +668,7 @@ async function start() {
         ),
         openCase: (order) => api("api/cases/open", order),
         history: (signal) => api("api/cases/history", undefined, { signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) }),
-        avatar: (signal, openingId) => loadGameAvatar(
+        avatar: (signal, openingId) => loadActivityImage(
           openingId ? `api/cases/history/${encodeURIComponent(openingId)}.png` : "api/cases/avatar.png",
           AbortSignal.any([signal, AbortSignal.timeout(8000)]),
         ),
@@ -652,11 +677,13 @@ async function start() {
     if (typeof createRocketView === "function") {
       rocket = createRocketView((path, body) => api(path, body, {
         signal: AbortSignal.timeout(path === "api/rocket/start" ? 12000 : 5000),
-      }), (user) => loadGameAvatar(`api/rocket/avatar/${encodeURIComponent(user)}.png`), gameAvatar);
+      }), (user) => loadActivityImage(`api/rocket/avatar/${encodeURIComponent(user)}.png`), gameAvatar);
     }
     gameSwitch.hidden = false;
     document.getElementById("game-audio").hidden = false;
-    openGame(login.game === "words" ? "words" : "lobby");
+    const initialGame = login.game === "ai" && aiChat ? "ai"
+      : login.game === "words" ? "words" : "lobby";
+    openGame(initialGame);
     hideSplash();
     setInterval(() => {
       loadWords();

@@ -10,6 +10,7 @@
 mod admin;
 mod backups;
 mod ai;
+mod ai_activity;
 mod ai_commands;
 mod ai_math;
 mod blackjack;
@@ -273,17 +274,25 @@ async fn register_globally(token: &str, app_id: u64, commands: &[poise::Command<
     if !status.is_success() {
         return Err(format!("Discord не отдал список команд: {status} {text}").into());
     }
-    let existing: Vec<serde_json::Value> = serde_json::from_str(&text)?;
-    let mut payload = serde_json::to_value(poise::builtins::create_application_commands(commands))?;
-    let ours = payload.as_array().map_or(0, Vec::len);
-    let entry_points: Vec<serde_json::Value> = existing.into_iter().filter(|command| command["type"] == 4).collect();
-    payload.as_array_mut().ok_or("список команд — не массив")?.extend(entry_points);
-    let response = web.put(&url).header("Authorization", &auth).header("Content-Type", "application/json").body(payload.to_string()).send().await?;
+    let existing = serde_json::from_str(&text)?;
+    let (payload, ours) = global_command_payload(commands, existing)?;
+    let response = web.put(&url).header("Authorization", &auth).header("Content-Type", "application/json").body(serde_json::to_string(&payload)?).send().await?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("Discord не принял команды: {status} {}", response.text().await.unwrap_or_default()).into());
     }
     Ok(ours)
+}
+
+fn global_command_payload(
+    commands: &[poise::Command<Shared, Error>],
+    existing: Vec<serde_json::Value>,
+) -> Result<(Vec<serde_json::Value>, usize), serde_json::Error> {
+    let mut payload = poise::builtins::create_application_commands(commands)
+        .into_iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>()?;
+    let count = payload.len();
+    payload.extend(existing.into_iter().filter(|command| command["type"] == 4));
+    Ok((payload, count))
 }
 
 /// Раз в 20 секунд: напоминания, у которых пришло время, и опросы, которые пора закрыть.
@@ -317,15 +326,8 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         economy::work(),
         economy::daily(),
         economy::give_money(),
-        economy::coinflip(),
         blackjack::blackjack(),
-        pets::open_case(),
-        pets::cases(),
-        pets::show_pets(),
         pets::pets_collect(),
-        pets::pet_feed(),
-        pets::pet_sell(),
-        pets::pet_battle(),
         pets::pet_trade(),
         shop::shop(),
         shop::shop_buy(),
@@ -356,7 +358,6 @@ fn bot_commands() -> Vec<poise::Command<Shared, Error>> {
         admin::warns_clear(),
         weather::weather(),
         weather::weather_cities(),
-        ai_commands::ask(),
         ai_commands::forget(),
         ai_commands::ai_limits(),
         ai_commands::summary(),
@@ -613,20 +614,25 @@ mod tests {
         assert_eq!(names.len(), list.len());
         let games = list.iter().find(|c| c["name"] == "games").unwrap();
         assert!(games["options"].as_array().is_none_or(Vec::is_empty));
-        for retired in ["slovo", "wort", "words", "rocket", "slots", "roulette", "admin_money"] {
-            assert!(!names.contains(retired));
+        for retired in [
+            "slovo", "wort", "words", "rocket", "slots", "roulette", "admin_money",
+            "ask", "case", "cases", "pet_battle", "coinflip", "pets", "pet_sell", "pet_feed",
+        ] {
+            assert!(!names.contains(retired), "/{retired} is still in the guild payload");
         }
         assert!(!names.contains("welcome_channel"));
         assert!(names.contains("music_channel") && names.contains("status"));
-        assert!(names.contains("coinflip") && names.contains("blackjack"));
+        for active in ["blackjack", "pets_collect", "pet_trade", "forget", "ai_limits", "summary", "quiz"] {
+            assert!(names.contains(active), "/{active} is missing from the guild payload");
+        }
         #[cfg(feature = "voice")]
         {
-            assert_eq!(names.len(), 76);
+            assert_eq!(names.len(), 68);
             assert!(names.contains("favorites") && names.contains("history"));
         }
         #[cfg(not(feature = "voice"))]
         {
-            assert_eq!(names.len(), 55);
+            assert_eq!(names.len(), 47);
             assert!(!names.contains("favorites") && !names.contains("history"));
         }
     }
@@ -634,14 +640,32 @@ mod tests {
     /// Список команд для Discord собирается в JSON, который принимает массовое обновление (PUT).
     #[test]
     fn command_payload() {
-        let commands = vec![super::economy::coinflip(), super::admin::set_games_channel()];
+        let commands = vec![super::economy::give_money(), super::admin::set_games_channel()];
         let payload = serde_json::to_value(poise::builtins::create_application_commands(&commands)).unwrap();
         let list = payload.as_array().unwrap();
         assert_eq!(list.len(), 2);
-        assert_eq!(list[0]["name"], "coinflip");
+        assert_eq!(list[0]["name"], "give_money");
         assert_eq!(list[0]["options"].as_array().unwrap().len(), 2);
         assert_eq!(list[1]["name"], "games_channel");
         assert_eq!(list[1]["default_member_permissions"], "32"); // Manage Server
+    }
+
+    #[test]
+    fn global_payload_replaces_stale_commands_and_keeps_the_entry_point() {
+        use serde_json::json;
+
+        let commands = super::bot_commands();
+        let guild_payload = poise::builtins::create_application_commands(&commands);
+        let expected = serde_json::to_value(guild_payload).unwrap();
+        let entry_point = json!({"id": "42", "type": 4, "name": "launch", "description": "Open the Activity", "handler": 2});
+        let mut existing = ["ask", "case", "cases", "pet_battle", "coinflip", "pets", "pet_sell", "pet_feed"]
+            .map(|name| json!({"type": 1, "name": name})).to_vec();
+        existing.push(entry_point.clone());
+        let (payload, count) = super::global_command_payload(&commands, existing).unwrap();
+        assert_eq!(count, expected.as_array().unwrap().len());
+        assert_eq!(payload.len(), count + 1);
+        assert_eq!(&payload[..count], expected.as_array().unwrap());
+        assert_eq!(payload[count], entry_point);
     }
 
     #[test]

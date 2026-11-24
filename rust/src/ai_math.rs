@@ -30,7 +30,7 @@ blockquote { border-inline-start: .2em solid GrayText; margin-inline: 0; padding
 "#;
 
 fn parser(text: &str) -> Parser<'_> {
-    Parser::new_ext(text, Options::ENABLE_MATH | Options::ENABLE_TABLES)
+    Parser::new_ext(text, Options::ENABLE_MATH | Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH)
 }
 
 pub fn contains_math(text: &str) -> bool {
@@ -72,55 +72,100 @@ pub fn render(text: &str) -> Option<MathAnswer> {
         return None;
     }
 
-    let converter = LatexToMathML::new(MathCoreConfig::default(), vec![]).ok()?;
     let mut output = HTML_START.to_string();
     let mut discord = String::with_capacity(text.len());
     let mut offset = 0;
+    render_markup(text, &mut output, false, |latex, display, range| {
+        discord.push_str(&text[offset..range.start]);
+        offset = range.end;
+        let code = latex.replace('`', "｀");
+        if matches!(display, MathDisplay::Block) || code.contains('\n') || code.len() > 600 {
+            discord.push_str(&format!("\n```\n{}\n```\n", code.trim()));
+        } else {
+            discord.push_str(&format!("`{code}`"));
+        }
+    });
+    discord.push_str(&text[offset..]);
+    output.push_str("</main></body></html>");
+    Some(MathAnswer { html: output, discord })
+}
+
+/// The returned fragment is safe to insert into the Activity document.
+fn render_markup(
+    text: &str, output: &mut String, allow_links: bool,
+    mut formula: impl FnMut(&str, MathDisplay, std::ops::Range<usize>),
+) {
+    let converter = text.contains('$').then(|| LatexToMathML::new(MathCoreConfig::default(), vec![]).ok()).flatten();
+    let mut link = false;
 
     html::push_html(
-        &mut output,
+        output,
         parser(text)
             .into_offset_iter()
             .filter_map(|(event, range)| {
                 let (latex, display) = match event {
                     Event::InlineMath(latex) => (latex, MathDisplay::Inline),
                     Event::DisplayMath(latex) => (latex, MathDisplay::Block),
-                    // Ответ модели не может включать активный HTML, ссылки или внешние изображения.
+                    // Raw markup and externally loaded images are untrusted.
                     Event::Html(raw) | Event::InlineHtml(raw) => return Some(Event::Text(raw)),
-                    Event::Start(Tag::Link { .. } | Tag::Image { .. })
-                    | Event::End(TagEnd::Link | TagEnd::Image) => return None,
+                    Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => return None,
+                    Event::Start(ref tag @ Tag::Link { ref dest_url, .. }) => {
+                        link = allow_links && reqwest::Url::parse(dest_url).is_ok_and(|url| {
+                            matches!(url.scheme(), "https" | "http") && url.has_host()
+                        });
+                        return link.then(|| Event::Start(tag.clone()));
+                    }
+                    Event::End(TagEnd::Link) => return std::mem::take(&mut link).then_some(event),
                     event => return Some(event),
                 };
-                discord.push_str(&text[offset..range.start]);
-                offset = range.end;
-                let code = latex.replace('`', "｀");
-                if matches!(display, MathDisplay::Block) || code.contains('\n') || code.len() > 600
-                {
-                    discord.push_str(&format!("\n```\n{}\n```\n", code.trim()));
-                } else {
-                    discord.push_str(&format!("`{code}`"));
-                }
-
-                let rendered = (latex.len() <= MAX_FORMULA_BYTES)
-                    .then(|| converter.convert_with_local_state(&latex, display).ok())
-                    .flatten();
+                formula(&latex, display, range);
+                let rendered = converter.as_ref().filter(|_| latex.len() <= MAX_FORMULA_BYTES)
+                    .and_then(|converter| converter.convert_with_local_state(&latex, display).ok());
                 Some(match rendered {
                     Some(math) => Event::Html(math.mathml.into()),
                     None => Event::Code(latex), // неизвестная команда LaTeX: сохраняем формулу, не теряем весь ответ
                 })
             }),
     );
-    discord.push_str(&text[offset..]);
-    output.push_str("</main></body></html>");
-    Some(MathAnswer {
-        html: output,
-        discord,
-    })
+}
+
+fn activity_markup(text: &str) -> Option<String> {
+    if text.len() > MAX_ANSWER_BYTES { return None; }
+    let mut html = String::with_capacity(text.len());
+    render_markup(text, &mut html, true, |_, _, _| {});
+    (html.len() <= MAX_ATTACHMENT_BYTES).then_some(html)
+}
+
+pub async fn render_activity_turns(mut response: serde_json::Value) -> Result<serde_json::Value, tokio::task::JoinError> {
+    let slot = RENDER_SLOTS.acquire().await.expect("render semaphore stays open");
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        if let Some(turns) = response.get_mut("turns").and_then(serde_json::Value::as_array_mut) {
+            for turn in turns {
+                if let Some(markup) = turn["answer"].as_str().and_then(activity_markup) {
+                    turn["answer_html"] = serde_json::Value::String(markup);
+                }
+            }
+        }
+        response
+    }).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_accepts_markdown_and_math_and_escapes_untrusted_content() {
+        let text = "**Жирный** $x_1$\n\n$$\\frac{1}{2}$$\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n\x60\x60\x60js\nalert(1)\n\x60\x60\x60\n\n<span onclick=alert(1)>X</span> ![alt](https://example.com/image.png) [опасно](javascript:alert%281%29) [ссылка](https://example.com/)";
+        let html = activity_markup(text).unwrap();
+        for expected in ["<strong>", "<msub>", "<mfrac>", "<table>", "<pre><code", "&lt;span", "href=\"https://example.com/\""] {
+            assert!(html.contains(expected), "{expected} missing from {html}");
+        }
+        for unsafe_tag in ["<span", "<img", "href=\"javascript:"] {
+            assert!(!html.contains(unsafe_tag), "{unsafe_tag} active in {html}");
+        }
+    }
 
     #[test]
     fn renders_math_from_the_report_and_keeps_the_table() {

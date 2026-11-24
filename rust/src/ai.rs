@@ -1,5 +1,5 @@
 //! Ядро ИИ: запросы к Gemini, характер и правила, лимиты, память разговора, грубость.
-//! Команды (/ask, /summary, /quiz…) — в ai_commands.rs.
+//! Команды (/summary, /quiz…) — в ai_commands.rs.
 
 use crate::moderation::Requester;
 use crate::text::plural;
@@ -7,7 +7,7 @@ use crate::{db, Data};
 use base64::Engine;
 use poise::serenity_prelude as serenity;
 use serde_json::{json, Value};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ pub struct AiSettings {
 
 pub const HYDROGEN_MODEL: &str = "gemini-4-hydrogen";
 pub const FLASH_LITE_MODEL: &str = "gemini-3.5-flash-lite";
-pub const HYDROGEN_DAILY_LIMIT: i64 = 4;
+pub const HYDROGEN_DAILY_LIMIT: i64 = 3;
 
 #[derive(Debug, Clone, Copy, Default, poise::ChoiceParameter)]
 pub enum ModelChoice {
@@ -95,9 +95,13 @@ pub fn moscow_day_at(now: chrono::DateTime<chrono::Utc>) -> String {
 pub fn moscow_day() -> String { moscow_day_at(chrono::Utc::now()) }
 
 pub fn moscow_reset_time() -> i64 {
+    moscow_reset_time_at(chrono::Utc::now())
+}
+
+pub(crate) fn moscow_reset_time_at(now: chrono::DateTime<chrono::Utc>) -> i64 {
     use chrono::TimeZone;
     let zone = chrono_tz::Europe::Moscow;
-    let next = chrono::Utc::now().with_timezone(&zone).date_naive() + chrono::Duration::days(1);
+    let next = now.with_timezone(&zone).date_naive() + chrono::Duration::days(1);
     zone.from_local_datetime(&next.and_hms_opt(0, 0, 0).unwrap()).earliest().map_or(0, |time| time.timestamp())
 }
 
@@ -353,7 +357,7 @@ pub enum AiError {
 impl std::fmt::Display for AiError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AiError::HydrogenLimit => write!(formatter, "Лимит Hydrogen: 4 ответа в сутки, сброс в 00:00 МСК. Выбери Flash-Lite."),
+            AiError::HydrogenLimit => formatter.write_str(error_text(self)),
             AiError::Busy => write!(formatter, "очередь запросов ИИ заполнена"),
             AiError::Quota => write!(formatter, "лимит запросов к Gemini исчерпан (429)"),
             AiError::Overloaded => write!(formatter, "Gemini перегружен (5xx)"),
@@ -368,7 +372,7 @@ impl std::error::Error for AiError {}
 /// Понятный текст ошибки ИИ для чата.
 pub fn error_text(error: &AiError) -> &'static str {
     match error {
-        AiError::HydrogenLimit => "Лимит Hydrogen на сегодня закончился: 4 ответа в сутки. Сброс в 00:00 МСК; пока можно выбрать Flash-Lite.",
+        AiError::HydrogenLimit => "Лимит Hydrogen на сегодня закончился: 3 ответа в сутки. Сброс в 00:00 МСК.",
         AiError::Busy => "Сейчас слишком много запросов к ИИ. Попробуй чуть позже.",
         AiError::Quota => "😵 Лимит бесплатных запросов к ИИ на сейчас исчерпан. Попробуй позже (подробнее — /ai_limits).",
         AiError::Overloaded => "😵 ИИ у Google сейчас перегружен, попробуй через пару минут.",
@@ -492,6 +496,27 @@ pub async fn generate(data: &Data, system: &str, turns: &[Turn]) -> Result<Answe
     // Ограничиваем суммарное ожидание всех моделей: один запрос не занимает все 15 минут
     // жизни Discord interaction. Отмена прекращает текущий запрос и дальнейшие повторы.
     generate_selected(data, system, turns, RequestOptions::default()).await
+}
+
+// Activity owns its Hydrogen bucket reservation and commits it with chat history.
+const ACTIVITY_OPTIONS: RequestOptions<'static> = RequestOptions {
+    model: ModelChoice::FlashLite,
+    thinking: Some(ThinkingLevel::Medium),
+    user: None,
+    delivery: None,
+};
+
+const ACTIVITY_RULES: &str = "Для этого приложения используй Markdown и выбирай длину и структуру ответа по задаче. \
+    При необходимости используй заголовки, абзацы, списки и таблицы. \
+    Для формул LaTeX используй $...$ внутри строки и $$...$$ для отдельных формул. \
+    Пиши формулы LaTeX вне блоков кода. Здесь ты отвечаешь в личном чате и не модерируешь Discord.";
+
+fn activity_system_prompt(data: &Data) -> String {
+    format!("{}\n\n{ACTIVITY_RULES}", character_prompt(data))
+}
+
+pub(crate) async fn generate_activity(data: &Data, turns: &[Turn]) -> Result<Answer, AiError> {
+    generate_selected(data, &activity_system_prompt(data), turns, ACTIVITY_OPTIONS).await
 }
 
 #[cfg(test)]
@@ -683,11 +708,7 @@ pub fn provider_usage(data: &Data, day: &str) -> rusqlite::Result<Vec<ModelUsage
 }
 
 pub fn hydrogen_usage(data: &Data, user: u64, day: &str) -> rusqlite::Result<(i64, i64)> {
-    Ok(data.db.lock().query_row(
-        "SELECT used, reserved FROM ai_model_usage WHERE user_id = ?1 AND day = ?2 AND model = ?3",
-        params![user as i64, day, HYDROGEN_MODEL],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional()?.unwrap_or_default())
+    db::Database::ai_model_counts_on(&data.db.lock(), user, day, HYDROGEN_MODEL)
 }
 
 /// Убирает из prompt.txt строки-пояснения (начинаются с #).
@@ -695,11 +716,16 @@ pub fn parse_prompt(text: &str) -> String {
     text.lines().filter(|line| !line.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
+fn character_prompt(data: &Data) -> Arc<String> {
+    data.ai.prompt.read(&data.dir.join("config").join("prompt.txt"), |text| {
+        let character = parse_prompt(text);
+        if character.is_empty() { DEFAULT_CHARACTER.trim().into() } else { character }
+    })
+}
+
 /// Полная инструкция для ИИ: характер из config/prompt.txt + технические правила.
 pub fn system_prompt(data: &Data) -> String {
-    let own = data.ai.prompt.read(&data.dir.join("config").join("prompt.txt"), parse_prompt);
-    let character = if own.is_empty() { DEFAULT_CHARACTER.trim() } else { own.as_str() };
-    format!("{character}\n\n{}", TECH_RULES.trim())
+    format!("{}\n\n{}", character_prompt(data), TECH_RULES.trim())
 }
 
 /// Убирает из ответа метки вида [ИМЯ: …] или [ИМЯ] (без учёта регистра). names — какие метки убрать.
@@ -1045,6 +1071,24 @@ mod tests {
     }
 
     #[test]
+    fn activity_pins_flash_lite_medium_and_markdown() {
+        let defaults = settings("[ai]\nmodel = gemini-4-hydrogen\nfallback_model = secondary\nthinking_level = high\n");
+        let selected = request_settings(&defaults, ACTIVITY_OPTIONS);
+        assert_eq!(selected.model, "gemini-3.5-flash-lite");
+        assert!(selected.fallback_model.is_none());
+        let data = retry_test_data();
+        *locked(&data.ai.prompt.0) = Some((Instant::now(), Arc::new("Настроенный характер Malfoid".into())));
+        let body = request_body(&selected, &selected.model, &activity_system_prompt(&data), &[Turn::user("Формула")]);
+        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium");
+        let system = body["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
+        assert!(system.starts_with("Настроенный характер Malfoid"));
+        assert!(!system.contains("[ВАРН:"));
+        assert!(system.contains("Markdown"));
+        assert!(system.contains("$...$"));
+        assert!(system.contains("$$...$$"));
+    }
+
+    #[test]
     fn moderation_classifier_requires_unambiguous_structured_result() {
         assert!(directed_insult_result(r#"{"target":"bot"}"#));
         for text in [r#"{"target":"other"}"#, r#"{"target":"none"}"#, r#"{"target":"uncertain"}"#,
@@ -1065,7 +1109,7 @@ mod tests {
         let mut selected = request_settings(&data.ai.settings, RequestOptions { model: ModelChoice::Hydrogen, ..Default::default() });
         selected.retries = 0;
         let options = RequestOptions { user: Some(9), ..Default::default() };
-        for _ in 0..4 {
+        for _ in 0..3 {
             let result = generate_with_settings(&data, &selected, options, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |_| {
                 std::future::ready(Ok(Answer { text: "готово".into(), cut: false }))
             }).await;
@@ -1078,7 +1122,7 @@ mod tests {
         }).await;
         assert_eq!(result, Err(AiError::HydrogenLimit));
         assert_eq!(calls, 0);
-        assert_eq!(data.db.ai_model_usage(9, &moscow_day(), HYDROGEN_MODEL).unwrap(), 4);
+        assert_eq!(data.db.ai_model_usage(9, &moscow_day(), HYDROGEN_MODEL).unwrap(), 3);
 
         selected.model = "primary".into(); selected.fallback_model = Some(HYDROGEN_MODEL.into());
         let result = generate_with_settings(&data, &selected, RequestOptions { user: Some(10), ..Default::default() }, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |model| {
@@ -1100,9 +1144,8 @@ mod tests {
         let result = generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, budget, |_| std::future::pending::<Result<Answer, AiError>>()).await;
         assert!(result.is_err());
         assert_eq!(data.db.ai_model_usage(11, &moscow_day(), HYDROGEN_MODEL).unwrap(), 0);
-        // Все четыре места доступны после отмены, пятого быть не должно.
-        for _ in 0..4 { assert!(data.db.reserve_ai_model(11, &moscow_day(), HYDROGEN_MODEL, 4).unwrap()); }
-        assert!(!data.db.reserve_ai_model(11, &moscow_day(), HYDROGEN_MODEL, 4).unwrap());
+        for _ in 0..3 { assert!(data.db.reserve_ai_model(11, &moscow_day(), HYDROGEN_MODEL, HYDROGEN_DAILY_LIMIT).unwrap()); }
+        assert!(!data.db.reserve_ai_model(11, &moscow_day(), HYDROGEN_MODEL, HYDROGEN_DAILY_LIMIT).unwrap());
     }
 
     #[tokio::test]
@@ -1123,8 +1166,8 @@ mod tests {
         generate_with_settings(&data, &settings, options, std::time::Duration::ZERO, std::time::Duration::from_secs(1), |_| body()).await.unwrap();
         receipt.delivered(); receipt.delivered();
         assert_eq!(data.db.ai_model_usage(50, &moscow_day(), HYDROGEN_MODEL).unwrap(), 1);
-        for _ in 0..3 { assert!(data.db.reserve_ai_model(50, &moscow_day(), HYDROGEN_MODEL, 4).unwrap()); }
-        assert!(!data.db.reserve_ai_model(50, &moscow_day(), HYDROGEN_MODEL, 4).unwrap());
+        for _ in 0..2 { assert!(data.db.reserve_ai_model(50, &moscow_day(), HYDROGEN_MODEL, HYDROGEN_DAILY_LIMIT).unwrap()); }
+        assert!(!data.db.reserve_ai_model(50, &moscow_day(), HYDROGEN_MODEL, HYDROGEN_DAILY_LIMIT).unwrap());
     }
 
     fn retry_test_data() -> Data {
@@ -1310,7 +1353,7 @@ mod tests {
         let system = system_prompt(&data);
         let main = call_gemini(&data, &models.0, &system, &[Turn::user("Тест: ответь одним словом «работает».")]).await;
         println!("основная модель {}: {main:?}", models.0);
-        // Потом полный путь, как у /ask: память разговора, повторы, запасная модель
+        // Потом полный путь чата Discord: память разговора, повторы, запасная модель
         let answer = ask(&data, "Сколько будет 2+2? Ответь коротко.", "Тестер", 1, Vec::new(), Extras::default()).await;
         println!("ask: {answer:?}");
         assert!(matches!(&answer, Ok(text) if !text.is_empty()), "{answer:?}");

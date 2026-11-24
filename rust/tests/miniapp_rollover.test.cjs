@@ -181,7 +181,7 @@ test('a guess crossing midnight carries its old date and clears stale input', as
 
 test('switching games hides the previous view and stops refreshing word data', async () => {
   const panels = Object.fromEntries(
-    ['app', 'cases', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip', 'durak']
+    ['app', 'cases', 'ai-chat', 'rocket', 'poker', 'blackjack', 'mines', 'slots', 'roulette', 'coinflip', 'durak']
       .map(id => [id, { hidden: true }]),
   );
   const calls = [];
@@ -193,10 +193,11 @@ test('switching games hides the previous view and stops refreshing word data', a
   const context = vm.createContext({
     document, activeGame: null, session: 'test', lang: 'ru', reloadWords: false, gameAvatar: () => null,
     casinoViews: new Map(),
-    helpEl: {}, playersEl: {}, gameLobby: { hidden: false }, gameSwitch: { querySelectorAll: () => [] },
+    helpEl: {}, playersEl: {}, gameLobby: { hidden: false }, gameSwitch: { querySelectorAll: () => [] }, navLinks: [],
     rocket: { show() { calls.push('show rocket'); }, hide() { calls.push('hide rocket'); } },
     casesRoot: panels.cases,
     casesView: { show() { calls.push('show cases'); }, hide() { calls.push('hide cases'); } },
+    aiChat: { show() { calls.push('show ai'); }, hide() { calls.push('hide ai'); } },
     window: { CasinoGames: { roulette: mount('roulette'), coinflip: mount('coinflip') } },
     api: (path) => { calls.push(path); return Promise.resolve({}); },
   });
@@ -225,4 +226,7 @@ test('switching games hides the previous view and stops refreshing word data', a
   vm.runInContext('openGame("lobby")', context);
   assert.equal(panels.cases.hidden, true);
   assert.deepEqual(calls.slice(-2), ['show cases', 'hide cases']);
+  vm.runInContext('openGame("ai"); openGame("lobby")', context);
+  assert.equal(panels['ai-chat'].hidden, true);
+  assert.deepEqual(calls.slice(-2), ['show ai', 'hide ai']);
 });

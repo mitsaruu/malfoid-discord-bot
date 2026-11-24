@@ -1,9 +1,9 @@
-//! Питомцы и кейсы: /case, /cases, /pets, /pets_collect, /pet_feed, /pet_sell.
+//! Питомцы и кейсы: мини-приложение, /pets_collect и /pet_trade.
 //! Питомец сам приносит монеты в час; корм поднимает уровень (+25% к доходу за уровень).
 
 use crate::db::{self, Database, Pet, Wallet};
-use crate::reply::{challenge, display_name, finish_challenge, insufficient_money, say, user_name, whisper};
-use crate::text::{hours_text, money_text, number};
+use crate::reply::{challenge, display_name, finish_challenge, insufficient_money, say, whisper};
+use crate::text::money_text;
 use crate::{Context, Error};
 use poise::serenity_prelude as serenity;
 use rand::Rng;
@@ -50,15 +50,11 @@ impl PetSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, poise::ChoiceParameter)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Case {
-    #[name = "📦 Дешёвый"]
     Cheap,
-    #[name = "🎁 Средний"]
     Medium,
-    #[name = "💎 Дорогой"]
     Expensive,
-    #[name = "🔮 Секретный"]
     Secret,
 }
 
@@ -78,10 +74,6 @@ impl Case {
         }
     }
 
-    fn emoji(self) -> &'static str {
-        ["📦", "🎁", "💎", "🔮"][self as usize]
-    }
-
     pub(crate) fn title(self) -> &'static str {
         ["Дешёвый", "Средний", "Дорогой", "Секретный"][self as usize]
     }
@@ -92,21 +84,20 @@ impl Case {
     }
 }
 
-/// Редкость: название, цвет карточки и шанс выпасть в каждом кейсе (в процентах, в каждом кейсе сумма — 100).
+/// Редкость: название и шанс выпасть в каждом кейсе в процентах.
 pub struct Rarity {
     pub key: &'static str,
     pub name: &'static str,
-    pub color: u32,
     pub chances: [f64; 4], // дешёвый, средний, дорогой, секретный
 }
 
 pub const RARITIES: [Rarity; 6] = [
-    Rarity { key: "common", name: "Обычный", color: 0x9CA3AF, chances: [75.0, 40.0, 0.0, 0.0] },
-    Rarity { key: "rare", name: "Редкий", color: 0x3B82F6, chances: [20.0, 38.0, 40.0, 0.0] },
-    Rarity { key: "epic", name: "Эпический", color: 0xA855F7, chances: [4.5, 17.0, 40.0, 60.0] },
-    Rarity { key: "legendary", name: "Легендарный", color: 0xF59E0B, chances: [0.49, 4.8, 18.5, 34.95] },
-    Rarity { key: "mythic", name: "Мифический", color: 0xEF4444, chances: [0.01, 0.2, 1.5, 4.95] },
-    Rarity { key: "secret", name: "Секретный", color: 0x22D3EE, chances: [0.0, 0.0, 0.0, 0.1] },
+    Rarity { key: "common", name: "Обычный", chances: [75.0, 40.0, 0.0, 0.0] },
+    Rarity { key: "rare", name: "Редкий", chances: [20.0, 38.0, 40.0, 0.0] },
+    Rarity { key: "epic", name: "Эпический", chances: [4.5, 17.0, 40.0, 60.0] },
+    Rarity { key: "legendary", name: "Легендарный", chances: [0.49, 4.8, 18.5, 34.95] },
+    Rarity { key: "mythic", name: "Мифический", chances: [0.01, 0.2, 1.5, 4.95] },
+    Rarity { key: "secret", name: "Секретный", chances: [0.0, 0.0, 0.0, 0.1] },
 ];
 
 /// Вид питомца: ключ из базы, эмодзи, название, редкость и базовый доход.
@@ -161,10 +152,6 @@ const SECRET_PET_FILENAME: &str = "stellochka.webp";
 
 pub(crate) async fn secret_pet_art(data: &crate::Data) -> Option<Vec<u8>> {
     tokio::fs::read(data.dir.join("miniapp/pets").join(SECRET_PET_FILENAME)).await.ok()
-}
-
-fn needs_sale_confirmation(species: &Species) -> bool {
-    species.rarity != "common"
 }
 
 pub fn stage(level: i64) -> &'static str {
@@ -248,7 +235,7 @@ fn buy_pet(
     let count = Database::pet_count_on(tx, wallet.guild, wallet.user)?;
     if count >= max_pets {
         return Ok(Err(format!(
-            "🏠 У тебя уже {max_pets} питомцев — больше не поместится. Продай кого-нибудь: /pet_sell")));
+            "🏠 У тебя уже {max_pets} питомцев — больше не поместится. Продай питомца на складе.")));
     }
     let (balance, _) = wallet.open(tx)?;
     if balance < price {
@@ -513,7 +500,7 @@ pub(crate) fn collect_pets(
     database.transaction(|tx| {
         let pets = sorted_pets(Database::pets_on(tx, wallet.guild, wallet.user)?);
         if pets.is_empty() {
-            return Ok(Err("🐾 Питомцев пока нет. Открой кейс: /case"));
+            return Ok(Err("🐾 Питомцев пока нет. Открой кейс в «Зверушнике» через /games."));
         }
         let total = pets.iter().try_fold(0_i64, |total, (pet, species)| {
             total.checked_add(owned_pending(pet, species, now, cap_hours))
@@ -537,7 +524,6 @@ pub(crate) fn collect_pets(
 pub(crate) struct Feeding {
     pub pet: Pet,
     pub species: &'static Species,
-    pub previous_level: i64,
     pub cost: i64,
     pub balance: i64,
 }
@@ -581,7 +567,6 @@ pub(crate) fn feed_owned_pet(
             params![pet.id, new_level, spent, last_collect],
         )?;
         Ok(Ok(Feeding {
-            previous_level: pet.level,
             pet: Pet { level: new_level, spent, last_collect, ..pet },
             species, cost, balance,
         }))
@@ -590,14 +575,6 @@ pub(crate) fn feed_owned_pet(
 
 /// Подсказки в поле «питомец»: список своих питомцев.
 async fn pet_autocomplete(ctx: Context<'_>, partial: &str) -> serenity::CreateAutocompleteResponse {
-    owned_pet_autocomplete(ctx, partial, false)
-}
-
-async fn pet_sale_autocomplete(ctx: Context<'_>, partial: &str) -> serenity::CreateAutocompleteResponse {
-    owned_pet_autocomplete(ctx, partial, true)
-}
-
-fn owned_pet_autocomplete(ctx: Context<'_>, partial: &str, show_sale_price: bool) -> serenity::CreateAutocompleteResponse {
     let response = serenity::CreateAutocompleteResponse::new();
     let Some(guild) = ctx.guild_id() else { return response };
     let pets = ctx.data().db.user_pets(guild.get(), ctx.author().id.get()).unwrap_or_default();
@@ -605,157 +582,12 @@ fn owned_pet_autocomplete(ctx: Context<'_>, partial: &str, show_sale_price: bool
     let choices: Vec<serenity::AutocompleteChoice> = sorted_pets(pets)
         .into_iter()
         .enumerate()
-        .map(|(index, (pet, species))| (format!("{}. {}", index + 1, title(species, pet.level)), pet, species))
-        .filter(|(label, _, _)| label.to_lowercase().contains(&partial))
+        .map(|(index, (pet, species))| (format!("{}. {}", index + 1, title(species, pet.level)), pet.id))
+        .filter(|(label, _)| label.to_lowercase().contains(&partial))
         .take(25)
-        .map(|(mut label, pet, species)| {
-            if show_sale_price {
-                label.push_str(&format!(" — {}", money_text(value(species, pet.level))));
-            }
-            serenity::AutocompleteChoice::new(label, pet.id)
-        })
+        .map(|(label, id)| serenity::AutocompleteChoice::new(label, id))
         .collect();
     response.set_choices(choices)
-}
-
-/// Открыть кейс с питомцем: дешёвый, средний, дорогой или секретный
-#[poise::command(slash_command, guild_only, rename = "case")]
-pub async fn open_case(ctx: Context<'_>, #[description = "Какой кейс открыть"] kind: Case) -> Result<(), Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let (name, face) = match ctx.author_member().await {
-        Some(member) => (member.display_name().to_string(), member.face()),
-        None => (user_name(ctx.author()), ctx.author().face()),
-    };
-    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
-    let (species, _) = match buy_case(&data.db, wallet, &face, &data.pets, kind, None)? {
-        Ok(opening) => opening,
-        Err(reason) => return whisper(ctx, reason).await,
-    };
-
-    let no_pings = serenity::CreateAllowedMentions::new();
-    let message = ctx
-        .send(poise::CreateReply::default()
-            .content(format!("{} <@{user}> открывает {} кейс...", kind.emoji(), kind.title().to_lowercase()))
-            .allowed_mentions(no_pings.clone()))
-        .await?;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await; // немного интриги
-    let rarity = rarity_of(species);
-    let ending = if rarity.key == "secret" { "!!! Самый редкий в игре!" } else { "!" };
-    let mut embed = serenity::CreateEmbed::new()
-        .color(rarity.color)
-        .title(format!("{} {}", species.emoji, species.name))
-        .description(format!(
-            "**{}** питомец{ending}\nПриносит **{} в час**.", rarity.name, money_text(income(species, 1))))
-        .author(serenity::CreateEmbedAuthor::new(name).icon_url(ctx.author().face()))
-        .footer(serenity::CreateEmbedFooter::new("Забрать доход — /pets_collect · вырастить — /pet_feed"));
-    let mut reply = poise::CreateReply::default().content("").allowed_mentions(no_pings);
-    if rarity.key == "secret" {
-        if let Some(art) = secret_pet_art(data).await {
-            embed = embed.image(format!("attachment://{SECRET_PET_FILENAME}"));
-            reply = reply.attachment(serenity::CreateAttachment::bytes(art, SECRET_PET_FILENAME));
-        }
-    }
-    message.edit(ctx, reply.embed(embed)).await?;
-    Ok(())
-}
-
-fn case_catalogue(prices: [i64; 4]) -> String {
-    let mut blocks = vec![Case::ALL
-        .iter()
-        .map(|case| format!("{} **{}** — {}", case.emoji(), case.title(), money_text(prices[*case as usize])))
-        .collect::<Vec<_>>()
-        .join(" · ")];
-    for rarity in RARITIES.iter() {
-        let mut kinds: Vec<&Species> = SPECIES.iter().filter(|species| species.rarity == rarity.key).collect();
-        kinds.sort_by_key(|species| species.income); // от меньшего дохода к большему
-        let pets = kinds
-            .iter()
-            .map(|species| format!(
-                "{} {} — {}/ч, корм от {}", species.emoji, species.name, money_text(species.income),
-                number(feed_cost(species, 1))))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let odds = Case::ALL
-            .iter()
-            .map(|case| format!("{} {}%", case.emoji(), rarity.chances[*case as usize]))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        blocks.push(format!("**{}** — {odds}\n{pets}", rarity.name));
-    }
-    blocks.join("\n\n")
-}
-
-/// Какие питомцы бывают в кейсах и с каким шансом
-#[poise::command(slash_command)]
-pub async fn cases(ctx: Context<'_>) -> Result<(), Error> {
-    let embed = serenity::CreateEmbed::new()
-        .color(0x8B5CF6)
-        .title("🎁 Кейсы с питомцами")
-        .description(case_catalogue(ctx.data().pets.case_prices))
-        .footer(serenity::CreateEmbedFooter::new(
-            "Корм поднимает питомца на 1 уровень (+25% к доходу) и дорожает с каждым уровнем: \
-             на ур. 2 — цена «корм от», на ур. 3 — вдвое больше, на ур. 4 — втрое и так далее."));
-    ctx.send(poise::CreateReply::default().embed(embed).ephemeral(true)).await?;
-    Ok(())
-}
-
-/// Посмотреть питомцев и сколько они накопили
-#[poise::command(slash_command, guild_only, rename = "pets")]
-pub async fn show_pets(
-    ctx: Context<'_>,
-    #[description = "Чьих питомцев посмотреть (если не выбрать — твоих)"] member: Option<serenity::Member>,
-) -> Result<(), Error> {
-    let (data, guild) = (ctx.data(), ctx.guild_id().unwrap().get());
-    let (owner, owner_name, own) = match &member {
-        Some(member) => (member.user.id.get(), member.display_name().to_string(), member.user.id == ctx.author().id),
-        None => (ctx.author().id.get(), display_name(ctx).await, true),
-    };
-    let pets = sorted_pets(data.db.user_pets(guild, owner)?);
-    if pets.is_empty() {
-        let text = if own { "Питомцев пока нет. Открой кейс: /case" } else { "У него пока нет питомцев." };
-        return whisper(ctx, format!("🐾 {text}")).await;
-    }
-    let (now, cap) = (db::now(), data.pets.collect_cap_hours);
-    let (mut lines, mut total_income, mut total_pending) = (Vec::new(), 0, 0);
-    for (index, (pet, species)) in pets.iter().enumerate() {
-        let (hourly, saved) = (if pet.inactive_since.is_none() { income(species, pet.level) } else { 0 },
-            owned_pending(pet, species, now, cap));
-        total_income += hourly;
-        total_pending += saved;
-        let feed = if pet.level < data.pets.max_level {
-            format!("корм {}", number(feed_cost(species, pet.level)))
-        } else {
-            "макс. уровень".to_string()
-        };
-        lines.push(format!(
-            "`{}.` {} — {}/ч, накопил {}, {feed}", index + 1, title(species, pet.level), money_text(hourly), number(saved)));
-    }
-    let mut description = lines.join("\n");
-    if description.encode_utf16().count() > 4096 {
-        let mut length = 0;
-        description = lines.into_iter().take_while(|line| {
-            length += line.encode_utf16().count() + 1;
-            length <= 4000
-        }).collect::<Vec<_>>().join("\n");
-        description.push_str("\nОстальные питомцы видны на складе в /games.");
-    }
-    let mut embed = serenity::CreateEmbed::new()
-        .color(0x22C55E)
-        .title(format!("🐾 Питомцы {owner_name} ({}/{})", pets.len(), data.pets.max_pets))
-        .description(description)
-        .field("Доход", format!("{} в час", money_text(total_income)), true)
-        .field("Можно забрать", money_text(total_pending), true)
-        .footer(serenity::CreateEmbedFooter::new(format!(
-            "Доход копится до {} — потом питомцы ждут, пока заберёшь", hours_text(cap * 3600))));
-    let mut reply = poise::CreateReply::default();
-    if own && pets.iter().any(|(_, species)| species.rarity == "secret") {
-        if let Some(art) = secret_pet_art(data).await {
-            embed = embed.thumbnail(format!("attachment://{SECRET_PET_FILENAME}"));
-            reply = reply.ephemeral(true).attachment(serenity::CreateAttachment::bytes(art, SECRET_PET_FILENAME));
-        }
-    }
-    ctx.send(reply.embed(embed)).await?;
-    Ok(())
 }
 
 /// Забрать монеты, которые заработали питомцы
@@ -770,56 +602,6 @@ pub async fn pets_collect(ctx: Context<'_>) -> Result<(), Error> {
     };
     say(ctx, format!(
         "🐾 Питомцы <@{user}> принесли **+{}**. Баланс: **{}**.", money_text(total), money_text(balance))).await
-}
-
-/// Покормить питомца — он вырастет на уровень и станет приносить больше
-#[poise::command(slash_command, guild_only)]
-pub async fn pet_feed(
-    ctx: Context<'_>,
-    #[description = "Какого питомца покормить"]
-    #[autocomplete = "pet_autocomplete"]
-    pet: i64,
-) -> Result<(), Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let name = display_name(ctx).await;
-    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
-    let Feeding { pet, species, cost, previous_level, .. } = match feed_owned_pet(&data.db, wallet, pet, &data.pets, None)? {
-        Ok(result) => result,
-        Err(reason) => return whisper(ctx, reason).await,
-    };
-    let max_level = data.pets.max_level;
-    let new_level = pet.level;
-    let new_income = income(species, new_level);
-    let grown = if stage(new_level) != stage(previous_level) {
-        format!(" и теперь он **{}**!", stage(new_level))
-    } else {
-        String::new()
-    };
-    let next = if new_level < max_level {
-        format!(", следующая кормёжка — {}.", money_text(feed_cost(species, new_level)))
-    } else {
-        ".".to_string()
-    };
-    say(ctx, format!(
-        "🍖 Питомец <@{user}> {} {} поел за {} — теперь **ур. {new_level}**{grown}. Доход: **{}/ч**{next}",
-        species.emoji, species.name, money_text(cost), money_text(new_income))).await
-}
-
-fn sell_owned_pet(
-    database: &Database,
-    wallet: Wallet<'_>,
-    pet: &Pet,
-    species: &Species,
-    cap_hours: i64,
-    now: impl FnOnce() -> f64,
-) -> rusqlite::Result<Option<(i64, i64)>> {
-    database.transaction(|tx| {
-        if Database::own_pet_on(tx, pet.id, wallet.guild, wallet.user)?.as_ref() != Some(pet) {
-            return Ok(None);
-        }
-        let sale = commit_pet_sale(tx, wallet, [(pet, species)], cap_hours, now())?;
-        Ok(Some((sale.earned, sale.balance)))
-    })
 }
 
 pub(crate) struct PetSale {
@@ -871,108 +653,6 @@ pub(crate) fn sell_inventory_pets(
         }
         commit_pet_sale(tx, wallet, animals.iter().map(|(pet, species)| (pet, *species)), cap_hours, now()).map(Ok)
     })
-}
-
-/// Продать питомца и забрать накопленный доход
-#[poise::command(slash_command, guild_only)]
-pub async fn pet_sell(
-    ctx: Context<'_>,
-    #[description = "Какого питомца продать"]
-    #[autocomplete = "pet_sale_autocomplete"]
-    pet: i64,
-) -> Result<(), Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let found = data.db.own_pet(pet, guild, user)?.and_then(|pet| find_species(&pet.species).map(|species| (pet, species)));
-    let Some((pet, species)) = found else {
-        return whisper(ctx, "Такого питомца у тебя нет — выбери из списка.").await;
-    };
-    if needs_sale_confirmation(species) {
-        let offer = format!(
-            "Продать {} за **{}**? Накопленный к моменту продажи доход будет начислен отдельно. \
-             Вернуть питомца после продажи нельзя.",
-            title(species, pet.level), money_text(value(species, pet.level)));
-        if !crate::qol::confirm(ctx, offer).await? {
-            return Ok(());
-        }
-    }
-    let name = display_name(ctx).await;
-    let wallet = Wallet { guild, user, name: &name, start: data.economy.start_balance };
-    let sold = sell_owned_pet(&data.db, wallet, &pet, species, data.pets.collect_cap_hours, db::now)?;
-    let Some((earned, balance)) = sold else {
-        return whisper(ctx, "Питомец уже продан, передан или изменился. Повтори команду.").await;
-    };
-    say(ctx, format!(
-        "💸 <@{user}> продаёт питомца {} за **{}**. Накопленный доход: **+{}**. Баланс: **{}**.",
-        title(species, pet.level), money_text(value(species, pet.level)), money_text(earned), money_text(balance))).await
-}
-
-const BATTLE_MIN_CHANCE: i64 = 10; // шанс победить в бою не бывает меньше 10% и больше 90%
-
-/// Шанс победить в процентах: доля своей силы (дохода в час) в общей, но не меньше 10% и не больше 90%.
-pub fn battle_chance(power: i64, enemy_power: i64) -> i64 {
-    let chance = (100.0 * power as f64 / (power as f64 + enemy_power as f64)).round_ties_even() as i64;
-    chance.clamp(BATTLE_MIN_CHANCE, 100 - BATTLE_MIN_CHANCE)
-}
-
-/// Бой питомцев на ставку: твой питомец против сильнейшего у соперника
-#[poise::command(slash_command, guild_only)]
-pub async fn pet_battle(
-    ctx: Context<'_>,
-    #[description = "Кого вызвать на бой"] member: serenity::User,
-    #[description = "Какой твой питомец дерётся"]
-    #[autocomplete = "pet_autocomplete"]
-    pet: i64,
-    #[description = "Ставка в монетах"]
-    #[min = 1]
-    #[max = 1_000_000]
-    bet: i64,
-) -> Result<(), Error> {
-    let (data, guild, user) = (ctx.data(), ctx.guild_id().unwrap().get(), ctx.author().id.get());
-    let (start, name, enemy_name) = (data.economy.start_balance, display_name(ctx).await, user_name(&member));
-    let enemy = member.id.get();
-    if member.bot || enemy == user {
-        return whisper(ctx, "Вызови на бой другого участника (не бота и не себя).").await;
-    }
-    let mine = data.db.own_pet(pet, guild, user)?.and_then(|pet| find_species(&pet.species).map(|species| (pet, species)));
-    let Some((mine, my_species)) = mine else {
-        return whisper(ctx, "Такого питомца у тебя нет — выбери из списка.").await;
-    };
-    if sorted_pets(data.db.user_pets(guild, enemy)?).is_empty() {
-        return whisper(ctx, "У него пока нет питомцев — драться не с кем.").await;
-    }
-    if bet < data.economy.min_bet || data.db.wallet(guild, user, &name, start)?.0 < bet {
-        return whisper(ctx, format!(
-            "Ставка — от {}, и у тебя должно хватать монет.", money_text(data.economy.min_bet))).await;
-    }
-    let offer = format!(
-        "⚔️ <@{enemy}>, <@{user}> вызывает твоего сильнейшего питомца на бой с {}! Ставка — **{}** с каждого.",
-        title(my_species, mine.level), money_text(bet));
-    let Some(press) = challenge(ctx, member.id, offer).await? else { return Ok(()) };
-
-    // Пока ждали ответа, питомца могли продать, а монеты — потратить: проверяем заново
-    let result = data.db.transaction(|tx| {
-        let still_mine = Database::own_pet_on(tx, mine.id, guild, user)?
-            .filter(|pet| pet.species == my_species.key);
-        let enemy_pets = sorted_pets(Database::pets_on(tx, guild, enemy)?);
-        let (Some(my_pet), Some((enemy_pet, enemy_species))) = (still_mine, enemy_pets.first()) else {
-            return Ok("Бой отменён: у кого-то больше нет питомца.".into());
-        };
-        let first = Wallet { guild, user, name: &name, start };
-        let second = Wallet { guild, user: enemy, name: &enemy_name, start };
-        if first.open(tx)?.0 < bet || second.open(tx)?.0 < bet {
-            return Ok(format!("Бой отменён: кому-то не хватает {} на ставку.", money_text(bet)));
-        }
-        let chance = battle_chance(income(my_species, my_pet.level), income(enemy_species, enemy_pet.level));
-        let won = rand::rng().random_range(0.0..100.0) < chance as f64;
-        let (winner, loser) = if won { (user, enemy) } else { (enemy, user) };
-        db::change_balance(tx, guild, loser, -bet)?;
-        let balance = db::change_balance(tx, guild, winner, bet)?;
-        Ok(format!(
-            "⚔️ {} (<@{user}>, шанс {chance}%) против {} (<@{enemy}>, шанс {}%)\n🏆 Побеждает <@{winner}> и забирает **{}**! Баланс: **{}**.",
-            title(my_species, my_pet.level), title(enemy_species, enemy_pet.level), 100 - chance, money_text(bet),
-            money_text(balance)))
-    })?;
-    finish_challenge(ctx, &press, result).await
 }
 
 /// Подсказки в поле «питомец соперника»: питомцы того, кого выбрали в поле member.
@@ -1138,20 +818,11 @@ mod tests {
     }
 
     #[test]
-    fn secret_case_price_choices_and_catalogue() {
+    fn secret_case_price_is_configurable() {
         let defaults = PetSettings::load(&crate::config::Settings::default());
         assert_eq!(defaults.case_prices, [1000, 3000, 9000, 30000]);
         let custom = PetSettings::load(&crate::config::Settings::parse("[pets]\nsecret_case_price = 35000\n"));
         assert_eq!(custom.case_prices[Case::Secret as usize], 35000);
-        let command = open_case();
-        let choices = &command.parameters[0].choices;
-        assert_eq!(choices.iter().map(|choice| choice.name.as_ref()).collect::<Vec<_>>(),
-                   ["📦 Дешёвый", "🎁 Средний", "💎 Дорогой", "🔮 Секретный"]);
-        let catalogue = case_catalogue(defaults.case_prices);
-        for text in ["Секретный", "Стеллочка", "Фоидка романа", "Даня собака", "0.1%", "30 000"] {
-            assert!(catalogue.contains(text), "missing {text}: {catalogue}");
-        }
-        assert!(catalogue.encode_utf16().count() <= 4096);
     }
 
     #[test]
@@ -1184,20 +855,12 @@ mod tests {
             assert_eq!((species.rarity, income(species, 1)), (rarity, hourly));
             assert_eq!(pending(species, 1, 0.0, 3600.0, 24), hourly);
             assert_eq!(feed_cost(species, 1), hourly * 20);
-            assert!(needs_sale_confirmation(species));
         }
         for key in ["valera", "gena", "tolik", "frog", "arkady", "tamara", "boris", "igor", "edik", "zhorik", "vasily", "lyudmila", "lion", "sergey"] {
             assert!(find_species(key).is_some());
         }
-        assert!(!needs_sale_confirmation(kind("valera")));
         let unique = SPECIES.iter().map(|species| species.key).collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), SPECIES.len());
-    }
-
-    #[test]
-    fn battle_chances() {
-        assert_eq!([battle_chance(500, 10), battle_chance(10, 500), battle_chance(60, 60), battle_chance(500, 150)],
-                   [90, 10, 50, 77]);
     }
 
     fn kind(key: &str) -> &'static Species {
@@ -1447,16 +1110,13 @@ mod tests {
         let species = kind("valera");
         let first = db.add_pet(7, 1, species.key, 0.0, 500).unwrap();
         let second = db.add_pet(7, 1, species.key, 0.0, 7500).unwrap();
-        let first = db.own_pet(first, 7, 1).unwrap().unwrap();
-        let stale = db.own_pet(second, 7, 1).unwrap().unwrap();
         db.feed_pet(second, 200, 0.0).unwrap();
-        let second = db.own_pet(second, 7, 1).unwrap().unwrap();
-        let sell = |pet| sell_owned_pet(&db, wallet, pet, species, 24, || 7200.0).unwrap();
-
-        assert_eq!(sell(&stale), None);
-        assert_eq!(sell(&first), Some((20, 420)));
-        assert_eq!(sell(&second), Some((24, 804)));
-        assert_eq!(sell(&second), None);
+        let sell = |id| sell_inventory_pets(&db, wallet, &[id].into(), 24, || 7200.0).unwrap();
+        let first_sale = sell(first).unwrap();
+        assert_eq!((first_sale.payout, first_sale.balance), (320, 420));
+        let second_sale = sell(second).unwrap();
+        assert_eq!((second_sale.payout, second_sale.balance), (384, 804));
+        assert!(sell(second).is_err());
         assert!(db.user_pets(7, 1).unwrap().is_empty());
         assert_eq!(db.wallet(7, 1, "Alice", 100).unwrap().0, 804);
     }
@@ -1470,7 +1130,7 @@ mod tests {
         let pet = db.own_pet(id, 7, 1).unwrap().unwrap();
         db.wallet(7, 1, "Alice", i64::MAX).unwrap();
 
-        assert!(matches!(sell_owned_pet(&db, wallet, &pet, species, 24, || 0.0),
+        assert!(matches!(sell_inventory_pets(&db, wallet, &[id].into(), 24, || 0.0),
             Err(rusqlite::Error::IntegralValueOutOfRange(..))));
         assert_eq!(db.own_pet(id, 7, 1).unwrap(), Some(pet));
         assert_eq!(db.wallet(7, 1, "Alice", 0).unwrap().0, i64::MAX);

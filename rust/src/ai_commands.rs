@@ -1,10 +1,7 @@
-//! Команды ИИ: /ask, /forget, /ai_limits, /summary, /quiz.
+//! Команды ИИ: /forget, /ai_limits, /summary, /quiz.
 
-use crate::admin::report_error;
 use crate::ai::{self, Turn};
-use crate::ai_math;
-use crate::moderation::{self, Requester};
-use crate::reply::{display_name, whisper};
+use crate::reply::whisper;
 use crate::text::money_text;
 use crate::{db, Context, Error};
 use poise::serenity_prelude as serenity;
@@ -12,109 +9,6 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 const NOT_READY: &str = "ИИ не настроен: нет ключа GEMINI_API_KEY.";
-
-/// Убирает «бот думает…», как будто команды и не было (когда бот решил промолчать).
-async fn vanish(ctx: Context<'_>) {
-    if let poise::Context::Application(app) = ctx {
-        let _ = app.interaction.delete_response(ctx.http()).await;
-    }
-}
-
-/// Задать вопрос ИИ (можно с картинкой)
-#[poise::command(slash_command)]
-pub async fn ask(
-    ctx: Context<'_>,
-    #[description = "Твой вопрос"] question: String,
-    #[description = "Картинка к вопросу (необязательно): PNG, JPEG, WEBP"] image: Option<serenity::Attachment>,
-    #[description = "Модель: Авто, Flash-Lite или Hydrogen (4 ответа в сутки)"] model: Option<ai::ModelChoice>,
-    #[description = "Уровень рассуждения; без выбора используется настройка бота"] thinking: Option<ai::ThinkingLevel>,
-) -> Result<(), Error> {
-    let data = ctx.data();
-    if !data.ai.ready() {
-        return whisper(ctx, NOT_READY).await;
-    }
-    if let Some(image) = &image {
-        if !ai::is_supported_image(image.content_type.as_deref(), image.size as u64) {
-            return whisper(ctx, format!(
-                "Это не подходит: нужна картинка PNG, JPEG или WEBP не больше {} МБ.", ai::MAX_IMAGE_MB)).await;
-        }
-    }
-    if let Some(refusal) = data.ai.limit_check(ctx.author().id.get()) {
-        return whisper(ctx, refusal).await;
-    }
-    let Ok(_slot) = data.ai.ask_slots.try_acquire() else {
-        return whisper(ctx, ai::error_text(&ai::AiError::Busy)).await;
-    };
-    ctx.defer().await?;
-    if ai::directed_insult(data, &question).await {
-        vanish(ctx).await;
-        moderation::warn_for_insult(ctx.http(), data, ctx.guild_id(), ctx.author(), ctx.channel_id(), ctx.framework().bot_id()).await;
-        return Ok(());
-    }
-    let bot = ctx.framework().bot_id().get();
-    let moderation = match (ctx.guild_id(), moderation::requested_action(&question, None, bot)) {
-        (Some(guild), Some(Ok(action))) => Some((Requester { ctx: ctx.serenity_context(), guild, user: ctx.author().id }, action)),
-        (Some(_), Some(Err(message))) => return whisper(ctx, message).await,
-        _ => None,
-    };
-
-    let delivery = ai::DeliveryReceipt::default();
-    let mut images = Vec::new();
-    if moderation.is_none() {
-        if let Some(image) = &image {
-            match ai::download_image(data, image).await {
-                Ok(bytes) => images.push((bytes, ai::image_type(image.content_type.as_deref()))),
-                Err(error) => report_error(ctx.http(), data, ctx.guild_id(), "Скачивание картинки для ИИ", &error.to_string()).await,
-            }
-        }
-    }
-    let name = display_name(ctx).await;
-    let extras = ai::Extras {
-        moderation,
-        options: ai::RequestOptions { model: model.unwrap_or_default(), thinking, user: Some(ctx.author().id.get()), delivery: Some(&delivery) },
-        ..Default::default()
-    };
-    let mut answer = match ai::ask(data, &question, &name, ctx.channel_id().get(), images, extras).await {
-        Ok(answer) => answer,
-        Err(error) => {
-            report_error(ctx.http(), data, ctx.guild_id(), "ИИ /ask", &error.to_string()).await;
-            ai::error_text(&error).to_string()
-        }
-    };
-    if let Some(guild) = ctx.guild_id() {
-        let _ = data.db.reset_rude_strikes(guild.get(), ctx.author().id.get());
-    }
-    let no_pings = serenity::CreateAllowedMentions::new(); // иначе ИИ мог бы случайно написать @everyone
-    if let Some(math) = ai_math::render_for_discord(&answer).await {
-        let mut reply = poise::CreateReply::default()
-            .content(ai_math::FILE_MESSAGE)
-            .attachment(math.attachment())
-            .allowed_mentions(no_pings.clone());
-        if let Some(image) = &image {
-            reply = reply.embed(serenity::CreateEmbed::new().color(0x8B5CF6).image(&image.url));
-        }
-        match ctx.send(reply).await {
-            Ok(_) => { delivery.delivered(); return Ok(()); }
-            Err(error) if ai_math::attachment_denied(&error) => answer = math.discord,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let question_preview: String = question.chars().take(300).collect();
-    let question_preview = if question.chars().count() > 300 { format!("{question_preview}…") } else { question_preview };
-    let parts = ai::split_message(&answer, 1300);
-    for (index, part) in parts.into_iter().enumerate() {
-        let part = if index == 0 { format!("❓ {question_preview}\n\n{part}") } else { part };
-        let mut reply = poise::CreateReply::default().content(part).allowed_mentions(no_pings.clone());
-        if let (0, Some(image)) = (index, &image) {
-            // показываем картинку, о которой спрашивали, в «карточке» под первым сообщением
-            reply = reply.embed(serenity::CreateEmbed::new().color(0x8B5CF6).image(&image.url));
-        }
-        ctx.send(reply).await?;
-        // После первого доставленного фрагмента повторы доставки не освобождают резерв.
-        delivery.delivered();
-    }
-    Ok(())
-}
 
 /// Стереть память разговора с ботом в этом канале
 #[poise::command(slash_command)]
@@ -418,17 +312,6 @@ fn guild_name(press: &serenity::ComponentInteraction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ask_registers_optional_model_and_thinking_choices() {
-        let command = ask();
-        for (name, expected) in [("model", vec!["Авто", "Flash-Lite", "Hydrogen"]), ("thinking", vec!["low", "medium", "high"])] {
-            let parameter = command.parameters.iter().find(|parameter| parameter.name == name).unwrap();
-            assert!(!parameter.required);
-            assert_eq!(parameter.choices.iter().map(|choice| choice.name.as_ref()).collect::<Vec<_>>(), expected);
-            assert!(parameter.create_as_slash_command_option().is_some());
-        }
-    }
 
     #[test]
     fn quiz_parsing() {

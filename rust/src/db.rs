@@ -237,6 +237,37 @@ impl Database {
                  reserved INTEGER NOT NULL DEFAULT 0 CHECK (reserved >= 0),
                  PRIMARY KEY (user_id, day, model)
              );
+             CREATE TABLE IF NOT EXISTS ai_activity_chats (
+                 id INTEGER PRIMARY KEY,
+                 user_id INTEGER NOT NULL,
+                 title TEXT NOT NULL,
+                 updated REAL NOT NULL,
+                 UNIQUE (id, user_id)
+             );
+             CREATE INDEX IF NOT EXISTS ai_activity_chats_user_updated
+                 ON ai_activity_chats (user_id, updated DESC, id DESC);
+             CREATE TABLE IF NOT EXISTS ai_activity_turns (
+                 id INTEGER PRIMARY KEY,
+                 user_id INTEGER NOT NULL,
+                 request_id TEXT NOT NULL,
+                 chat_id INTEGER NOT NULL,
+                 prompt TEXT NOT NULL,
+                 answer TEXT NOT NULL,
+                 image_mime TEXT,
+                 image_data BLOB,
+                 UNIQUE (user_id, request_id),
+                 FOREIGN KEY (chat_id, user_id) REFERENCES ai_activity_chats (id, user_id)
+             );
+             CREATE INDEX IF NOT EXISTS ai_activity_turns_chat ON ai_activity_turns (chat_id, id);
+             CREATE TABLE IF NOT EXISTS ai_activity_pending (
+                 user_id INTEGER NOT NULL,
+                 request_id TEXT NOT NULL,
+                 chat_id INTEGER,
+                 day TEXT NOT NULL,
+                 PRIMARY KEY (user_id, request_id),
+                 UNIQUE (user_id, chat_id),
+                 FOREIGN KEY (chat_id, user_id) REFERENCES ai_activity_chats (id, user_id)
+             );
              CREATE TABLE IF NOT EXISTS rude_strikes (
                  guild_id INTEGER, user_id INTEGER, count INTEGER, last_time REAL,
                  PRIMARY KEY (guild_id, user_id)
@@ -280,7 +311,10 @@ impl Database {
         if !has_details{connection.execute_batch("ALTER TABLE playlists ADD COLUMN details TEXT")?;}
         // Single-bot startup: unfinished requests died with the previous process.
         // Successful usage survives; callers must not reopen during active requests.
-        connection.execute("UPDATE ai_model_usage SET reserved = 0 WHERE reserved != 0", [])?;
+        let startup = connection.unchecked_transaction()?;
+        startup.execute("UPDATE ai_model_usage SET reserved = 0 WHERE reserved != 0", [])?;
+        startup.execute("DELETE FROM ai_activity_pending", [])?;
+        startup.commit()?;
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS ai_history_channel_id ON ai_history(channel_id, id DESC);
              CREATE INDEX IF NOT EXISTS word_daily_guild_day ON word_daily(guild_id, day);
@@ -1180,10 +1214,14 @@ impl Database {
     /// Moscow calendar day and owns an RAII guard that finishes this reservation.
     /// A single conditional write also enforces the limit across SQLite connections.
     pub fn reserve_ai_model(&self, user: u64, day: &str, model: &str, limit: i64) -> rusqlite::Result<bool> {
+        Self::reserve_ai_model_on(&self.lock(), user, day, model, limit)
+    }
+
+    pub(crate) fn reserve_ai_model_on(connection: &Connection, user: u64, day: &str, model: &str, limit: i64) -> rusqlite::Result<bool> {
         if limit <= 0 {
             return Ok(false);
         }
-        Ok(self.lock().execute(
+        Ok(connection.execute(
             "INSERT INTO ai_model_usage (user_id, day, model, used, reserved)
              VALUES (?1, ?2, ?3, 0, 1)
              ON CONFLICT (user_id, day, model) DO UPDATE SET reserved = reserved + 1
@@ -1196,12 +1234,23 @@ impl Database {
     /// against the originally reserved day, even if the request crosses midnight.
     /// With no pending reservation this is a no-op, preventing counter underflow.
     pub fn finish_ai_model(&self, user: u64, day: &str, model: &str, success: bool) -> rusqlite::Result<()> {
-        self.lock().execute(
+        Self::finish_ai_model_on(&self.lock(), user, day, model, success).map(|_| ())
+    }
+
+    pub(crate) fn finish_ai_model_on(connection: &Connection, user: u64, day: &str, model: &str, success: bool) -> rusqlite::Result<bool> {
+        Ok(connection.execute(
             "UPDATE ai_model_usage SET reserved = reserved - 1, used = used + ?4
              WHERE user_id = ?1 AND day = ?2 AND model = ?3 AND reserved > 0",
             params![user as i64, day, model, i64::from(success)],
-        )?;
-        Ok(())
+        )? > 0)
+    }
+
+    pub(crate) fn ai_model_counts_on(connection: &Connection, user: u64, day: &str, model: &str) -> rusqlite::Result<(i64, i64)> {
+        Ok(connection.query_row(
+            "SELECT used, reserved FROM ai_model_usage WHERE user_id = ?1 AND day = ?2 AND model = ?3",
+            params![user as i64, day, model],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.unwrap_or_default())
     }
 
     /// Successful answers only; pending reservations do not count as usage.

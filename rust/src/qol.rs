@@ -58,10 +58,7 @@ fn section(name: &str) -> usize {
                 | "balance"
                 | "daily"
                 | "give_money"
-                | "coinflip"
                 | "blackjack"
-                | "case"
-                | "cases"
                 | "money_leaderboard"
         )
     {
@@ -74,7 +71,7 @@ fn section(name: &str) -> usize {
         )
     {
         2
-    } else if matches!(name, "ask" | "summary" | "quiz" | "forget" | "ai_limits") {
+    } else if matches!(name, "summary" | "quiz" | "forget" | "ai_limits") {
         3
     } else {
         4
@@ -95,9 +92,9 @@ fn help_embed(commands: &[poise::Command<Shared, Error>], page: usize) -> s::Cre
     lines.sort();
     let example = [
         "`/play название` · `/queue` — страницы и кнопки управления",
-        "`/daily` · `/pets` · `/shop` · `/coinflip`",
+        "`/daily` · `/shop` · `/games` — питомцы и орёл или решка",
         "`/games` · `/wordstats`",
-        "`/ask question:объясни закон Ома model:Hydrogen thinking:high` · `/ai_limits`",
+        "`/summary` · `/quiz` · `/ai_limits`",
         "`/music_channel channel:#музыка` · `/status` · `/server_settings`",
     ][page];
     s::CreateEmbed::new()

@@ -84,8 +84,9 @@ pub async fn set_games_channel(
             channel.id)).await;
     }
     data.db.set_games_channel(guild, Some(channel.id.get()))?;
+    let registered = &ctx.framework().options().commands;
     let commands: Vec<String> = data.games_commands.iter()
-        .filter(|name| !matches!(name.as_str(), "words" | "rocket" | "roulette" | "slots"))
+        .filter(|name| registered.iter().any(|command| command.name.as_ref() == name.as_str()))
         .map(|name| format!("/{name}")).collect();
     say(ctx, format!(
         "✅ Теперь эти команды работают только в <#{}>:\n{}\nЧтобы снова разрешить их везде — вызови /games_channel без канала.",

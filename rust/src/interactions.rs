@@ -22,13 +22,12 @@ pub fn error_context(ctx: Context<'_>) -> String {
 /// None — команда сама выбирает тип или видимость своего первого ответа.
 fn defer_privately(command: &str) -> Option<bool> {
     if matches!(command, "games"
-        | "coinflip" | "give_money" | "blackjack" | "shop_buy"
-        | "case" | "pet_feed" | "pet_sell" | "pet_battle" | "pet_trade" | "wordduel" | "dick_growth")
+        | "give_money" | "blackjack" | "shop_buy" | "pet_trade" | "wordduel" | "dick_growth")
     {
         return None;
     }
     Some(matches!(command,
-        "help" | "status" | "music_channel" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "cases" | "remind" | "reminders" | "lyrics" |
+        "help" | "status" | "music_channel" | "server_settings" | "favorites" | "history" | "ai_limits" | "summary" | "remind" | "reminders" | "lyrics" |
         "patchnotes" | "patchnotes_channel" | "log_channel" | "shop_add" | "shop_remove" | "daily_test"
         | "warns" | "warns_clear"
     ))
@@ -91,7 +90,7 @@ mod tests {
         assert_eq!(defer_privately("remind"), Some(true));
         assert_eq!(defer_privately("summary"), Some(true));
         assert_eq!(defer_privately("play"), Some(false));
-        assert_eq!(defer_privately("coinflip"), None);
+        assert_eq!(defer_privately("pet_trade"), None);
     }
 
     #[test]
