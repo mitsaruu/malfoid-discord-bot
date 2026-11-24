@@ -6,6 +6,7 @@ function createCasesInventory({ root, request, showPetArt, balanceVersion, updat
     count: element.querySelector(".inventory-group-count"),
   }));
   const count = root.querySelector("#inventory-count");
+  const hourly = root.querySelector("#inventory-hourly");
   const template = root.querySelector("#inventory-pet-template");
   const status = root.querySelector("#inventory-status");
   const retry = root.querySelector("#inventory-retry");
@@ -221,10 +222,11 @@ function createCasesInventory({ root, request, showPetArt, balanceVersion, updat
     try {
       const state = await request(null, undefined, signal);
       if (signal.aborted || read !== readVersion) return;
-      if (!Array.isArray(state.pets) || typeof state.balance !== "string") {
+      if (!Array.isArray(state.pets) || typeof state.balance !== "string" || typeof state.hourly_income !== "string") {
         throw new Error("Склад не загрузился полностью. Попробуй обновить.");
       }
       pets = state.pets;
+      hourly.textContent = `${money.format(BigInt(state.hourly_income))} монет/ч`;
       capacity = state.capacity;
       activeLimit = state.active_limit;
       secretSprite = state.secret_sprite;
@@ -320,6 +322,7 @@ function createCasesInventory({ root, request, showPetArt, balanceVersion, updat
       selected.clear();
       for (const group of groups) group.grid.replaceChildren();
       pets = [];
+      hourly.textContent = "—";
       secretSprite = null;
     },
     reload() { if (view && !mutating) load(); },

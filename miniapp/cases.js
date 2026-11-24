@@ -80,7 +80,7 @@ function createCaseReel(track, pets, renderCard) {
   };
 }
 
-function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, openCase, history, avatar }) {
+function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, leaderboardRequest, openCase, history, avatar }) {
   const nameEl = root.querySelector("#cases-name");
   const initial = root.querySelector("#cases-initial");
   const avatarEl = root.querySelector("#cases-avatar");
@@ -99,8 +99,11 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   const upgradePanel = root.querySelector("#cases-upgrade-panel");
   const upgradeTitle = root.querySelector("#cases-upgrade-title");
   const contractTab = root.querySelector("#cases-contract");
-  const developmentPanel = root.querySelector("#cases-development");
-  const developmentTitle = root.querySelector("#cases-development-title");
+  const contractPanel = root.querySelector("#cases-contract-panel");
+  const contractTitle = root.querySelector("#cases-contract-title");
+  const leaderboardTab = root.querySelector("#cases-leaderboard");
+  const leaderboardPanel = root.querySelector("#cases-leaderboard-panel");
+  const leaderboardTitle = root.querySelector("#cases-leaderboard-title");
   const casePanel = root.querySelector("#cases-case");
   const caseTitle = root.querySelector("#cases-case-title");
   const caseArt = root.querySelector(".case-stage-art");
@@ -137,6 +140,7 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   ]);
   let pending = null;
   let historyTimer = null;
+  let historyRead = 0;
   let historyRows = new Map();
   let casesById = new Map();
   let selectedCase = null;
@@ -154,13 +158,14 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   let inventoryFull = false;
   const fullMessage = "у вас полный склад, продайте лишних питомцев";
 
+  const leaderboard = createCasesLeaderboard({ root: leaderboardPanel, request: leaderboardRequest, showPetArt, showSecretSilhouette });
   const warehouse = createCasesInventory({
     root: warehousePanel,
     request: inventoryRequest,
     showPetArt,
     balanceVersion: () => balanceVersion,
-    canMutate: () => !purchaseBusy && !upgrade.isMutating(),
-    onSettled: () => { showPurchase(); upgrade.reload(); },
+    canMutate: () => !purchaseBusy && !upgrade.isMutating() && !contract.isMutating(),
+    onSettled: () => { showPurchase(); upgrade.reload(); contract.reload(); leaderboard.reload(); },
     updateAccount,
   });
   const upgrade = createCasesUpgrade({
@@ -168,8 +173,17 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     request: inventoryRequest,
     showPetArt,
     balanceVersion: () => balanceVersion,
-    canMutate: () => !purchaseBusy && !warehouse.isMutating(),
-    onSettled: () => { showPurchase(); warehouse.reload(); },
+    canMutate: () => !purchaseBusy && !warehouse.isMutating() && !contract.isMutating(),
+    onSettled: () => { showPurchase(); warehouse.reload(); contract.reload(); leaderboard.reload(); reloadHistory(); },
+    updateAccount,
+  });
+  const contract = createCasesContract({
+    root: contractPanel,
+    request: inventoryRequest,
+    showPetArt,
+    balanceVersion: () => balanceVersion,
+    canMutate: () => !purchaseBusy && !warehouse.isMutating() && !upgrade.isMutating(),
+    onSettled: () => { showPurchase(); warehouse.reload(); upgrade.reload(); leaderboard.reload(); },
     updateAccount,
   });
 
@@ -232,13 +246,15 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   function showSection(panel, title, tab = casesHome) {
     if (panel !== warehousePanel) warehouse.hide();
     if (panel !== upgradePanel) upgrade.hide();
+    if (panel !== contractPanel) contract.hide();
+    if (panel !== leaderboardPanel) leaderboard.hide();
     if (panel !== casePanel) {
       selectedCase = null;
       stopOpening();
       resetResult();
     }
-    for (const section of [cataloguePanel, casePanel, warehousePanel, upgradePanel, developmentPanel]) section.hidden = section !== panel;
-    for (const button of [casesHome, warehouseTab, upgradeTab, contractTab]) {
+    for (const section of [cataloguePanel, casePanel, warehousePanel, upgradePanel, contractPanel, leaderboardPanel]) section.hidden = section !== panel;
+    for (const button of [casesHome, warehouseTab, upgradeTab, contractTab, leaderboardTab]) {
       if (button === tab) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
     }
@@ -323,12 +339,6 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     }
   }
 
-  function showDevelopment(name, tab) {
-    developmentTitle.textContent = name;
-    showSection(developmentPanel, developmentTitle, tab);
-    developmentTitle.focus();
-  }
-
   function showWarehouse() {
     showSection(warehousePanel, warehouseTitle, warehouseTab);
     warehouse.show();
@@ -339,6 +349,18 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     showSection(upgradePanel, upgradeTitle, upgradeTab);
     upgrade.show();
     upgradeTitle.focus();
+  }
+
+  function showContract() {
+    showSection(contractPanel, contractTitle, contractTab);
+    contract.show();
+    contractTitle.focus();
+  }
+
+  function showLeaderboard() {
+    showSection(leaderboardPanel, leaderboardTitle, leaderboardTab);
+    leaderboard.show();
+    leaderboardTitle.focus();
   }
 
   function showSecretSilhouette(container) {
@@ -404,7 +426,7 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     resultPanel.hidden = !result;
     resultActions.hidden = !result;
     const full = inventoryFull && !current;
-    openButton.disabled = purchaseBusy || warehouse.isMutating() || upgrade.isMutating() || Boolean(anotherCase) || full;
+    openButton.disabled = purchaseBusy || warehouse.isMutating() || upgrade.isMutating() || contract.isMutating() || Boolean(anotherCase) || full;
     fastButton.disabled = openButton.disabled;
     openLabel.textContent = current ? (purchaseBusy ? "Открываем…" : "Повторить запрос") : "Открыть";
     let message = purchaseMessage?.caseId === selectedCase.id ? purchaseMessage.text : "";
@@ -434,7 +456,7 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   }
 
   async function purchase(fast = false) {
-    if (!pending || !selectedCase || purchaseBusy || warehouse.isMutating() || upgrade.isMutating() ||
+    if (!pending || !selectedCase || purchaseBusy || warehouse.isMutating() || upgrade.isMutating() || contract.isMutating() ||
         (pendingPurchase && pendingPurchase.case !== selectedCase.id)) return;
     const item = selectedCase;
     const isRetry = Boolean(pendingPurchase);
@@ -484,6 +506,9 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
       if (visible && purchaseResult?.pet.rarity === "secret") void showSecretReveal(!fast);
       warehouse.reload();
       upgrade.reload();
+      contract.reload();
+      leaderboard.reload();
+      reloadHistory();
     }
   }
 
@@ -507,6 +532,7 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   function showPetArt(container, pet, source = illustratedPets.has(pet.key) ? `static/pets/${pet.key}.webp` : null) {
     const emoji = container.querySelector("[data-pet-emoji]");
     const image = container.querySelector("[data-pet-image]");
+    image.toggleAttribute("data-tall-sprite", pet.key === "fat_oleg" || pet.key === "hermes");
     emoji.textContent = pet.emoji;
     emoji.hidden = false;
     image.hidden = true;
@@ -523,6 +549,26 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
     image.src = source;
   }
 
+  function showHistoryArt(container, pet) {
+    const secret = pet.rarity === "secret";
+    container.toggleAttribute("data-secret", secret);
+    if (secret) showSecretSilhouette(container);
+    else showPetArt(container, pet);
+  }
+
+  function renderHistoryUpgrade(row, opening) {
+    const { source, won } = opening.upgrade;
+    row.dataset.upgrade = won ? "won" : "lost";
+    const outcome = won ? "Апгрейд удачный" : "Апгрейд неудачный";
+    row.querySelector(".case-opening-chest").hidden = true;
+    const art = row.querySelector("[data-history-source]");
+    const pet = source || { name: "Питомец", emoji: "?" };
+    art.title = pet.name;
+    art.hidden = false;
+    showHistoryArt(art, pet);
+    return `${pet.name} → ${opening.pet.name}. ${outcome}.`;
+  }
+
   function renderHistory(openings, signal) {
     const displayedIds = [...historyRows.keys()];
     if (openings.length === displayedIds.length && openings.every((item, index) => item.id === displayedIds[index])) return;
@@ -532,19 +578,25 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
       if (!row) {
         row = openingTemplate.content.firstElementChild.cloneNode(true);
         row.dataset.rarity = opening.pet.rarity;
+        row.toggleAttribute("data-me", opening.me === true);
         const nameEl = row.querySelector(".case-opening-name");
-        nameEl.textContent = opening.name;
+        nameEl.textContent = opening.me ? `${opening.name} · вы` : opening.name;
         nameEl.title = opening.name;
         row.querySelector(".case-opening-initial").textContent = firstLetter(opening.name);
-        const chest = row.querySelector(".case-opening-chest");
-        const caseName = opening.case_name ? `Кейс «${opening.case_name}»` : "Кейс";
-        chest.title = caseName;
-        if (opening.case_key) chest.dataset.case = opening.case_key;
-        const secret = opening.pet.rarity === "secret";
-        const petName = secret ? "Секретный питомец" : opening.pet.name;
-        row.querySelector(".case-opening-pet").setAttribute("aria-label", `${caseName} → ${petName}`);
-        if (secret) showSecretSilhouette(row);
-        else showPetArt(row, opening.pet);
+        let label;
+        if (opening.upgrade) {
+          label = renderHistoryUpgrade(row, opening);
+        } else {
+          const chest = row.querySelector(".case-opening-chest");
+          const caseName = opening.case_name ? `Кейс «${opening.case_name}»` : "Кейс";
+          chest.title = caseName;
+          if (opening.case_key) chest.dataset.case = opening.case_key;
+          label = `${caseName} → ${opening.pet.name}`;
+        }
+        const target = row.querySelector("[data-history-target]");
+        if (opening.upgrade) target.title = opening.pet.name;
+        showHistoryArt(target, opening.pet);
+        row.querySelector(".case-opening-pet").setAttribute("aria-label", label);
         showAvatar(row.querySelector(".case-opening-avatar img"), signal, opening.id);
       }
       nextRows.set(opening.id, row);
@@ -554,18 +606,26 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   }
 
   async function refreshHistory(signal) {
+    clearTimeout(historyTimer);
+    const read = ++historyRead;
     try {
       const { openings } = await history(signal);
-      if (signal.aborted) return;
-      renderHistory(openings, signal);
-      historyStatus.textContent = "Пока нет открытий других игроков.";
-      historyStatus.hidden = openings.length > 0;
+      if (signal.aborted || read !== historyRead) return;
+      const visible = openings.filter((event) =>
+        !event.me || historyRows.has(event.id) || !(event.upgrade ? upgrade.isMutating() : purchaseBusy));
+      renderHistory(visible, signal);
+      historyStatus.textContent = "Пока нет открытий и апгрейдов.";
+      historyStatus.hidden = visible.length > 0;
     } catch {
-      if (signal.aborted) return;
+      if (signal.aborted || read !== historyRead) return;
       historyStatus.textContent = "Не удалось загрузить историю.";
       historyStatus.hidden = false;
     }
     historyTimer = setTimeout(() => refreshHistory(signal), 10000);
+  }
+
+  function reloadHistory() {
+    if (pending) void refreshHistory(pending.signal);
   }
 
   function hide() {
@@ -635,7 +695,8 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   });
   warehouseTab.addEventListener("click", showWarehouse);
   upgradeTab.addEventListener("click", showUpgrade);
-  contractTab.addEventListener("click", () => showDevelopment("Контракт", contractTab));
+  contractTab.addEventListener("click", showContract);
+  leaderboardTab.addEventListener("click", showLeaderboard);
   root.querySelector("#cases-back").addEventListener("click", () => showCatalogueScreen(true));
   root.querySelector("#cases-result-back").addEventListener("click", () => showCatalogueScreen(true));
   openButton.addEventListener("click", () => purchase());

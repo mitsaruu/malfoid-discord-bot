@@ -633,6 +633,9 @@ async function start() {
         name: login.name,
         storageKey: login.user_id ? `malfoid:case-opening:${params.get("guild_id")}:${login.user_id}` : null,
         catalogue: (signal) => api("api/cases", undefined, { signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]) }),
+        leaderboardRequest: (signal) => api("api/cases/leaderboard", undefined, {
+          signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
+        }),
         inventoryRequest: (action, fields, signal) => api(
           action ? `api/cases/inventory/${action}` : "api/cases/inventory",
           fields,

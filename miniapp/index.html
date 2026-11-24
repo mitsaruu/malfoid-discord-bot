@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Игры Malfoid</title>
   <link rel="stylesheet" href="static/style.css?v=5">
-  <link rel="stylesheet" href="static/cases.css?v=23">
+  <link rel="stylesheet" href="static/cases.css?v=31">
   <link rel="stylesheet" href="static/rocket.css?v=9">
   <link rel="stylesheet" href="static/casino.css?v=3">
   <link rel="stylesheet" href="static/roulette.css?v=3">
@@ -121,10 +121,11 @@
       <main class="pet-cases" id="cases" aria-labelledby="cases-title" lang="ru" hidden>
         <header class="cases-header">
           <nav class="cases-nav" aria-label="Разделы Зверушника">
-            <a id="cases-home" href="#cases-title" aria-current="page"><span aria-hidden="true">⬡</span> Зверушник</a>
+            <a id="cases-home" href="#cases-title" aria-current="page"><span aria-hidden="true">⬡</span> Кейсы</a>
             <button type="button" id="cases-warehouse-tab" aria-controls="cases-warehouse"><span aria-hidden="true">▦</span> Склад</button>
             <button type="button" id="cases-upgrade" aria-controls="cases-upgrade-panel"><span aria-hidden="true">⇧</span> Апгрейд</button>
-            <button type="button" id="cases-contract" aria-controls="cases-development"><span aria-hidden="true">▤</span> Контракт</button>
+            <button type="button" id="cases-contract" aria-controls="cases-contract-panel"><span aria-hidden="true">▤</span> Контракт</button>
+            <button type="button" id="cases-leaderboard" aria-controls="cases-leaderboard-panel"><span aria-hidden="true">🏆</span> Топ игроков</button>
           </nav>
           <div class="cases-profile">
             <span class="cases-avatar" aria-hidden="true">
@@ -140,7 +141,7 @@
 
         <div class="cases-layout">
           <aside class="cases-history" aria-labelledby="cases-history-title">
-            <h2 id="cases-history-title">История открытий</h2>
+            <h2 id="cases-history-title">История открытий и апгрейдов</h2>
             <p class="cases-history-status" id="cases-history-status" role="status">Загружаем историю…</p>
             <ul class="cases-history-list" id="cases-history-list" role="list"></ul>
             <template id="cases-opening-template">
@@ -154,8 +155,11 @@
                 </div>
                 <div class="case-opening-pet" role="img">
                   <span class="case-opening-chest case-theme" aria-hidden="true"></span>
+                  <span class="case-opening-art" data-history-source aria-hidden="true" hidden>
+                    <span data-pet-emoji></span><img class="case-opening-image" data-pet-image alt="" hidden>
+                  </span>
                   <span class="case-opening-arrow" aria-hidden="true"></span>
-                  <span class="case-opening-art" aria-hidden="true">
+                  <span class="case-opening-art" data-history-target aria-hidden="true">
                     <span class="case-opening-emoji" data-pet-emoji></span>
                     <img class="case-opening-image" data-pet-image alt="" hidden>
                   </span>
@@ -183,6 +187,7 @@
           <section class="case-view cases-inventory" id="cases-warehouse" aria-labelledby="cases-warehouse-title" hidden>
             <div class="inventory-header">
               <h1 id="cases-warehouse-title" tabindex="-1">Склад</h1>
+              <span class="inventory-hourly">Общий доход <strong id="inventory-hourly">—</strong></span>
               <span class="inventory-count" id="inventory-count"></span>
               <button class="inventory-collect" id="inventory-collect" type="button" disabled>
                 <span class="cases-coin" aria-hidden="true"></span> Собрать доход
@@ -270,9 +275,84 @@
             </template>
           </section>
 
-          <section class="case-view cases-development" id="cases-development" aria-labelledby="cases-development-title" hidden>
-            <h1 id="cases-development-title" tabindex="-1"></h1>
-            <p>В разработке</p>
+          <section class="case-view pet-contract" id="cases-contract-panel" aria-labelledby="cases-contract-title" hidden>
+            <h1 id="cases-contract-title" tabindex="-1">Контракт</h1>
+            <div class="contract-layout">
+              <section class="contract-picker" aria-labelledby="contract-owned-title">
+                <h2 id="contract-owned-title">Твои питомцы</h2>
+                <p>Выбери от трёх питомцев. По контракту они обменяются на одного нового.</p>
+                <div class="upgrade-options contract-options" id="contract-owned"></div>
+                <button type="button" class="cases-retry" id="contract-retry" hidden>Обновить список</button>
+              </section>
+              <section class="contract-sheet" aria-labelledby="contract-terms-title">
+                <h2 id="contract-terms-title">Условия контракта</h2>
+                <dl class="contract-totals">
+                  <div><dt>Общая стоимость ставки</dt><dd id="contract-stake">—</dd></div>
+                  <div><dt>Диапазон цены приза</dt><dd id="contract-value-range">—</dd></div>
+                </dl>
+                <button type="button" class="case-open-button upgrade-submit" id="contract-sign" disabled>Подписать контракт</button>
+                <p class="inventory-status" id="contract-status" role="status"></p>
+                <div class="contract-result" id="contract-result" role="status" hidden>
+                  <span class="case-pet-art" aria-hidden="true"><span data-pet-emoji></span><img data-pet-image alt="" hidden></span>
+                  <div>
+                    <span id="contract-result-outcome"></span>
+                    <strong id="contract-result-name"></strong>
+                    <span id="contract-result-income"></span>
+                    <span id="contract-result-price"></span>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <template id="contract-pet-template">
+              <button type="button" class="upgrade-pet-content">
+                <span class="case-pet-art" aria-hidden="true"><span data-pet-emoji></span><img data-pet-image alt="" hidden></span>
+                <strong class="case-pet-name"></strong>
+                <span class="upgrade-pet-value"></span>
+              </button>
+            </template>
+          </section>
+
+          <section class="case-view player-top" id="cases-leaderboard-panel" aria-labelledby="cases-leaderboard-title" hidden>
+            <header class="player-top-heading">
+              <h1 id="cases-leaderboard-title" tabindex="-1">Топ игроков</h1>
+              <label for="player-top-sort">
+                Сортировка
+                <select id="player-top-sort">
+                  <option value="income">Доход в час</option>
+                  <option value="xp">Уровень в чате</option>
+                  <option value="balance">Монеты</option>
+                </select>
+              </label>
+            </header>
+            <p id="player-top-status" class="inventory-status" role="status"></p>
+            <button class="cases-retry" id="player-top-retry" type="button" hidden>Обновить список</button>
+            <div id="player-top-table" hidden>
+              <div class="player-top-columns" aria-hidden="true">
+                <span>Игрок</span><span>Доход в час</span><span>Лучшие питомцы</span><span>Баланс</span>
+              </div>
+              <ol class="player-top-rows" id="player-top-rows" role="list"></ol>
+            </div>
+            <template id="player-top-row-template">
+              <li class="player-top-entry">
+                <span class="player-top-place"></span>
+                <div class="player-top-row">
+                  <div class="player-top-identity">
+                    <span class="player-top-level" data-player-level title="Уровень в чате"></span>
+                    <span class="player-top-initial" aria-hidden="true"></span>
+                    <strong class="player-top-name"></strong>
+                    <span class="player-top-self" hidden>Вы</span>
+                  </div>
+                  <div class="player-top-income"><span class="player-top-label">Доход в час</span><strong data-player-income></strong></div>
+                  <div class="player-top-pets"><span class="player-top-label">Лучшие питомцы</span><ul data-player-pets role="list"></ul></div>
+                  <div class="player-top-balance"><span class="player-top-label">Баланс</span><strong data-player-balance></strong></div>
+                </div>
+              </li>
+            </template>
+            <template id="player-top-pet-template">
+              <li class="player-top-pet">
+                <span class="player-top-pet-art" role="img"><span data-pet-emoji aria-hidden="true"></span><img data-pet-image alt="" hidden></span>
+              </li>
+            </template>
           </section>
 
           <section class="case-view case-theme" id="cases-case" aria-labelledby="cases-case-title" hidden>
@@ -480,9 +560,11 @@
   <script src="static/coinflip.js"></script>
   <script src="static/durak_online.js?v=3"></script>
   <script src="static/durak.js?v=4"></script>
-  <script src="static/cases-inventory.js?v=9"></script>
+  <script src="static/cases-inventory.js?v=10"></script>
   <script src="static/cases-upgrade.js?v=5"></script>
-  <script src="static/cases.js?v=20"></script>
-  <script src="static/app.js?v=12"></script>
+  <script src="static/cases-contract.js?v=2"></script>
+  <script src="static/cases-leaderboard.js?v=3"></script>
+  <script src="static/cases.js?v=24"></script>
+  <script src="static/app.js?v=13"></script>
 </body>
 </html>

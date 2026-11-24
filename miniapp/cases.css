@@ -124,6 +124,7 @@ body[data-game="cases"] .activity-content { padding: 0; }
 .cases-layout {
   display: grid;
   grid-template-columns: clamp(252px, 22vw, 312px) minmax(0, 1fr);
+  align-items: stretch;
 }
 
 .cases-history {
@@ -138,14 +139,13 @@ body[data-game="cases"] .activity-content { padding: 0; }
 .cases-history-list, .cases-grid { margin: 0; padding: 0; list-style: none; }
 .cases-history-list {
   display: grid;
+  align-items: start;
   gap: 8px;
-  max-height: 480px;
-  overflow: auto;
-  scrollbar-width: thin;
 }
 
 .case-opening {
   --drop-color: #a4b4bf;
+  --case-opening-art-height: 52px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -163,6 +163,9 @@ body[data-game="cases"] .activity-content { padding: 0; }
 .case-opening[data-rarity="legendary"] { --drop-color: #f0b860; }
 .case-opening[data-rarity="mythic"] { --drop-color: #ff9a9a; }
 .case-opening[data-rarity="secret"] { --drop-color: #65dce3; }
+.case-opening[data-me] { background: linear-gradient(105deg, #f4c65b18, transparent 76%), #191c2b; }
+.case-opening[data-upgrade="won"] { --drop-color: #9fe6ba; }
+.case-opening[data-upgrade="lost"] { --drop-color: #ffafb3; }
 
 .case-opening-player, .case-opening-pet {
   display: flex;
@@ -184,6 +187,7 @@ body[data-game="cases"] .activity-content { padding: 0; }
 
 .case-opening-pet {
   gap: 4px;
+  min-height: var(--case-opening-art-height);
 }
 
 .case-opening-chest {
@@ -191,7 +195,7 @@ body[data-game="cases"] .activity-content { padding: 0; }
   place-items: center;
   flex: none;
   width: 64px;
-  height: 52px;
+  height: var(--case-opening-art-height);
   transform: scale(.94);
 }
 
@@ -206,10 +210,34 @@ body[data-game="cases"] .activity-content { padding: 0; }
 }
 
 .case-opening-arrow {
+  position: relative;
+  flex: none;
   width: 13px;
   height: 10px;
-  background: var(--cases-muted);
+  color: var(--cases-muted);
+}
+
+.case-opening-arrow::before {
+  position: absolute;
+  inset: 0;
+  background: currentColor;
   clip-path: polygon(0 39%, 65% 39%, 44% 13%, 57% 0, 100% 50%, 57% 100%, 44% 87%, 65% 61%, 0 61%);
+  content: "";
+}
+
+.case-opening[data-upgrade] .case-opening-arrow { width: 15px; height: 12px; }
+.case-opening[data-upgrade="won"] .case-opening-arrow { color: var(--drop-color); }
+.case-opening[data-upgrade="lost"] .case-opening-arrow { color: #fff; }
+.case-opening[data-upgrade="lost"] .case-opening-arrow::after {
+  position: absolute;
+  inset: 0;
+  width: 12px;
+  height: 12px;
+  margin: auto;
+  background:
+    linear-gradient(45deg, transparent 43%, #ff5362 44% 56%, transparent 57%),
+    linear-gradient(-45deg, transparent 43%, #ff5362 44% 56%, transparent 57%);
+  content: "";
 }
 
 .case-opening-art {
@@ -224,7 +252,7 @@ body[data-game="cases"] .activity-content { padding: 0; }
 
 .case-opening-image { width: 100%; height: 100%; object-fit: contain; }
 
-.case-opening[data-rarity="secret"] .case-opening-art:has(.case-opening-image:not([hidden]))::after {
+:is(.case-opening-art, .player-top-pet-art)[data-secret]:has(img:not([hidden]))::after {
   position: absolute;
   inset: 0;
   display: grid;
@@ -312,18 +340,6 @@ body[data-game="cases"] .activity-content { padding: 0; }
   min-width: 0;
   padding: clamp(16px, 2.7vw, 36px) clamp(14px, 3vw, 42px) 42px;
 }
-
-.cases-development {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding-block: clamp(16px, 2.7vw, 36px);
-  text-align: center;
-}
-
-.cases-development h1 { margin: 0 0 8px; font-size: clamp(1.35rem, 2.4vw, 2rem); }
-.cases-development p { margin: 0; color: var(--cases-muted); }
 
 .case-back {
   display: inline-flex;
@@ -564,6 +580,7 @@ body[data-game="cases"] .activity-content { padding: 0; }
 .case-result[data-fast]:not([data-rarity="secret"]) .case-result-art { animation: none; }
 .case-result-actions .case-back { margin: 0; }
 .case-result-art img, .case-pet-art img, .case-reel-art img { width: 100%; height: 100%; object-fit: contain; }
+.pet-cases img[data-tall-sprite] { min-height: 0; transform: scale(.86); }
 .case-result-info strong::first-letter, .case-pet-name::first-letter { text-transform: uppercase; }
 .case-contents { margin-top: 24px; }
 .case-contents h2 { margin: 0 0 12px; font-size: clamp(1.18rem, 1.9vw, 1.5rem); }
@@ -623,6 +640,8 @@ body[data-game="cases"] .activity-content { padding: 0; }
 .inventory-collect:disabled { opacity: .55; cursor: default; }
 .inventory-count, .inventory-group-count { color: var(--cases-muted); font-size: .8125rem; }
 .inventory-count { margin-inline-end: auto; }
+.inventory-hourly { color: var(--cases-muted); font-size: .8125rem; }
+.inventory-hourly strong { margin-inline-start: 3px; color: var(--cases-gold); font-variant-numeric: tabular-nums; }
 .inventory-group + .inventory-group { padding-top: 16px; border-top: 1px solid var(--cases-line); }
 .inventory-group[data-drop-target] h2 { color: var(--cases-gold); }
 .inventory-group-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 12px; }
@@ -786,6 +805,149 @@ body[data-game="cases"] .activity-content { padding: 0; }
 .upgrade-center [data-result="won"] { color: #8be4b0; }
 .upgrade-center [data-result="lost"] { color: #ffa1a6; }
 
+.pet-contract h1 { margin: 0 0 20px; font-size: clamp(1.35rem, 2.4vw, 2rem); }
+.contract-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  align-items: start;
+  gap: clamp(14px, 2vw, 24px);
+}
+.contract-picker, .contract-sheet { display: grid; gap: 12px; min-width: 0; }
+.contract-picker h2, .contract-sheet h2 { margin: 0; font-size: 1rem; }
+.contract-picker p { margin: 0; color: var(--cases-muted); font-size: .875rem; }
+.contract-options { max-height: 390px; grid-template-columns: repeat(auto-fill, minmax(min(94px, 100%), 1fr)); }
+.contract-options button { min-height: 96px; }
+.contract-picker .cases-retry, .contract-sheet .case-open-button { justify-self: start; }
+.contract-sheet {
+  padding: clamp(14px, 2vw, 22px);
+  border: 1px solid var(--cases-line);
+  border-radius: 12px;
+  background: #171a2a;
+}
+.contract-totals { display: grid; gap: 8px; margin: 0; }
+.contract-totals > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px 12px;
+  flex-wrap: wrap;
+  padding-block: 7px;
+  border-bottom: 1px solid var(--cases-line);
+}
+.contract-totals dt { color: var(--cases-muted); font-size: .875rem; }
+.contract-totals dd { margin: 0; font-variant-numeric: tabular-nums; }
+.contract-result[data-outcome="dearer"] #contract-result-outcome { color: #9fe6ba; }
+.contract-result[data-outcome="cheaper"] #contract-result-outcome { color: #ffafb3; }
+.contract-result {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid #49405b;
+  border-radius: 9px;
+  background: #201d31;
+}
+.contract-result .case-pet-art { width: clamp(48px, 8vw, 78px); }
+.contract-result div { display: grid; gap: 4px; font-size: .875rem; }
+#contract-result-price { color: var(--cases-gold); }
+
+.player-top {
+  --player-top-place-width: clamp(1.4rem, 3vw, 2.5rem);
+  --player-top-place-gap: 8px;
+  container-type: inline-size;
+}
+.player-top-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  margin-block-end: 16px;
+}
+.player-top-heading h1 { margin: 0; font-size: clamp(1.35rem, 2.4vw, 2rem); }
+.player-top-heading label { display: flex; align-items: center; gap: 8px; color: var(--cases-muted); font-size: .8125rem; }
+.player-top-heading select {
+  min-height: 36px;
+  padding: 4px 8px;
+  border: 1px solid var(--cases-line);
+  border-radius: 7px;
+  background: #191c2b;
+  color: var(--cases-text);
+  font: inherit;
+}
+.player-top-rows { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.player-top-entry { display: grid; grid-template-columns: var(--player-top-place-width) minmax(0, 1fr); align-items: center; gap: var(--player-top-place-gap); }
+.player-top-columns, .player-top-row {
+  display: grid;
+  grid-template-columns: minmax(148px, 1.25fr) minmax(74px, .65fr) minmax(136px, 1.35fr) minmax(72px, .65fr);
+  grid-template-areas: "player income pets balance";
+  align-items: center;
+  gap: 8px 10px;
+  padding: 8px 12px;
+}
+.player-top-columns {
+  margin-inline-start: calc(var(--player-top-place-width) + var(--player-top-place-gap));
+  color: var(--cases-muted);
+  font-size: .75rem;
+}
+.player-top-columns :last-child { text-align: right; }
+.player-top-row { min-width: 0; border: 1px solid var(--cases-line); border-radius: 9px; background: #191c2b; font-size: .875rem; }
+.player-top-row[data-me] {
+  border-color: #77613b;
+  background: linear-gradient(105deg, #f4c65b30, #f4c65b0b 62%, transparent), #191c2b;
+}
+.player-top-identity { grid-area: player; display: flex; align-items: center; gap: 7px; min-width: 0; }
+.player-top-place { min-width: 0; color: var(--cases-muted); font-size: .8rem; text-align: center; font-variant-numeric: tabular-nums; }
+.player-top-level {
+  flex: none;
+  padding: 3px 5px;
+  border-radius: 5px;
+  background: #292a40;
+  color: var(--cases-muted);
+  font-size: .69rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.player-top-initial {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 30px;
+  aspect-ratio: 1;
+  border-radius: 7px;
+  background: #353256;
+  color: #e6dcff;
+  font-weight: 750;
+}
+.player-top-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player-top-self { flex: none; color: var(--cases-gold); font-size: .71rem; }
+.player-top-income { grid-area: income; }
+.player-top-balance { grid-area: balance; text-align: right; }
+.player-top-income, .player-top-balance { min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.player-top-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.player-top-pets { grid-area: pets; min-width: 0; }
+.player-top-pets ul { display: flex; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.player-top-pets[data-empty] ul::after { color: var(--cases-muted); content: "—"; }
+.player-top-pet {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 40px;
+  aspect-ratio: 1;
+  border-radius: 6px;
+  background: #24263a;
+}
+.player-top-pet-art { position: relative; display: grid; place-items: center; width: 34px; height: 34px; font-size: 1rem; }
+.player-top-pet-art img { width: 100%; height: 100%; object-fit: contain; }
+
 @media (max-width: 1130px) {
   .pet-upgrade-layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .upgrade-center { grid-row: 1; grid-column: 1 / -1; padding-top: 0; }
@@ -798,11 +960,38 @@ body[data-game="cases"] .activity-content { padding: 0; }
 
 @media (max-width: 920px) {
   .cases-layout { grid-template-columns: minmax(0, 1fr); align-content: start; }
-  .cases-layout:has(.cases-development:not([hidden])) { grid-template-rows: auto minmax(min-content, 1fr); }
   .cases-history { padding: 14px 16px; border-inline-end: 0; border-bottom: 1px solid var(--cases-line); }
   .cases-history h2 { margin: 0 0 9px; }
   .cases-history-status { margin-inline: 0; }
-  .cases-history-list { grid-auto-flow: column; grid-auto-columns: minmax(250px, 1fr); }
+  .cases-history-list { grid-auto-flow: column; grid-auto-columns: minmax(250px, 1fr); overflow-x: auto; scrollbar-width: thin; }
+}
+
+@media (max-width: 650px) {
+  .contract-layout { grid-template-columns: minmax(0, 1fr); }
+  .contract-options { max-height: 240px; }
+}
+
+@container (max-width: 590px) {
+  .player-top-columns { display: none; }
+  .player-top-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-areas: "player player balance" "pets pets income";
+    gap: 8px;
+    padding: 9px 10px;
+  }
+  .player-top-income { text-align: right; }
+  .player-top-label {
+    position: static;
+    display: block;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+    color: var(--cases-muted);
+    font-size: .71rem;
+    white-space: normal;
+  }
+  .player-top-pets ul { margin-top: 4px; }
 }
 
 @media (max-width: 550px) {

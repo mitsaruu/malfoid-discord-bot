@@ -156,7 +156,8 @@ impl Database {
                  name     TEXT NOT NULL,
                  face     TEXT NOT NULL,
                  species  TEXT NOT NULL,
-                 case_key TEXT
+                 case_key TEXT,
+                 upgrade  TEXT
              );
              CREATE TABLE IF NOT EXISTS case_opening_requests (
                  guild_id   INTEGER NOT NULL,
@@ -286,6 +287,7 @@ impl Database {
              CREATE INDEX IF NOT EXISTS word_daily_ru_guild_day ON word_daily_ru(guild_id, day);
              CREATE INDEX IF NOT EXISTS levels_guild_xp ON levels(guild_id, xp DESC);
              CREATE INDEX IF NOT EXISTS economy_guild_balance ON economy(guild_id, balance DESC);
+             CREATE INDEX IF NOT EXISTS pets_guild_user ON pets(guild_id, user_id);
              CREATE INDEX IF NOT EXISTS case_openings_guild_id ON case_openings(guild_id, id DESC);
              CREATE INDEX IF NOT EXISTS case_openings_player_species ON case_openings(guild_id, user_id, species);",
         )?;
@@ -403,11 +405,11 @@ impl Database {
 
     fn prepare_case_history(&self) -> rusqlite::Result<()> {
         self.transaction(|tx| {
-            let present: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('case_openings') WHERE name = 'case_key')",
-                [], |row| row.get(0),
-            )?;
-            if !present {
+            let has_column = |name| tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('case_openings') WHERE name = ?1)",
+                [name], |row| row.get::<_, bool>(0),
+            );
+            if !has_column("case_key")? {
                 tx.execute("ALTER TABLE case_openings ADD COLUMN case_key TEXT", [])?;
                 tx.execute(
                     "UPDATE case_openings SET case_key = requests.case_key
@@ -418,6 +420,9 @@ impl Database {
                     "UPDATE case_openings SET case_key = 'secret' WHERE case_key IS NULL AND species = 'stellochka'",
                     [],
                 )?;
+            }
+            if !has_column("upgrade")? {
+                tx.execute("ALTER TABLE case_openings ADD COLUMN upgrade TEXT", [])?;
             }
             Ok(())
         })
@@ -1523,6 +1528,7 @@ mod tests {
         let db = Database::open(&file.0).unwrap();
         db.lock().execute_batch(
             "ALTER TABLE case_openings DROP COLUMN case_key;
+             ALTER TABLE case_openings DROP COLUMN upgrade;
              INSERT INTO case_openings (id, guild_id, user_id, name, face, species) VALUES
                  (1, 7, 1, 'Алиса', 'alice.png', 'valera'),
                  (2, 7, 2, 'Борис', 'boris.png', 'igor'),
@@ -1534,7 +1540,7 @@ mod tests {
 
         for _ in 0..2 {
             let migrated = Database::open(&file.0).unwrap();
-            let openings = case_history(&migrated, 7, 4).unwrap();
+            let openings = case_history(&migrated, 7).unwrap();
             assert_eq!(openings.iter().map(|entry| (entry.id, entry.kind)).collect::<Vec<_>>(),
                 [(3, Some(Case::Secret)), (2, Some(Case::Expensive)), (1, None)]);
         }
