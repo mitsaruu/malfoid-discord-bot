@@ -19,10 +19,19 @@ function fixture(game, { reduced = false, audio = true, avatar = false } = {}) {
     children = [];
     style = { setProperty() {} };
     dataset = {};
-    classList = { add() {}, toggle() {} };
+    attributes = new Map();
+    classList = {
+      classes: new Set(),
+      add(name) { this.classes.add(name); },
+      toggle(name, force) { force ? this.classes.add(name) : this.classes.delete(name); },
+      contains(name) { return this.classes.has(name); },
+    };
     #value = "";
+    #text = "";
     get value() { return this.#value; }
     set value(value) { this.#value = String(value); }
+    get textContent() { return this.children.length ? [this.#text, ...this.children.map((child) => child.textContent)].join("") : this.#text; }
+    set textContent(value) { this.#text = value; this.children = []; }
     append(...children) {
       for (const child of children) {
         const node = typeof child === "string" ? Object.assign(new Element(), { textContent: child }) : child;
@@ -35,11 +44,13 @@ function fixture(game, { reduced = false, audio = true, avatar = false } = {}) {
       this.children.unshift(child);
     }
     replaceChildren(...children) {
-      this.children = [];
+      this.textContent = "";
       this.append(...children);
     }
     remove() { this.parent.children = this.parent.children.filter((child) => child !== this); }
-    setAttribute() {}
+    setAttribute(name, value) { this.attributes.set(name, value); }
+    getAttribute(name) { return this.attributes.get(name); }
+    focus() {}
     getContext() { return null; }
     animate(keyframes, options) {
       const animation = {
@@ -96,7 +107,7 @@ function fixture(game, { reduced = false, audio = true, avatar = false } = {}) {
       return nextId;
     },
     cancelAnimationFrame: (id) => frames.delete(id),
-    setTimeout: (fn) => timers.set(++nextId, fn) && nextId,
+    setTimeout: (fn, delay) => timers.set(++nextId, Object.assign(fn, { delay })) && nextId,
     clearTimeout: (id) => timers.delete(id),
     setInterval: (fn) => intervals.set(++nextId, fn) && nextId,
     clearInterval: (id) => intervals.delete(id),
@@ -112,7 +123,7 @@ function fixture(game, { reduced = false, audio = true, avatar = false } = {}) {
   const nodes = (className) => descendants(root).filter((node) => node.className === className);
   const flush = () => new Promise(setImmediate);
   return {
-    animations, sounds, cues, calls, frames, timers, intervals, view, nodes, flush,
+    animations, sounds, cues, calls, frames, timers, intervals, root, view, nodes, flush,
     node: (name) => nodes(name)[0],
     async respond(action, data) {
       assert.equal(calls.at(-1).action, action);
@@ -442,6 +453,22 @@ test("blackjack marks the avatar of the player with the active hand", async () =
     ["Алиса (вы)", "Борис"]);
 });
 
+test("roulette shows the number and color history after the ball lands", async () => {
+  const f = fixture("roulette");
+  const old = { id: "previous", number: 0 };
+  f.view.show();
+  await f.respond("state", { ...rouletteState(openRound), history: [old] });
+  assert.equal(f.node("roulette-history-empty").hidden, true);
+  const rows = () => f.node("roulette-history-list").children.map(({ children: [number, color] }) =>
+    [number.textContent, number.dataset.tone, color.textContent]);
+  assert.deepEqual(rows(), [["0", "green", "Зелёное"]]);
+  await f.poll({ ...rouletteState(null, receipt(32)), history: [{ id: openRound.id, number: 32 }, old] });
+  f.frame(2799);
+  assert.deepEqual(rows(), [["0", "green", "Зелёное"]]);
+  f.frame(2800);
+  assert.deepEqual(rows(), [["32", "red", "Красное"], ["0", "green", "Зелёное"]]);
+});
+
 const symbols = Array.from({ length: 6 }, (_, index) => ({ icon: String(index), name: String(index), payouts: [] }));
 const slotsState = (spin = null) => ({ spin, symbols, paylines: [], balance: 500, min_bet: 1, max_bet: 500 });
 const slotsResult = slotsState({
@@ -467,9 +494,8 @@ async function startSlots(options, initial = slotsState()) {
   return f;
 }
 
-test("slots brakes from the rendered reel position, then sounds each individual stop", async () => {
+test("slots brakes from the rendered reel position and stays silent", async () => {
   const f = await startSlots();
-  assert.deepEqual(f.sounds, ["slots.spin"]);
   assert.ok(f.animations[0].options.duration < symbols.length * 65);
   f.animations[0].progress = 2.25 / symbols.length;
   await f.respond("spin", slotsResult);
@@ -479,35 +505,33 @@ test("slots brakes from the rendered reel position, then sounds each individual 
   assert.deepEqual(firstTrack.children.slice(0, 3).map((child) => child.textContent), ["2", "3", "4"]);
   assert.match(braking[0].keyframes[0].transform, /-8\.3333/);
   assert.ok(braking[0].options.duration > 540 && braking[4].options.duration > 1140);
-  for (const [index, animation] of braking.entries()) {
-    animation.finish();
-    await f.flush();
-    assert.equal(f.sounds.filter((name) => name === "slots.stop").length, index + 1);
-  }
-  assert.equal(f.sounds.at(-1), "slots.spin:end");
-  assert.ok(!f.sounds.includes("slots.win"));
+  for (const animation of braking) animation.finish();
+  await f.flush();
+  assert.deepEqual(f.sounds, []);
   assert.deepEqual(f.nodes("slots-strip")[0].children.map((child) => child.textContent), ["5", "4", "3"]);
 });
 
-test("slots keeps the loop through the last actual stop, then plays a line win once", async () => {
+test("slots waits for the last reel before displaying a winning payout", async () => {
   const f = await startSlots();
   await f.respond("spin", winningSlots);
   const braking = f.animations.slice(5);
   const [last, ...earlier] = braking;
   for (const animation of earlier) animation.finish();
   await f.flush();
-  assert.deepEqual(f.sounds, ["slots.spin", ...Array(4).fill("slots.stop")]);
+  assert.match(f.node("slots-payout-last").textContent, /—$/);
   last.finish();
   await f.flush();
-  assert.deepEqual(f.sounds, ["slots.spin", ...Array(5).fill("slots.stop"), "slots.spin:end", "slots.win"]);
+  assert.match(f.node("slots-payout-last").textContent, /1 🪙$/);
+  assert.equal(f.node("slots-win-overlay").hidden, true);
+  assert.deepEqual(f.sounds, []);
 });
 
-test("slots does not sound stops or a win on a repeated spin receipt", async () => {
+test("slots does not brake again on a repeated spin receipt", async () => {
   const f = await startSlots({}, winningSlots);
   assert.equal(f.calls.at(-1).fields.expected_round, winningSlots.spin.id);
   await f.respond("spin", winningSlots);
   assert.equal(f.animations.length, 5);
-  assert.deepEqual(f.sounds, ["slots.spin", "slots.spin:end"]);
+  assert.deepEqual(f.sounds, []);
 });
 
 for (const [name, cancel] of [
@@ -515,28 +539,27 @@ for (const [name, cancel] of [
   ["document hide", (f) => f.visibility(true)],
   ["page suspension", (f) => f.page("pagehide")],
 ]) {
-  test(`slots releases the loop without reel-stop sounds on ${name}`, async () => {
+  test(`slots removes the animation on ${name}`, async () => {
     const f = await startSlots();
     await f.respond("spin", winningSlots);
     f.animations[5].finish();
     cancel(f);
     await f.flush();
-    assert.deepEqual(f.sounds, ["slots.spin", "slots.spin:end"]);
+    assert.deepEqual(f.sounds, []);
     assert.ok(f.nodes("slots-symbol").every((cell) => cell.style.visibility === ""));
   });
 }
 
-test("slots stops its loop when the spin request fails", async () => {
+test("slots removes its animation when the spin request fails", async () => {
   const f = await startSlots();
   f.calls.at(-1).reject(new Error("connection lost"));
   await f.flush();
-  assert.deepEqual(f.sounds, ["slots.spin", "slots.spin:end"]);
+  assert.ok(f.nodes("slots-symbol").every((cell) => cell.style.visibility === ""));
   await f.respond("state", winningSlots);
-  assert.deepEqual(f.sounds, ["slots.spin", "slots.spin:end"]);
   assert.equal(f.nodes("slots-strip")[0].children[0].textContent, "5");
 });
 
-test("slots does not restart audio when returning after a partial stop sequence", async () => {
+test("slots paints the receipt when returning after a partial stop sequence", async () => {
   const f = await startSlots();
   await f.respond("spin", winningSlots);
   f.animations[5].finish();
@@ -544,23 +567,22 @@ test("slots does not restart audio when returning after a partial stop sequence"
   f.visibility(true);
   f.visibility(false);
   await f.flush();
-  assert.deepEqual(f.sounds, ["slots.spin", "slots.stop", "slots.spin:end"]);
   assert.equal(f.nodes("slots-strip")[0].children[0].textContent, "5");
 });
 
-test("slots plays a confirmed win with reduced motion and skips the loop and stop sequence", async () => {
+test("slots paints a confirmed win with reduced motion and skips the animation", async () => {
   const f = await startSlots({ reduced: true });
   await f.respond("spin", winningSlots);
   assert.equal(f.animations.length, 0);
-  assert.deepEqual(f.sounds, ["slots.win"]);
+  assert.match(f.node("slots-payout-last").textContent, /1 🪙$/);
 });
 
-test("slots plays the confirmed win when reduced motion ends an active spin", async () => {
+test("slots paints the confirmed win when reduced motion ends an active spin", async () => {
   const f = await startSlots();
   await f.respond("spin", winningSlots);
   f.reduce();
   await f.flush();
-  assert.deepEqual(f.sounds, ["slots.spin", "slots.spin:end", "slots.win"]);
+  assert.match(f.node("slots-payout-last").textContent, /1 🪙$/);
 });
 
 test("slots can present a result with reduced motion and no audio API", async () => {
@@ -568,6 +590,179 @@ test("slots can present a result with reduced motion and no audio API", async ()
   await f.respond("spin", slotsResult);
   assert.equal(f.animations.length, 0);
   assert.deepEqual(f.nodes("slots-strip")[0].children.map((child) => child.textContent), ["5", "4", "3"]);
+});
+
+async function setupSlotsSeries({ count = 2, runs = 3, reduced = true } = {}) {
+  const f = fixture("slots", { reduced });
+  f.view.show();
+  await f.respond("state", slotsState());
+  f.nodes("slots-board-choice").find((choice) => Number(choice.dataset.count) === count).dispatchEvent(new Event("click"));
+  f.node("slots-repeats").dispatchEvent(new Event("click"));
+  f.nodes("slots-repeat-choice").find((choice) => Number(choice.dataset.count) === runs).dispatchEvent(new Event("click"));
+  assert.equal(f.node("slots-repeat-menu").hidden, true);
+  f.node("casino-toolbar").dispatchEvent(new Event("submit", { cancelable: true }));
+  return f;
+}
+
+function multiSlotsResult(id, count, balance = 500) {
+  const boards = Array.from({ length: count }, (_, index) => ({
+    grid: Array.from({ length: 3 }, () => Array(5).fill(index)),
+    wins: [], stake: 1, payout: 0,
+  }));
+  return { ...slotsState({ id, boards, stake: count, payout: 0 }), balance };
+}
+
+test("slots starts all three boards together and restores their individual results", async () => {
+  const f = await setupSlotsSeries({ count: 3, runs: 1, reduced: false });
+  assert.equal(f.nodes("slots-board").length, 3);
+  assert.equal(f.animations.length, 15);
+  assert.equal(f.calls.at(-1).fields.boards, 3);
+  const result = multiSlotsResult("three-boards", 3);
+  await f.respond("spin", result);
+  assert.equal(f.animations.length, 30);
+  for (const animation of f.animations.slice(15)) animation.finish();
+  await f.flush();
+  assert.deepEqual([0, 5, 10].map((index) => f.nodes("slots-strip")[index].children[0].textContent), ["0", "1", "2"]);
+
+  const reopened = fixture("slots");
+  reopened.view.show();
+  await reopened.respond("state", result);
+  assert.equal(reopened.nodes("slots-board-choice")[2].getAttribute("aria-pressed"), "true");
+  assert.equal(reopened.nodes("slots-board").length, 3);
+  assert.deepEqual([0, 5, 10].map((index) => reopened.nodes("slots-strip")[index].children[0].textContent), ["0", "1", "2"]);
+});
+
+test("slots auto-spin keeps the stake and board count fixed for exactly 30 launches", async () => {
+  const f = await setupSlotsSeries({ runs: 30 });
+  const lever = f.node("slots-lever");
+  assert.equal(lever.type, "submit");
+  assert.equal(lever.getAttribute("form"), f.node("casino-toolbar").id);
+  assert.match(lever.getAttribute("aria-label"), /запустить серию/);
+  assert.equal(lever.disabled, true);
+  assert.equal(f.node("slots-stop").hidden, false);
+  for (let step = 1; step <= 30; step++) {
+    const { fields } = f.calls.at(-1);
+    assert.equal(fields.boards, 2);
+    assert.equal(fields.bet, "1");
+    assert.equal(fields.expected_round, step === 1 ? null : `spin-${step - 1}`);
+    await f.respond("spin", multiSlotsResult(`spin-${step}`, 2));
+    if (step < 30) {
+      assert.equal(f.timers.size, 1);
+      const [id, run] = f.timers.entries().next().value;
+      f.timers.delete(id);
+      run();
+    }
+  }
+  assert.equal(f.calls.filter(({ action }) => action === "spin").length, 30);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.node("slots-stop").hidden, true);
+  assert.equal(lever.disabled, false);
+});
+
+test("slots extends auto-spin and shows the portrait and both payouts after every reel stops", async () => {
+  const f = await setupSlotsSeries({ runs: 3, reduced: false });
+  const first = multiSlotsResult("first", 2);
+  first.symbols = [...symbols.slice(0, 5), { icon: "portrait", name: "Даня", payouts: [1] }];
+  first.paylines = winningSlots.paylines;
+  first.spin.boards[0] = winningSlots.spin;
+  first.spin.payout = first.spin.boards[0].payout;
+  await f.respond("spin", first);
+  assert.equal(f.animations.length, 10, "the early response does not trigger braking immediately");
+  const [leadInId, leadIn] = f.timers.entries().next().value;
+  assert.ok(leadIn.delay >= 1000);
+  f.timers.delete(leadInId);
+  leadIn();
+  await f.flush();
+  assert.equal(f.timers.size, 0, "the results pause starts after the reels brake");
+  for (const animation of f.animations.slice(10)) animation.finish();
+  await f.flush();
+  const winning = f.nodes("slots-symbol").filter((cell) => cell.classList.contains("slots-symbol--win"));
+  assert.equal(winning.length, 3);
+  assert.ok(winning.every((cell) => cell.children[0].children[0].src === "static/slots-portrait.png"));
+  assert.ok(winning.every((cell) => cell.getAttribute("aria-label") === "Даня, выигрыш"));
+  assert.match(f.node("slots-payout-last").textContent, /1 🪙$/);
+  assert.match(f.node("slots-payout-series").textContent, /1 🪙$/);
+  const [id, next] = f.timers.entries().next().value;
+  assert.equal(next.delay, 1350);
+  f.timers.delete(id);
+  f.reduce();
+  next();
+  await f.respond("spin", multiSlotsResult("second", 2));
+  assert.match(f.node("slots-payout-last").textContent, /0 🪙$/);
+  assert.match(f.node("slots-payout-series").textContent, /1 🪙$/);
+});
+
+test("slots selects the effect and pause using the highest payout multiplier on any board", async () => {
+  const cases = [[10, "", 1350], [11, "green", 2100], [25, "green", 2100], [26, "blue", 2600],
+    [50, "blue", 2600], [51, "violet", 3400], [99, "violet", 3400], [100, "gold", 4300]];
+  for (const [payout, effect, pause] of cases) {
+    const f = await setupSlotsSeries({ count: 3 });
+    const result = multiSlotsResult("first", 3);
+    result.spin.boards[2].payout = result.spin.payout = payout;
+    await f.respond("spin", result);
+    assert.equal(f.root.dataset.slotsReward, effect);
+    assert.equal([...f.timers.values()][0].delay, pause);
+  }
+});
+
+test("slots flashes the total payout once the last reel lands on a win of at least 3x", async () => {
+  const f = await setupSlotsSeries({ runs: 1, reduced: false });
+  const result = multiSlotsResult("first", 2);
+  result.spin.boards[0].payout = 3;
+  result.spin.boards[1].payout = 1;
+  result.spin.payout = 4;
+  await f.respond("spin", result);
+  const [last, ...earlier] = f.animations.slice(10);
+  for (const animation of earlier) animation.finish();
+  await f.flush();
+  assert.equal(f.node("slots-win-overlay").hidden, true);
+  last.finish();
+  await f.flush();
+  assert.equal(f.node("slots-win-overlay").hidden, false);
+  assert.equal(f.node("slots-win-amount").textContent, "4 🪙");
+  f.node("slots-win-amount").dispatchEvent(new Event("animationend"));
+  assert.equal(f.node("slots-win-overlay").hidden, true);
+});
+
+for (const [name, cancel] of [
+  ["the stop button", (f) => f.node("slots-stop").dispatchEvent(new Event("click"))],
+  ["view hide", (f) => f.view.hide()],
+  ["document hide", (f) => f.visibility(true)],
+  ["page suspension", (f) => f.page("pagehide")],
+]) {
+  test(`slots cancels a scheduled launch on ${name}`, async () => {
+    const f = await setupSlotsSeries();
+    await f.respond("spin", multiSlotsResult("first", 2));
+    assert.equal(f.timers.size, 1);
+    cancel(f);
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.calls.filter(({ action }) => action === "spin").length, 1);
+  });
+}
+
+test("slots settles an in-flight launch after stopping and never sends the next one", async () => {
+  const f = await setupSlotsSeries();
+  f.node("slots-stop").dispatchEvent(new Event("click"));
+  await f.respond("spin", multiSlotsResult("first", 2));
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.nodes("slots-strip")[5].children[0].textContent, "1");
+});
+
+test("slots stops a series when the balance cannot cover all selected boards", async () => {
+  const f = await setupSlotsSeries();
+  await f.respond("spin", multiSlotsResult("first", 2, 1));
+  assert.equal(f.timers.size, 0);
+  assert.match(f.nodes("casino-feedback").at(-1).textContent, /Не хватает монет/);
+});
+
+test("slots never continues auto-spin after recovering a lost reply", async () => {
+  const f = await setupSlotsSeries();
+  f.calls.at(-1).reject(new Error("timeout"));
+  await f.flush();
+  await f.respond("state", multiSlotsResult("first", 2));
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.node("slots-stop").hidden, true);
+  assert.equal(f.nodes("slots-strip")[5].children[0].textContent, "1");
 });
 
 test("mines only sounds the requested tile, including a confirmed reveal recovered after a timeout", async () => {

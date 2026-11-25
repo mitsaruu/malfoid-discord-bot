@@ -80,7 +80,7 @@ function createCaseReel(track, pets, renderCard) {
   };
 }
 
-function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, leaderboardRequest, openCase, history, avatar }) {
+function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, leaderboardRequest, leaderboardAvatar, openCase, history, avatar }) {
   const nameEl = root.querySelector("#cases-name");
   const initial = root.querySelector("#cases-initial");
   const avatarEl = root.querySelector("#cases-avatar");
@@ -158,7 +158,9 @@ function createCasesView({ root, name, storageKey, catalogue, inventoryRequest, 
   let inventoryFull = false;
   const fullMessage = "у вас полный склад, продайте лишних питомцев";
 
-  const leaderboard = createCasesLeaderboard({ root: leaderboardPanel, request: leaderboardRequest, showPetArt, showSecretSilhouette });
+  const leaderboard = createCasesLeaderboard({
+    root: leaderboardPanel, request: leaderboardRequest, avatar: leaderboardAvatar, showPetArt, showSecretSilhouette,
+  });
   const warehouse = createCasesInventory({
     root: warehousePanel,
     request: inventoryRequest,

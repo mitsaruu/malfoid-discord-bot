@@ -179,6 +179,15 @@ impl Database {
                  guild_id   INTEGER PRIMARY KEY,
                  channel_id INTEGER
              );
+             CREATE TABLE IF NOT EXISTS miniapp_roulette_history (
+                 id       INTEGER PRIMARY KEY,
+                 guild_id INTEGER NOT NULL,
+                 round_id INTEGER NOT NULL,
+                 number   INTEGER NOT NULL CHECK(number BETWEEN 0 AND 36),
+                 UNIQUE (guild_id, round_id)
+             );
+             CREATE INDEX IF NOT EXISTS miniapp_roulette_history_recent
+                 ON miniapp_roulette_history(guild_id, id DESC);
              CREATE TABLE IF NOT EXISTS word_daily (
                  guild_id INTEGER, user_id INTEGER, day TEXT, answer TEXT, guesses TEXT,
                  PRIMARY KEY (guild_id, user_id, day)

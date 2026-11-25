@@ -920,6 +920,12 @@ body[data-game="cases"] .activity-content { padding: 0; }
   color: #e6dcff;
   font-weight: 750;
 }
+.player-top-identity .game-player-avatar {
+  --avatar-size: 30px;
+  border-radius: 7px;
+  background: #353256;
+  color: #e6dcff;
+}
 .player-top-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .player-top-self { flex: none; color: var(--cases-gold); font-size: .71rem; }
 .player-top-income { grid-area: income; }

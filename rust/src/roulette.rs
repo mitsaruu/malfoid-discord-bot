@@ -7,6 +7,7 @@ use crate::{
 };
 use poise::serenity_prelude as s;
 use rand::Rng;
+use rusqlite::params;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -16,6 +17,7 @@ const WAIT: Duration = Duration::from_secs(15);
 const MAX_ROUND: Duration = Duration::from_secs(60);
 const MIN_BET: i64 = 10;
 const MAX_BETS: usize = 50;
+const HISTORY_LIMIT: i64 = 10;
 const HELP_BUTTON: &str = "roulette:help";
 const RED: [u8; 18] = [
     1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36,
@@ -144,6 +146,20 @@ fn new_id() -> u64 {
     rand::random::<u64>() | (1 << 63)
 }
 
+fn read_history(db: &Database, guild: u64) -> rusqlite::Result<Vec<Value>> {
+    let connection = db.lock();
+    let mut query = connection.prepare(
+        "SELECT round_id, number FROM miniapp_roulette_history
+         WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    let rows = query.query_map(params![guild as i64, HISTORY_LIMIT], |row| {
+        let round_id = row.get::<_, i64>(0)? as u64;
+        let number = row.get::<_, u8>(1)?;
+        Ok(json!({"id": round_id.to_string(), "number": number}))
+    })?;
+    rows.collect()
+}
+
 fn own_bets(bets: &[Bet], user: u64) -> Vec<Value> {
     bets.iter()
         .filter(|bet| bet.user == user)
@@ -178,7 +194,7 @@ impl Completed {
 }
 
 impl Table {
-    fn maintain(&mut self, db: &Database, now: Instant) {
+    fn maintain(&mut self, db: &Database, guild: u64, now: Instant) {
         let Some(round) = self.round.as_mut().filter(|round| now >= round.deadline) else {
             return;
         };
@@ -191,7 +207,22 @@ impl Table {
                 .iter()
                 .map(|bet| (bet.ticket, bet.payout(Some(drawn))))
                 .collect();
-            match wagers::settle(db, self.round_id, &payouts) {
+            let settled = db.transaction(|tx| {
+                wagers::settle_on(tx, self.round_id, &payouts)?;
+                tx.execute(
+                    "INSERT INTO miniapp_roulette_history (guild_id, round_id, number) VALUES (?1, ?2, ?3)",
+                    params![guild as i64, self.round_id as i64, drawn],
+                )?;
+                tx.execute(
+                    "DELETE FROM miniapp_roulette_history WHERE id IN (
+                         SELECT id FROM miniapp_roulette_history
+                         WHERE guild_id = ?1 ORDER BY id DESC LIMIT -1 OFFSET ?2
+                     )",
+                    params![guild as i64, HISTORY_LIMIT],
+                )?;
+                Ok(())
+            });
+            match settled {
                 Ok(()) => number = Some(drawn),
                 Err(error) => {
                     eprintln!(
@@ -226,6 +257,7 @@ impl Table {
         balance: i64,
         now: Instant,
         bet_error: Option<String>,
+        history: Vec<Value>,
     ) -> Value {
         let round = self.round.as_ref().map(|round| {
             json!({
@@ -247,6 +279,7 @@ impl Table {
             "round_id": self.round_id.to_string(),
             "round": round,
             "last_result": self.last_result.as_ref().map(|last| last.snapshot(user)),
+            "history": history,
             "bet_error": bet_error,
         })
     }
@@ -331,7 +364,7 @@ impl State {
         };
         let mut tables = self.0.lock().unwrap_or_else(|error| error.into_inner());
         let table = tables.entry(wallet.guild).or_default();
-        table.maintain(db, clock());
+        table.maintain(db, wallet.guild, clock());
 
         let mut bet_error = None;
         let balance = if let Some(wager) = wager.filter(|wager| !table.accepted(wager, wallet.user))
@@ -398,13 +431,14 @@ impl State {
             balance,
             clock(),
             bet_error,
+            read_history(db, wallet.guild)?,
         )))
     }
 
     fn sweep(&self, db: &Database, now: Instant) {
         let mut tables = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        for table in tables.values_mut() {
-            table.maintain(db, now);
+        for (&guild, table) in tables.iter_mut() {
+            table.maintain(db, guild, now);
         }
     }
 }
@@ -581,6 +615,38 @@ mod tests {
     }
 
     #[test]
+    fn spin_history_keeps_only_the_latest_ten_results_for_each_server() {
+        let f = Fixture::new();
+        let mut expected = Vec::new();
+        for step in 0..12_u64 {
+            let now = step * 20;
+            let idle = f.call(1, now, "state", json!({}));
+            let placed = f.call(1, now, "bet", json!({
+                "round_id": idle["round_id"], "request_id": "test", "bet": "10", "space": "0",
+            }));
+            assert!(placed["bet_error"].is_null());
+            assert_eq!(placed["history"], json!(expected));
+            let settled = f.call(1, now + 15, "state", json!({}));
+            expected.insert(0, json!({
+                "id": idle["round_id"], "number": settled["last_result"]["number"],
+            }));
+            expected.truncate(HISTORY_LIMIT as usize);
+            assert_eq!(settled["history"], json!(expected));
+        }
+        let restarted = State::default();
+        let after_restart = |guild| restarted.act(
+            &f.db, Wallet { guild, user: 1, name: "Игрок", start: 500 },
+            "state", &json!({}), Instant::now,
+        ).unwrap().unwrap();
+        assert_eq!(after_restart(10)["history"], json!(expected));
+        assert_eq!(after_restart(11)["history"], json!([]));
+        let stored: i64 = f.db.lock().query_row(
+            "SELECT COUNT(*) FROM miniapp_roulette_history", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored, HISTORY_LIMIT);
+    }
+
+    #[test]
     fn wagers_below_ten_do_not_open_a_round() {
         let f = Fixture::new();
         let idle = f.call(1, 0, "state", json!({}));
@@ -706,6 +772,7 @@ mod tests {
         assert!(settled["round"].is_null());
         assert_eq!(settled["last_result"]["refunded"], true);
         assert!(settled["last_result"]["number"].is_null());
+        assert_eq!(settled["history"], json!([]));
         assert_eq!(settled["last_result"]["players"][0]["net"], 0);
         for bet in settled["last_result"]["bets"].as_array().unwrap() {
             assert_eq!(bet["payout"], bet["amount"]);

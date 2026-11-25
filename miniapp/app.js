@@ -661,6 +661,7 @@ async function start() {
         leaderboardRequest: (signal) => api("api/cases/leaderboard", undefined, {
           signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
         }),
+        leaderboardAvatar: (user) => loadGameAvatar(`api/cases/leaderboard/avatar/${encodeURIComponent(user)}.png`),
         inventoryRequest: (action, fields, signal) => api(
           action ? `api/cases/inventory/${action}` : "api/cases/inventory",
           fields,

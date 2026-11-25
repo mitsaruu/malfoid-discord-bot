@@ -66,11 +66,11 @@ test('only a real click enables effects and delayed game sounds are cancelled on
   assert.ok(f.events.every(({ stopAt }) => stopAt === 0));
 });
 
-test('mute and volume survive reopening and muting stops a reel loop', async () => {
+test('mute and volume survive reopening and muting stops a flight loop', async () => {
   const f = fixture('{"enabled":true,"volume":55}');
   assert.equal(f.volume.value, '55');
   await f.listeners.get('click')({ isTrusted: true, target: { closest: () => null } });
-  const stop = f.audio.startLoop('slots.spin');
+  const stop = f.audio.startLoop('rocket.flight');
   assert.equal(typeof stop, 'function');
   assert.ok(f.events.some(({ loop }) => loop));
   await f.listeners.get('toggle:click')();
@@ -107,6 +107,19 @@ test('touch and disabled controls stay silent on hover, and hiding stops active 
   assert.ok(f.events.every(({ stopAt }) => stopAt === 0));
   f.audio.play('roulette.tick');
   assert.equal(f.events.length, 3);
+});
+
+test('slots navigation and controls are silent', async () => {
+  const f = fixture();
+  f.document.body = { dataset: { game: 'lobby' } };
+  const target = { closest: () => ({ dataset: { game: 'slots' } }) };
+  const click = { isTrusted: true, target };
+  await f.listeners.get('click')(click);
+  f.document.body.dataset.game = 'slots';
+  const control = { isTrusted: true, target: { closest: () => ({}) } };
+  await f.listeners.get('click')(control);
+  f.listeners.get('pointerover')({ ...control, pointerType: 'mouse' });
+  assert.equal(f.events.length, 0);
 });
 
 test('menu waits for audio unlock, plays the intro once and crossfades a single bed', async () => {

@@ -2,7 +2,8 @@
 
 use crate::{
     db::{Database, Wallet},
-    economy::{settle_bet_on, CoinSide, MAX_BET},
+    economy::{parse_bet, settle_bet_on, CoinSide, MAX_BET},
+    text::money_text,
     wagers, Data, Error,
 };
 use rand::{seq::SliceRandom, Rng};
@@ -361,14 +362,14 @@ pub fn sweep(data: &Data) {
     });
 }
 
-// Six equally likely symbols and five paylines give an expected return of 95.81%.
+// With six equally likely symbols and five paylines, these multipliers return 100.63% on average.
 const SLOT_SYMBOLS: [(&str, &str, [i64; 3]); 6] = [
     ("🍒", "Вишня", [2, 5, 15]),
     ("🍋", "Лимон", [3, 7, 25]),
     ("🍇", "Виноград", [4, 9, 35]),
-    ("🔔", "Колокол", [5, 12, 50]),
-    ("⭐", "Звезда", [6, 16, 75]),
-    ("💎", "Алмаз", [7, 23, 120]),
+    ("🥝", "Киви", [6, 13, 50]),
+    ("portrait", "Даня", [7, 17, 75]),
+    ("💎", "Алмаз", [7, 24, 120]),
 ];
 const SLOT_PAYLINES: [(&str, [usize; 5]); 5] = [
     ("Верхняя", [0; 5]),
@@ -512,33 +513,64 @@ fn handle_slots(
             let Some(bet) = body["bet"].as_str() else {
                 return Ok(Err("Укажи ставку в монетах.".into()));
             };
-            let id = available_wager_id(tx, previous)?;
-            let stake = match wagers::place_on(tx, id, id, wallet.guild, wallet.user, bet, minimum)?
-            {
+            let count = match body.get("boards") {
+                None => 1,
+                Some(value) => match value.as_u64() {
+                    Some(count @ 1..=3) => count as usize,
+                    _ => return Ok(Err("Выбери от одного до трёх наборов барабанов.".into())),
+                },
+            };
+            let stake = match parse_bet(bet, balance / count as i64, minimum.max(1)) {
                 Ok(stake) => stake,
                 Err(error) => return Ok(Err(error)),
             };
+            let total_stake = stake * count as i64;
+            if total_stake > balance {
+                return Ok(Err(format!(
+                    "Для ставки нужно {}, у тебя {}.",
+                    money_text(total_stake),
+                    money_text(balance)
+                )));
+            }
+
+            let id = available_wager_id(tx, previous)?;
+            let bet = stake.to_string();
             let mut rng = rand::rng();
-            let grid: SlotGrid = std::array::from_fn(|_| {
-                std::array::from_fn(|_| rng.random_range(0..SLOT_SYMBOLS.len()))
-            });
-            let wins = slot_wins(&grid);
-            let payout = stake * wins.iter().map(|win| win.multiplier).sum::<i64>();
-            wagers::settle_on(tx, id, &[(id, payout)])?;
-            let receipt = json!({
-                "id": id.to_string(),
-                "grid": grid,
-                "wins": wins.iter().map(SlotWin::snapshot).collect::<Vec<_>>(),
-                "stake": stake,
-                "payout": payout,
-            });
+            let mut boards = Vec::with_capacity(count);
+            let mut payouts = Vec::with_capacity(count);
+            for index in 0..count {
+                let ticket = if index == 0 { id } else { available_wager_id(tx, previous)? };
+                // The full stake was checked before placing any tickets. A failed placement rolls back the round.
+                wagers::place_on(tx, id, ticket, wallet.guild, wallet.user, &bet, minimum)?
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let grid: SlotGrid = std::array::from_fn(|_| {
+                    std::array::from_fn(|_| rng.random_range(0..SLOT_SYMBOLS.len()))
+                });
+                let wins = slot_wins(&grid);
+                let payout = stake * wins.iter().map(|win| win.multiplier).sum::<i64>();
+                boards.push(json!({
+                    "grid": grid,
+                    "wins": wins.iter().map(SlotWin::snapshot).collect::<Vec<_>>(),
+                    "stake": stake,
+                    "payout": payout,
+                }));
+                payouts.push((ticket, payout));
+            }
+            let total_payout = payouts.iter().map(|&(_, payout)| payout).sum::<i64>();
+            wagers::settle_on(tx, id, &payouts)?;
+            let mut receipt = if count == 1 {
+                boards.remove(0)
+            } else {
+                json!({"boards": boards, "stake": total_stake, "payout": total_payout})
+            };
+            receipt["id"] = json!(id.to_string());
             tx.execute(
                 "INSERT INTO miniapp_slots_results (guild_id, user_id, receipt) VALUES (?1, ?2, ?3)
                  ON CONFLICT (guild_id, user_id) DO UPDATE SET receipt = excluded.receipt",
                 params![wallet.guild as i64, wallet.user as i64, receipt.to_string()],
             )?;
             spin = Some(receipt);
-            balance = balance - stake + payout;
+            balance = balance - total_stake + total_payout;
         }
         let symbols: Vec<_> = SLOT_SYMBOLS
             .iter()
@@ -753,9 +785,20 @@ mod tests {
                 line: 0,
                 symbol: 5,
                 count: 4,
-                multiplier: 23
+                multiplier: 24
             }]
         );
+    }
+
+    #[test]
+    fn slots_paytable_raises_expected_return_by_about_five_percent() {
+        // For a given symbol on a five-cell line, there are 30, 5, and 1 ways to end a run of 3, 4, or 5.
+        let weighted_payout: i64 = SLOT_SYMBOLS
+            .iter()
+            .map(|(_, _, [three, four, five])| 30 * three + 5 * four + five)
+            .sum();
+        assert_eq!(weighted_payout, 1_565);
+        assert_eq!(SLOT_PAYLINES.len(), 5);
     }
 
     #[test]
@@ -773,6 +816,45 @@ mod tests {
     }
 
     #[test]
+    fn slots_charges_and_records_all_boards_as_one_round() {
+        let data = data();
+        let fields = json!({"bet": "100", "boards": 3, "expected_round": null});
+        let state = call(&data, "slots", "spin", fields.clone()).unwrap();
+        let spin = &state["spin"];
+        let boards = spin["boards"].as_array().unwrap();
+        assert_eq!(boards.len(), 3);
+        for board in boards {
+            assert_eq!(board["stake"], 100);
+            let grid: SlotGrid = serde_json::from_value(board["grid"].clone()).unwrap();
+            let wins = slot_wins(&grid);
+            assert_eq!(board["wins"], json!(wins.iter().map(SlotWin::snapshot).collect::<Vec<_>>()));
+            assert_eq!(board["payout"], 100 * wins.iter().map(|win| win.multiplier).sum::<i64>());
+        }
+        let payout: i64 = boards.iter().map(|board| board["payout"].as_i64().unwrap()).sum();
+        assert_eq!(spin["stake"], 300);
+        assert_eq!(spin["payout"], payout);
+        assert_eq!(state["balance"], 200 + payout);
+        assert!(call(&data, "slots", "spin", fields).is_err());
+        assert_eq!(call(&data, "slots", "state", json!({})).unwrap(), state);
+        assert_eq!(wagers::refund(&data.db, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn slots_rejects_invalid_counts_and_requires_funds_for_every_board() {
+        let data = data();
+        for count in [json!(0), json!(4), json!(2.5), json!("2"), json!(null)] {
+            let fields = json!({"bet": "100", "boards": count, "expected_round": null});
+            assert!(call(&data, "slots", "spin", fields).is_err());
+        }
+        let fields = json!({"bet": "200", "boards": 3, "expected_round": null});
+        assert!(call(&data, "slots", "spin", fields).is_err());
+        let state = call(&data, "slots", "state", json!({})).unwrap();
+        assert_eq!(state["balance"], 500);
+        assert!(state["spin"].is_null());
+        assert_eq!(wagers::refund(&data.db, None).unwrap(), 0);
+    }
+
+    #[test]
     fn slots_accepts_only_one_concurrent_spin_from_the_same_receipt() {
         let data = data();
         let previous = call(
@@ -782,7 +864,7 @@ mod tests {
             json!({"bet": "100", "expected_round": null}),
         )
         .unwrap();
-        let fields = json!({"bet": "100", "expected_round": previous["spin"]["id"]});
+        let fields = json!({"bet": "100", "boards": 2, "expected_round": previous["spin"]["id"]});
         let replies = std::thread::scope(|scope| {
             let first = scope.spawn(|| call(&data, "slots", "spin", fields.clone()));
             let second = scope.spawn(|| call(&data, "slots", "spin", fields.clone()));
@@ -799,7 +881,7 @@ mod tests {
         );
         assert_eq!(
             latest["balance"].as_i64().unwrap(),
-            previous["balance"].as_i64().unwrap() - 100
+            previous["balance"].as_i64().unwrap() - 200
                 + latest["spin"]["payout"].as_i64().unwrap()
         );
     }
@@ -822,7 +904,7 @@ mod tests {
             "<player>",
             "slots",
             "spin",
-            &json!({"bet": "100", "expected_round": null})
+            &json!({"bet": "100", "boards": 3, "expected_round": null})
         )
         .is_err());
         let state = call(&data, "slots", "state", json!({})).unwrap();

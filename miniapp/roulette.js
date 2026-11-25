@@ -86,6 +86,7 @@
   let shownResult = null;
   let renderedResultKey;
   let renderedBetsKey;
+  let renderedHistoryKey;
   let rotation = 0;
   let ballAngle = 0;
   let ballRadius = trackRadius;
@@ -163,8 +164,8 @@
   const own = element("p", "", "roulette-own");
   table.append(tableHeader, board, form, feedback, own);
 
-  const layout = element("div", "", "roulette-layout");
-  layout.append(betsPanel, wheelPanel, table);
+  const stage = element("div", "", "roulette-stage");
+  stage.append(wheelPanel, table);
   const results = element("section", "", "roulette-panel");
   results.hidden = true;
   const resultsList = element("ul", "", "roulette-results");
@@ -176,7 +177,20 @@
     element("p", "Цвет, чётность и половина поля — ×2. Дюжина и колонка — ×3. Точное число — ×36."),
     element("p", "Выплаты включают поставленные монеты. При выпадении зеро выигрывают только ставки на 0."),
   );
-  view.append(header, layout, results, rules);
+  const main = element("div", "", "roulette-main");
+  main.append(stage, results, rules);
+  const history = element("section", "", "roulette-history");
+  const historyTitle = element("h2", "Прошлые прокруты");
+  historyTitle.id = "roulette-history-title";
+  history.setAttribute("aria-labelledby", historyTitle.id);
+  const historyEmpty = element("p", "Загружаем историю…", "roulette-history-empty");
+  const historyList = element("ol", "", "roulette-history-list");
+  historyList.setAttribute("role", "list");
+  historyList.hidden = true;
+  history.append(historyTitle, historyEmpty, historyList);
+  const layout = element("div", "", "roulette-layout");
+  layout.append(betsPanel, main, history);
+  view.append(header, layout);
   root.replaceChildren(view);
 
   function drawWheel() {
@@ -232,6 +246,25 @@
     disk(12, "#d5b68f");
   }
   drawWheel();
+
+  function renderHistory() {
+    if (!state || spin) return;
+    const rounds = state.history ?? [];
+    const key = rounds[0]?.id ?? null;
+    if (renderedHistoryKey === key) return;
+    renderedHistoryKey = key;
+    historyEmpty.hidden = rounds.length > 0;
+    historyEmpty.textContent = "Прокрутов пока нет.";
+    historyList.hidden = rounds.length === 0;
+    historyList.replaceChildren(...rounds.map(({ number }) => {
+      const color = tone(number);
+      const row = element("li");
+      const badge = element("strong", String(number), "roulette-history-number");
+      badge.dataset.tone = color;
+      row.append(badge, element("span", color === "green" ? "Зелёное" : colorNames[color]));
+      return row;
+    }));
+  }
 
   function renderResult(result) {
     const key = result?.id ?? (spin ? "spinning" : state?.round ? "betting" : null);
@@ -489,6 +522,7 @@
     const result = !state?.round && !spin && shownResult?.id === state?.last_result?.id ? shownResult : null;
     renderResult(result);
     renderBets(result);
+    renderHistory();
     if (!spin) wallet.textContent = state ? "Баланс " + format.format(state.balance) : "";
     tableCount.textContent = state?.round
       ? "Игроки " + state.round.player_count + " · Ставки " + state.round.bet_count + " / " + state.max_bets

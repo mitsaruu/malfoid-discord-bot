@@ -1,9 +1,10 @@
+#roulette { width: min(100%, 1540px); }
 .roulette-view {
   --roulette-muted: var(--muted);
   --roulette-edge: var(--line);
   --roulette-accent: var(--mint);
   --roulette-ink: var(--text);
-  width: min(100%, 1120px);
+  container: roulette / inline-size;
   margin-inline: auto;
   color: var(--roulette-ink);
   font-variant-numeric: tabular-nums;
@@ -32,18 +33,40 @@
 
 .roulette-layout {
   display: grid;
-  grid-template-columns: minmax(190px, .7fr) minmax(0, 1fr) minmax(0, 1.65fr);
+  grid-template: "main" "history" "bets" / minmax(0, 1fr);
   align-items: start;
   gap: 14px;
 }
-.roulette-wheel-panel, .roulette-table, .roulette-panel, .roulette-bets-panel {
+.roulette-main {
+  grid-area: main;
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+  container: roulette-main / inline-size;
+}
+.roulette-stage { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+@container roulette-main (min-width: 735px) {
+  .roulette-stage { grid-template-columns: minmax(0, .93fr) minmax(410px, 1.07fr); }
+}
+@container roulette (min-width: 880px) {
+  .roulette-layout {
+    grid-template: "main history" "bets history" / minmax(0, 1fr) clamp(144px, 12cqi, 172px);
+  }
+  .roulette-header { padding-inline-end: calc(clamp(144px, 12cqi, 172px) + 14px); }
+}
+@container roulette (min-width: 1150px) {
+  .roulette-layout {
+    grid-template: "bets main history" / clamp(175px, 15cqi, 230px) minmax(0, 1fr) clamp(144px, 12cqi, 172px);
+  }
+}
+.roulette-wheel-panel, .roulette-table, .roulette-panel, .roulette-bets-panel, .roulette-history {
   min-width: 0;
   border: 1px solid var(--roulette-edge);
   border-radius: 14px;
   background: var(--surface);
   padding: clamp(12px, 2vw, 18px);
 }
-.roulette-bets-panel { padding: 12px; }
+.roulette-bets-panel { grid-area: bets; padding: 12px; }
 .roulette-bets-empty {
   margin-top: 6px;
   color: var(--roulette-muted);
@@ -79,12 +102,13 @@
 .roulette-wheel-panel {
   display: grid;
   justify-items: center;
+  align-content: center;
   gap: 8px;
   background: radial-gradient(ellipse at 50% 30%, #28382f, var(--surface) 76%);
 }
 .roulette-wheel-frame {
   position: relative;
-  width: min(100%, 430px);
+  width: min(100%, 520px);
   aspect-ratio: 1;
   filter: drop-shadow(0 6px 10px #0e1419b0);
 }
@@ -125,6 +149,7 @@
 .roulette-table {
   --roulette-felt: #164b3c;
   display: grid;
+  align-content: center;
   gap: 10px;
   border-color: #3d7462;
   background: radial-gradient(ellipse at 60% 0, #205d4b, var(--roulette-felt) 88%);
@@ -234,16 +259,41 @@
 .roulette-results [data-net="win"] { color: var(--roulette-accent); }
 .roulette-results [data-net="loss"] { color: #ffb8b2; }
 
-@media (max-width: 990px) {
-  .roulette-layout { grid-template-columns: minmax(0, .72fr) minmax(0, 1fr); }
-  .roulette-table { grid-column: 1 / -1; }
-  .roulette-wheel-frame { width: min(100%, 340px, 66vw); }
+.roulette-history { grid-area: history; padding: 12px; }
+.roulette-history h2 { font-size: .9rem; }
+.roulette-history-empty { margin-top: 7px; color: var(--roulette-muted); font-size: .79rem; }
+.roulette-history-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 105px), 1fr));
+  gap: 5px;
+  margin-top: 9px;
+  padding: 0;
+  list-style: none;
+}
+.roulette-history-list li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px;
+  border: 1px solid var(--roulette-edge);
+  border-radius: 7px;
+  background: var(--inset);
+  color: var(--roulette-muted);
+  font-size: .75rem;
+}
+.roulette-history-number {
+  display: inline-grid;
+  flex: none;
+  width: 2rem;
+  height: 1.65rem;
+  place-items: center;
+  border: 1px solid #ffffff32;
+  border-radius: 5px;
+  color: #fff;
+  font-size: .93rem;
 }
 
-@media (max-width: 560px) {
-  .roulette-layout { grid-template-columns: minmax(0, 1fr); }
-  .roulette-wheel-panel { grid-row: 1; }
-  .roulette-bets { max-height: 148px; }
+@container roulette-main (max-width: 560px) {
   .roulette-board { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .roulette-view .roulette-cell {
     grid-column: var(--mobile-column);
@@ -251,4 +301,8 @@
     min-height: 38px;
     font-size: .76rem;
   }
+}
+
+@container roulette (max-width: 560px) {
+  .roulette-bets { max-height: 148px; }
 }

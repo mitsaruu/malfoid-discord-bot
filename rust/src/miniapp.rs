@@ -144,6 +144,7 @@ async fn static_file(State(app): State<App>, Path(name): Path<String>) -> Respon
         "app.js" | "ai-chat.js" | "audio.js" | "game_avatars.js" | "cases.js" | "cases-inventory.js" | "cases-upgrade.js" | "cases-contract.js" | "cases-leaderboard.js" | "rocket.js" | "mines.js" | "casino_slots.js" | "poker.js" | "table_blackjack.js" | "roulette.js" | "coinflip.js" | "durak.js" | "durak_online.js" =>
             file(&app, &name, "text/javascript; charset=utf-8").await,
         "lobby-games.webp" | "pet-cases.webp" | "secret-pet-silhouette.webp" => file(&app, &name, "image/webp").await,
+        "slots-portrait.png" => file(&app, &name, "image/png").await,
         "menu-ambient.mp3" | "case-opening.mp3" | "case-secret.mp3" =>
             file(&app, &name, "audio/mpeg").await,
         "case-secret-explosion.mp4" => file(&app, &name, "video/mp4").await,
@@ -564,6 +565,21 @@ async fn cases_avatar(State(app): State<App>, headers: HeaderMap) -> Reply {
     case_avatar_image(&app, &session.face).await
 }
 
+async fn cases_leaderboard_avatar(State(app): State<App>, Path(file): Path<String>, headers: HeaderMap) -> Reply {
+    let missing = || StatusCode::NOT_FOUND.into_response();
+    let user = file.strip_suffix(".png").and_then(discord_id).ok_or_else(missing)?;
+    let (_, session) = app.authorized(&headers, None, false).await?;
+    let face = if user == session.user {
+        session.face
+    } else {
+        let guild = serenity::GuildId::new(session.guild);
+        let member = tokio::time::timeout(DISCORD_TIMEOUT, guild.member(&app.ctx, serenity::UserId::new(user)))
+            .await.ok().and_then(Result::ok).ok_or_else(missing)?;
+        member.face()
+    };
+    case_avatar_image(&app, &face).await
+}
+
 async fn cases_history(State(app): State<App>, headers: HeaderMap) -> Reply {
     let (_, session) = app.authorized(&headers, None, false).await?;
     let openings = pets::case_history(&app.data.db, session.guild).map_err(failed)?;
@@ -904,6 +920,7 @@ pub fn router(app: App) -> axum::Router {
         .route("/api/cases/open", post(cases_open).layer(DefaultBodyLimit::max(1024)))
         .route("/api/cases/inventory", get(cases_inventory))
         .route("/api/cases/leaderboard", get(cases_leaderboard))
+        .route("/api/cases/leaderboard/avatar/{file}", get(cases_leaderboard_avatar))
         .route("/api/cases/inventory/collect", post(cases_inventory_collect))
         .route("/api/cases/inventory/move", post(cases_inventory_move).layer(DefaultBodyLimit::max(1024)))
         .route("/api/cases/inventory/transform", post(cases_pet_upgrade).layer(DefaultBodyLimit::max(4096)))

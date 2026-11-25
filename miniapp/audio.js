@@ -44,10 +44,6 @@
     "roulette.land": wood(.085, 245),
     "roulette.win": warmPair(174.61, 261.63),
     "roulette.loss": [noise(.22, .058, 420), tone(.20, .050, 149, 139)],
-    "slots.spin": [noise(.55, .077, 540), ...Array.from({ length: 10 }, (_, index) =>
-      tone(.046, .026, 165 + index % 3 * 28, 121, index * .055))],
-    "slots.stop": wood(.065, 183),
-    "slots.win": warmChord([146.83, 220, 293.66], .35, .065),
     "cards.deal": [noise(.132, .085, 1220), noise(.084, .035, 500)],
     "cards.place": [noise(.058, .042, 410), tone(.064, .022, 122, 85)],
     "cards.flip": [noise(.117, .101, 1050), tone(.072, .023, 181, 139, .032)],
@@ -69,7 +65,7 @@
     "rocket.crash": [tone(.205, .14, 89, 49), noise(.22, .13, 345)],
   };
 
-  const quietCues = new Set(["ui.hover", "ui.click", "roulette.tick", "slots.stop",
+  const quietCues = new Set(["ui.hover", "ui.click", "roulette.tick",
     "cards.deal", "cards.place", "cards.flip", "cards.bet", "rocket.count"]);
   const minGap = { "ui.hover": .045, "ui.click": .040, "roulette.tick": .065 };
   const caseSounds = {
@@ -320,8 +316,7 @@
   }
 
   function tuneLoop(loop) {
-    const rocket = loop.name === "rocket.flight";
-    retarget(loop.voice, rocket ? .56 + loop.intensity * .33 : 1, .10);
+    retarget(loop.voice, .56 + loop.intensity * .33, .10);
     loop.voice.filter?.frequency.setTargetAtTime(505 + loop.intensity * 290, context.currentTime, .14);
   }
 
@@ -335,7 +330,7 @@
   }
 
   function startLoop(name) {
-    if (!["slots.spin", "rocket.flight"].includes(name)) return () => {};
+    if (name !== "rocket.flight") return () => {};
     const loop = { name, intensity: .25, voice: undefined };
     loops.add(loop);
     refreshLoops();
@@ -344,7 +339,7 @@
       if (loop.voice) stop(loop.voice, .035);
     };
     end.setIntensity = (level) => {
-      if (name !== "rocket.flight" || !Number.isFinite(level)) return;
+      if (!Number.isFinite(level)) return;
       loop.intensity = Math.max(0, Math.min(1, level));
       if (active.has(loop.voice)) tuneLoop(loop);
     };
@@ -372,10 +367,14 @@
     refreshLoops();
   }
 
+  function quietView() {
+    return ["cases", "slots"].includes(document.body?.dataset.game);
+  }
+
   function buttonAt(target) {
-    if (document.body?.dataset.game === "cases") return null;
+    if (quietView()) return null;
     const button = target?.closest?.("button, summary, [role='button']");
-    if (button?.dataset?.game === "cases") return null;
+    if (["cases", "slots"].includes(button?.dataset?.game)) return null;
     return button && !button.disabled && button.getAttribute?.("aria-disabled") !== "true" ? button : null;
   }
 
@@ -399,7 +398,7 @@
     if (!event.isTrusted) return;
     const button = buttonAt(event.target);
     await unlock();
-    if (button && button !== toggle && document.body?.dataset.game !== "cases") play("ui.click");
+    if (button && button !== toggle && !quietView()) play("ui.click");
   }, true);
   document.addEventListener("pointerdown", (event) => {
     if (event.isTrusted) inputWithKeyboard = false;
@@ -432,7 +431,7 @@
     save();
     if (enabled) {
       await unlock();
-      if (document.body?.dataset.game !== "cases") play("ui.click");
+      if (!quietView()) play("ui.click");
     }
   });
   slider?.addEventListener("input", () => {

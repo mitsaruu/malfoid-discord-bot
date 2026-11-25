@@ -1,6 +1,6 @@
 "use strict";
 
-function createCasesLeaderboard({ root, request, showPetArt, showSecretSilhouette }) {
+function createCasesLeaderboard({ root, request, avatar, showPetArt, showSecretSilhouette }) {
   const sort = root.querySelector("#player-top-sort");
   const table = root.querySelector("#player-top-table");
   const status = root.querySelector("#player-top-status");
@@ -10,6 +10,17 @@ function createCasesLeaderboard({ root, request, showPetArt, showSecretSilhouett
   const petTemplate = root.querySelector("#player-top-pet-template");
   const number = new Intl.NumberFormat("ru-RU");
   const collator = new Intl.Collator("ru-RU");
+  const avatars = typeof avatar === "function" ? window.createGameAvatars?.(avatar) : null;
+  const waitingAvatars = new WeakMap();
+  const avatarObserver = avatars && typeof IntersectionObserver === "function"
+    ? new IntersectionObserver((entries, observer) => {
+      for (const { target, isIntersecting } of entries) {
+        if (!isIntersecting) continue;
+        observer.unobserve(target);
+        const player = waitingAvatars.get(target);
+        if (target.isConnected && player) target.replaceWith(avatars.image(player.id, player.name));
+      }
+    }, { rootMargin: "96px" }) : null;
   let players = [];
   let active = false;
   let read;
@@ -29,6 +40,7 @@ function createCasesLeaderboard({ root, request, showPetArt, showSecretSilhouett
   }
 
   function render() {
+    avatarObserver?.disconnect();
     const key = sort.value;
     const ordered = players.slice().sort((first, second) => {
       if (first[key] !== second[key]) return first[key] > second[key] ? -1 : 1;
@@ -41,7 +53,14 @@ function createCasesLeaderboard({ root, request, showPetArt, showSecretSilhouett
       row.dataset.player = player.id;
       row.toggleAttribute("data-me", player.me);
       entry.querySelector(".player-top-place").textContent = String(index + 1);
-      row.querySelector(".player-top-initial").textContent = Array.from(player.name.trim())[0]?.toLocaleUpperCase("ru-RU") || "?";
+      const initial = row.querySelector(".player-top-initial");
+      initial.textContent = Array.from(player.name.trim())[0]?.toLocaleUpperCase("ru-RU") || "?";
+      if (avatarObserver) {
+        waitingAvatars.set(initial, player);
+        avatarObserver.observe(initial);
+      } else if (avatars) {
+        initial.replaceWith(avatars.image(player.id, player.name));
+      }
       const name = row.querySelector(".player-top-name");
       name.textContent = player.name;
       name.title = player.name;
@@ -92,6 +111,8 @@ function createCasesLeaderboard({ root, request, showPetArt, showSecretSilhouett
       if (!active) return;
       active = false;
       read?.abort();
+      avatarObserver?.disconnect();
+      avatars?.clear();
       players = [];
       rows.replaceChildren();
       table.hidden = true;

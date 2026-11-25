@@ -456,11 +456,6 @@ function createRocketHistory(viewport, list, empty, requestAvatar, format, motio
   const avatars = new Map();
   let cards = new Map();
   let newest = null;
-  let finishSlide = null;
-
-  motion.addEventListener("change", () => {
-    if (motion.matches) finishSlide?.();
-  });
 
   function forgetAvatar(id, entry) {
     avatars.delete(id);
@@ -509,6 +504,7 @@ function createRocketHistory(viewport, list, empty, requestAvatar, format, motio
     heading.className = "rocket-history-peak";
     const peak = document.createElement("strong");
     peak.textContent = format(round.peak);
+    peak.title = peak.textContent;
     heading.append(peak);
     card.append(heading);
     if (round.players.length) {
@@ -524,6 +520,7 @@ function createRocketHistory(viewport, list, empty, requestAvatar, format, motio
           amount.title = "Ставка проиграна";
         } else if (Number.isFinite(player.cashout_multiplier)) {
           amount.textContent = format(player.cashout_multiplier);
+          amount.title = amount.textContent;
         } else {
           amount.textContent = "—";
           amount.title = player.outcome === "won" ? "Коэффициент недоступен" : "Без вывода";
@@ -549,13 +546,6 @@ function createRocketHistory(viewport, list, empty, requestAvatar, format, motio
     return card;
   }
 
-  function place(items, anchor, left) {
-    list.replaceChildren(...items);
-    viewport.scrollLeft = anchor
-      ? viewport.scrollLeft + anchor.getBoundingClientRect().left - left
-      : viewport.scrollWidth;
-  }
-
   function discardOldAvatars(rounds) {
     const visiblePlayers = new Set(rounds.flatMap((round) =>
       round.players.slice(0, ROCKET_HISTORY_PLAYER_LIMIT).map((player) => player.id)));
@@ -564,56 +554,25 @@ function createRocketHistory(viewport, list, empty, requestAvatar, format, motio
     }
   }
 
-  function slide(next, previousNewest, oldLeft, rounds) {
-    const outgoing = [...cards].filter(([id]) => !next.has(id)).map(([, card]) => card);
-    for (const card of outgoing) card.setAttribute("aria-hidden", "true");
-    // Keep the old left edge in the track until it has moved out of view.
-    place([...outgoing, ...next.values()]);
-    const shift = oldLeft - previousNewest.getBoundingClientRect().left;
-    if (shift <= 0) return false;
-    const animation = list.animate([
-      { transform: `translateX(${shift}px)` },
-      { transform: "translateX(0px)" },
-    ], { duration: 220, easing: "cubic-bezier(.22,.7,.3,1)" });
-    const settle = () => {
-      finishSlide = null;
-      animation.cancel();
-      place(next.values(), previousNewest, previousNewest.getBoundingClientRect().left);
-      discardOldAvatars(rounds);
-    };
-    finishSlide = settle;
-    animation.finished.then(() => {
-      if (finishSlide === settle) settle();
-    }, () => {});
-    return true;
-  }
-
   return {
     render(rounds) {
       const head = rounds[0]?.id;
       if (head === newest) return;
-      finishSlide?.();
-      const following = viewport.scrollWidth - viewport.clientWidth - viewport.scrollLeft <= 2;
-      const previousNewest = cards.get(newest);
-      const oldLeft = previousNewest?.getBoundingClientRect().left;
       const next = new Map(rounds.slice().reverse().map((round) => [
         round.id, cards.get(round.id) ?? makeCard(round),
       ]));
       viewport.hidden = !head;
       empty.hidden = Boolean(head);
       empty.textContent = "Завершённых полётов пока нет.";
-      const retained = next.get(newest);
-      const animated = following && retained && !motion.matches && typeof list.animate === "function" &&
-        slide(next, retained, oldLeft, rounds);
-      if (!animated) {
-        place(next.values(), following ? null : retained, oldLeft);
-        discardOldAvatars(rounds);
+      list.replaceChildren(...next.values());
+      if (cards.has(newest) && !cards.has(head) && !motion.matches) {
+        next.get(head)?.animate?.([{ opacity: .6 }, { opacity: 1 }], { duration: 220, easing: "ease-out" });
       }
+      discardOldAvatars(rounds);
       cards = next;
       newest = head;
     },
     clear() {
-      finishSlide?.();
       for (const [id, entry] of avatars) forgetAvatar(id, entry);
       list.replaceChildren();
       viewport.hidden = true;
