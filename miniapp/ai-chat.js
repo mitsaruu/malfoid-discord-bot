@@ -19,6 +19,10 @@ function createAiChat({ request, image, profile }) {
   const chatRetry = byId("ai-chat-retry");
   const form = byId("ai-composer");
   const prompt = byId("ai-prompt");
+  const model = byId("ai-model");
+  const hydrogen = byId("ai-model-hydrogen");
+  const thinking = byId("ai-thinking");
+  const minimal = byId("ai-thinking-minimal");
   const fileInput = byId("ai-file");
   const attach = byId("ai-attach");
   const preview = byId("ai-preview");
@@ -58,7 +62,7 @@ function createAiChat({ request, image, profile }) {
 
   function currentDraft() {
     if (!drafts.has(chatId)) {
-      drafts.set(chatId, { text: "", file: null, url: "", attempt: null, error: "" });
+      drafts.set(chatId, { text: "", file: null, url: "", model: "auto", thinking: "medium", attempt: null, error: "" });
     }
     return drafts.get(chatId);
   }
@@ -186,9 +190,19 @@ function createAiChat({ request, image, profile }) {
     prompt.readOnly = sending;
     attach.disabled = sending || Boolean(connectionError);
     removeImage.disabled = sending;
+    if (hydrogen) hydrogen.disabled = limited;
+    if (minimal) minimal.disabled = draft.model !== "flash_lite";
+    if (model) {
+      model.value = draft.model;
+      model.disabled = sending || Boolean(connectionError);
+    }
+    if (thinking) {
+      thinking.value = draft.thinking;
+      thinking.disabled = sending || Boolean(connectionError);
+    }
     const retrying = Boolean(draft.attempt);
     send.disabled = Boolean(connectionError || pending || detailRequest || threadError
-      || !(draft.text.trim() || draft.file) || (limited && !retrying));
+      || !(draft.text.trim() || draft.file) || (draft.model === "hydrogen" && limited && !retrying));
     const sendLabel = retrying && !sending ? "Повторить отправку" : "Отправить";
     send.setAttribute("aria-label", sendLabel);
     send.title = sendLabel;
@@ -197,9 +211,9 @@ function createAiChat({ request, image, profile }) {
     if (status.textContent !== notice) status.textContent = notice;
     status.dataset.error = String(Boolean(connectionError || threadError || draft.error));
     chatRetry.hidden = !threadError || Boolean(connectionError);
-    const quotaLabel = limited ? "0 из " + quota.limit + " · Сброс в 00:00 МСК"
-      : quota ? "Осталось " + quota.remaining + " из " + quota.limit
-      : "Лимит пока неизвестен";
+    const quotaLabel = limited ? `Hydrogen · 0 из ${quota.limit} · Сброс в 00:00 МСК`
+      : quota ? `Hydrogen · Осталось ${quota.remaining} из ${quota.limit}`
+      : "Hydrogen · Лимит пока неизвестен";
     if (quotaText.textContent !== quotaLabel) quotaText.textContent = quotaLabel;
     quotaText.dataset.limited = String(limited);
   }
@@ -245,7 +259,7 @@ function createAiChat({ request, image, profile }) {
   }
 
   function updateQuota(next) {
-    if (quota && next.reset_at < quota.reset_at) return;
+    if (!next || (quota && next.reset_at < quota.reset_at)) return;
     quota = next;
     scheduleQuota();
     renderComposer();
@@ -337,6 +351,7 @@ function createAiChat({ request, image, profile }) {
     const draft = currentDraft();
     const attempt = {
       chatId: id, text: draft.text.trim(), url: draft.url,
+      model: draft.model, thinking: draft.thinking,
       requestId: draft.attempt ?? crypto.randomUUID(),
     };
     let updateCurrentDraft = false;
@@ -348,6 +363,8 @@ function createAiChat({ request, image, profile }) {
     renderThread();
     try {
       const body = { request_id: attempt.requestId, prompt: attempt.text };
+      if (model) body.model = attempt.model;
+      if (thinking) body.thinking = attempt.thinking;
       if (id !== null) body.chat_id = id;
       if (draft.file) body.image = await encodeImage(draft.file);
       if (connection.signal.aborted) return;
@@ -361,6 +378,9 @@ function createAiChat({ request, image, profile }) {
       historyStatus.textContent = "";
       if (draft.url) URL.revokeObjectURL(draft.url);
       drafts.delete(id);
+      if (!drafts.has(savedId)) {
+        drafts.set(savedId, { ...draft, text: "", file: null, url: "", attempt: null });
+      }
       if (id === chatId) {
         updateCurrentDraft = true;
         detailRequest?.abort();
@@ -446,6 +466,25 @@ function createAiChat({ request, image, profile }) {
     }
   }
 
+  function updateChoices() {
+    const draft = currentDraft();
+    const nextModel = model?.value || "auto";
+    let nextThinking = thinking?.value || "medium";
+    const hydrogenUnavailable = nextModel === "hydrogen" && draft.model !== nextModel && quota?.remaining === 0;
+    if (!connectionError && pending?.chatId !== chatId && !hydrogenUnavailable) {
+      if (nextThinking === "minimal" && nextModel !== "flash_lite") nextThinking = "medium";
+      if (nextModel !== draft.model || nextThinking !== draft.thinking) {
+        draft.model = nextModel;
+        draft.thinking = nextThinking;
+        draft.attempt = null;
+        draft.error = "";
+      }
+    }
+    renderComposer();
+  }
+
+  model?.addEventListener("change", updateChoices);
+  thinking?.addEventListener("change", updateChoices);
   prompt.addEventListener("input", () => {
     const draft = currentDraft();
     if (draft.text.trim() !== prompt.value.trim()) draft.attempt = null;

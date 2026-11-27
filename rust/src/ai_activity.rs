@@ -6,10 +6,11 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{ImageFormat, ImageReader, Limits};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
-use std::{future::Future, io::Cursor, time::Duration};
+use std::{future::Future, io::Cursor, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(95);
+const AUTO_PRIMARY_TIMEOUT: Duration = Duration::from_secs(35);
 const MAX_PROMPT_CHARS: usize = 16_000;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BASE64: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
@@ -49,10 +50,10 @@ impl Error {
             Self::Invalid(message) => message,
             Self::NotFound => "Чат или изображение не найдены.",
             Self::InProgress => "Предыдущий запрос ещё выполняется. Попробуй чуть позже.",
-            Self::Quota => "Лимит на сегодня исчерпан. Сброс в 00:00 МСК.",
+            Self::Quota => "Лимит Hydrogen на сегодня исчерпан. Сброс в 00:00 МСК. Можно выбрать Flash-Lite.",
             Self::Timeout => "Не удалось дождаться ответа ИИ. Попробуй ещё раз.",
             Self::Provider(ai::AiError::Other(_)) => {
-                "Gemini 3.5 Flash-Lite не смог обработать запрос. Попробуй позже."
+                "Gemini не смог обработать запрос с выбранными настройками. Попробуй позже."
             }
             Self::Provider(error) => ai::error_text(error),
             Self::Storage(_) => "Не удалось обработать запрос к чату.",
@@ -88,6 +89,8 @@ pub struct Request {
     chat_id: Option<i64>,
     prompt: String,
     image: Option<(String, String)>,
+    model: ai::ModelChoice,
+    thinking: ai::ThinkingLevel,
 }
 
 impl Request {
@@ -138,11 +141,33 @@ impl Request {
                 "Введите сообщение или прикрепите изображение.",
             ));
         }
+        // Pages cached before the selector keep their previous Flash-Lite/medium behavior.
+        let model = match body.get("model") {
+            None => ai::ModelChoice::FlashLite,
+            Some(value) => match value.as_str() {
+                Some("auto") => ai::ModelChoice::Auto,
+                Some("flash_lite") => ai::ModelChoice::FlashLite,
+                Some("hydrogen") => ai::ModelChoice::Hydrogen,
+                _ => return Err(Error::Invalid("Выбери доступную модель ИИ.")),
+            },
+        };
+        let thinking = match body.get("thinking") {
+            None => ai::ThinkingLevel::Medium,
+            Some(value) => match value.as_str() {
+                Some("minimal") if model == ai::ModelChoice::FlashLite => ai::ThinkingLevel::Minimal,
+                Some("low") => ai::ThinkingLevel::Low,
+                Some("medium") => ai::ThinkingLevel::Medium,
+                Some("high") => ai::ThinkingLevel::High,
+                _ => return Err(Error::Invalid("Выбери уровень рассуждений, доступный для этой модели.")),
+            },
+        };
         Ok(Self {
             request_id: request_id.to_owned(),
             chat_id,
             prompt: prompt.to_owned(),
             image,
+            model,
+            thinking,
         })
     }
 }
@@ -280,6 +305,7 @@ struct Pending<'a> {
     user: u64,
     request_id: &'a str,
     day: String,
+    hydrogen: bool,
     active: bool,
 }
 
@@ -289,6 +315,7 @@ fn admit<'a>(
     request_id: &'a str,
     chat_id: Option<i64>,
     day: String,
+    hydrogen: bool,
 ) -> Result<Admission<'a>, Error> {
     let mut connection = db.lock();
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -313,7 +340,7 @@ fn admit<'a>(
     {
         return Err(Error::InProgress);
     }
-    if !Database::reserve_ai_model_on(
+    if hydrogen && !Database::reserve_ai_model_on(
         &tx,
         user,
         &day,
@@ -328,24 +355,43 @@ fn admit<'a>(
         user,
         request_id,
         day,
+        hydrogen,
         active: true,
     }))
 }
 
 impl Pending<'_> {
+    fn reserve_hydrogen(&mut self, day: String) -> Result<(), Error> {
+        let mut connection = self.db.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !Database::reserve_ai_model_on(&tx, self.user, &day, ai::HYDROGEN_MODEL, ai::HYDROGEN_DAILY_LIMIT)? {
+            return Err(Error::Quota);
+        }
+        if day != self.day && tx.execute(
+            "UPDATE ai_activity_pending SET day = ?1 WHERE user_id = ?2 AND request_id = ?3 AND day = ?4",
+            params![day, self.user as i64, self.request_id, self.day],
+        )? != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+        tx.commit()?;
+        self.day = day;
+        self.hydrogen = true;
+        Ok(())
+    }
+
     fn finish(&self, connection: &Connection, success: bool) -> rusqlite::Result<()> {
         let found = connection.execute(
             "DELETE FROM ai_activity_pending WHERE user_id = ?1 AND request_id = ?2 AND day = ?3",
             params![self.user as i64, self.request_id, self.day],
         )?;
         if found == 1
-            && Database::finish_ai_model_on(
+            && (!self.hydrogen || Database::finish_ai_model_on(
                 connection,
                 self.user,
                 &self.day,
                 ai::HYDROGEN_MODEL,
                 success,
-            )?
+            )?)
         {
             Ok(())
         } else {
@@ -396,7 +442,7 @@ impl Pending<'_> {
                 image.map(|(_, mime)| mime.as_str()), image.map(|(bytes, _)| bytes.as_slice()),
             ],
         )?;
-        if self.day == saved_day {
+        if !self.hydrogen || self.day == saved_day {
             self.finish(&tx, true)?;
         } else {
             // A saved answer belongs to its Moscow day. Move the charge only
@@ -495,10 +541,11 @@ fn user_turn(prompt: String, image: Option<(Vec<u8>, String)>) -> ai::Turn {
 }
 
 pub async fn send(data: &Data, user: u64, request: Request) -> Result<Value, Error> {
+    let thinking = request.thinking;
     tokio::time::timeout(
         SEND_TIMEOUT,
-        send_with(data, user, request, |turns| async move {
-            ai::generate_activity(data, &turns).await
+        send_with(data, user, request, |model, turns| async move {
+            ai::generate_activity(data, &turns, model, thinking).await
         }),
     )
     .await
@@ -509,10 +556,10 @@ async fn send_with<F, Fut>(
     data: &Data,
     user: u64,
     request: Request,
-    generate: F,
+    mut generate: F,
 ) -> Result<Value, Error>
 where
-    F: FnOnce(Vec<ai::Turn>) -> Fut,
+    F: FnMut(ai::ModelChoice, Arc<Vec<ai::Turn>>) -> Fut,
     Fut: Future<Output = Result<ai::Answer, ai::AiError>>,
 {
     let Request {
@@ -520,8 +567,10 @@ where
         chat_id,
         prompt,
         image,
+        model,
+        thinking: _,
     } = request;
-    let pending = match admit(&data.db, user, &request_id, chat_id, ai::moscow_day())? {
+    let mut pending = match admit(&data.db, user, &request_id, chat_id, ai::moscow_day(), model == ai::ModelChoice::Hydrogen)? {
         Admission::Replay(chat_id) => return read_chat(data, user, chat_id),
         Admission::Pending(pending) => pending,
     };
@@ -550,7 +599,19 @@ where
         None => Vec::new(),
     };
     turns.push(user_turn(prompt.clone(), attachment.clone()));
-    let answer = generate(turns).await.map_err(Error::Provider)?;
+    let turns = Arc::new(turns);
+    let answer = if model == ai::ModelChoice::Auto {
+        let primary = tokio::time::timeout(AUTO_PRIMARY_TIMEOUT, generate(ai::ModelChoice::FlashLite, turns.clone())).await;
+        match primary {
+            Err(_) | Ok(Err(ai::AiError::Network(_) | ai::AiError::Overloaded | ai::AiError::Quota)) => {
+                pending.reserve_hydrogen(ai::moscow_day())?;
+                generate(ai::ModelChoice::Hydrogen, turns).await
+            }
+            Ok(result) => result,
+        }
+    } else {
+        generate(model, turns).await
+    }.map_err(Error::Provider)?;
     if answer.text.trim().is_empty() {
         return Err(Error::Provider(ai::AiError::Other(
             "Gemini вернул пустой ответ".into(),
@@ -588,7 +649,7 @@ mod tests {
 
     fn request(id: &str, chat_id: Option<&str>) -> Request {
         Request::from_json(
-            &json!({ "request_id": id, "chat_id": chat_id, "prompt": "  A question  " }),
+            &json!({ "request_id": id, "chat_id": chat_id, "prompt": "  A question  ", "model": "hydrogen" }),
         )
         .unwrap()
     }
@@ -614,14 +675,95 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn validates_model_and_thinking_pairs() {
+        let defaults = Request::from_json(&json!({"request_id": "id", "prompt": "Question"})).unwrap();
+        assert_eq!(defaults.model, ai::ModelChoice::FlashLite);
+        assert_eq!(defaults.thinking, ai::ThinkingLevel::Medium);
+        for model in ["auto", "flash_lite", "hydrogen"] {
+            for thinking in ["minimal", "low", "medium", "high"] {
+                let result = Request::from_json(&json!({
+                    "request_id": "id", "prompt": "Question", "model": model, "thinking": thinking
+                }));
+                assert_eq!(result.is_ok(), thinking != "minimal" || model == "flash_lite");
+            }
+        }
+        for extra in [json!({"model": "other"}), json!({"thinking": 1})] {
+            let mut query = json!({"request_id": "id", "prompt": "Question"});
+            query.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            assert!(matches!(Request::from_json(&query), Err(Error::Invalid(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_charges_only_a_saved_hydrogen_fallback() {
+        use ai::ModelChoice::{Auto, FlashLite, Hydrogen};
+
+        let data = test_data();
+        let mut models = Vec::new();
+        for i in 0..3 {
+            let mut req = request(&format!("fallback-{i}"), None);
+            req.model = Auto;
+            let saved = send_with(&data, 7, req, |model, _| {
+                models.push(model);
+                future::ready(if model == FlashLite { Err(ai::AiError::Overloaded) } else { answer() })
+            })
+            .await
+            .unwrap();
+            assert_eq!(saved["quota"]["remaining"], 2 - i);
+        }
+        assert_eq!(models, [FlashLite, Hydrogen].repeat(3));
+
+        models.clear();
+        let mut req = request("blocked", None);
+        req.model = Auto;
+        let blocked = send_with(&data, 7, req, |model, _| {
+            models.push(model);
+            future::ready(Err(ai::AiError::Overloaded))
+        }).await;
+        assert!(matches!(blocked, Err(Error::Quota)));
+        assert_eq!(models, [FlashLite]);
+
+        for (id, model) in [("explicit-lite", FlashLite), ("auto-lite", Auto)] {
+            let mut req = request(id, None);
+            req.model = model;
+            let saved = send_with(&data, 7, req, |model, _| {
+                assert_eq!(model, FlashLite);
+                future::ready(answer())
+            }).await.unwrap();
+            assert_eq!(saved["quota"]["remaining"], 0);
+        }
+
+        let replay = send_with(&data, 7, request("fallback-0", None), |_, _| {
+            future::ready(Err(ai::AiError::Other("provider should not run".into())))
+        }).await.unwrap();
+        assert_eq!(replay["quota"]["remaining"], 0);
+        assert_eq!(replay["turns"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn late_fallback_reserves_the_current_moscow_day() {
+        let data = test_data();
+        let Admission::Pending(mut pending) =
+            admit(&data.db, 7, "late", None, "2026-11-17".into(), false).unwrap()
+        else {
+            panic!("expected pending request");
+        };
+        pending.reserve_hydrogen("2026-11-18".into()).unwrap();
+        assert_eq!(ai::hydrogen_usage(&data, 7, "2026-11-17").unwrap(), (0, 0));
+        assert_eq!(ai::hydrogen_usage(&data, 7, "2026-11-18").unwrap(), (0, 1));
+        drop(pending);
+        assert_eq!(ai::hydrogen_usage(&data, 7, "2026-11-18").unwrap(), (0, 0));
+    }
+
     #[tokio::test]
     async fn concurrent_activity_sends_share_three_slots_with_hydrogen() {
         let data = test_data();
         let day = ai::moscow_day();
-        let mut first = Box::pin(send_with(&data, 7, request("first", None), |_| {
+        let mut first = Box::pin(send_with(&data, 7, request("first", None), |_, _| {
             future::pending()
         }));
-        let mut second = Box::pin(send_with(&data, 7, request("second", None), |_| {
+        let mut second = Box::pin(send_with(&data, 7, request("second", None), |_, _| {
             future::pending()
         }));
         poll_pending(first.as_mut());
@@ -638,14 +780,14 @@ mod tests {
             .db
             .reserve_ai_model(7, &day, ai::HYDROGEN_MODEL, 3)
             .unwrap());
-        let fourth = send_with(&data, 7, request("fourth", None), |_| {
+        let fourth = send_with(&data, 7, request("fourth", None), |_, _| {
             future::ready(Err(ai::AiError::Other("provider should not run".into())))
         })
         .await
         .unwrap_err();
         assert_eq!(fourth.status(), StatusCode::TOO_MANY_REQUESTS);
         drop(first);
-        let saved = send_with(&data, 7, request("fourth", None), |_| {
+        let saved = send_with(&data, 7, request("fourth", None), |_, _| {
             future::ready(answer())
         })
         .await
@@ -670,7 +812,7 @@ mod tests {
             .to_utc();
         assert_eq!(ai::moscow_reset_time_at(started), saved.timestamp());
         let Admission::Pending(pending) =
-            admit(&data.db, 7, "midnight", None, ai::moscow_day_at(started)).unwrap()
+            admit(&data.db, 7, "midnight", None, ai::moscow_day_at(started), true).unwrap()
         else {
             panic!("expected a new reservation");
         };
@@ -692,7 +834,7 @@ mod tests {
             .unwrap()
             .to_utc();
         let Admission::Pending(pending) =
-            admit(&data.db, 7, "midnight", None, "2026-11-17".into()).unwrap()
+            admit(&data.db, 7, "midnight", None, "2026-11-17".into(), true).unwrap()
         else {
             panic!("expected a new reservation");
         };
@@ -717,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn a_chat_serializes_pending_sends_and_replays_completed_ids() {
         let data = test_data();
-        let first = send_with(&data, 7, request("new", None), |_| future::ready(answer()))
+        let first = send_with(&data, 7, request("new", None), |_, _| future::ready(answer()))
             .await
             .unwrap();
         let chat_id = first["chat"]["id"].as_str().unwrap();
@@ -725,7 +867,7 @@ mod tests {
             &data,
             7,
             request("second", Some(chat_id)),
-            |turns| {
+            |_, turns| {
                 assert_eq!(turns.len(), 3);
                 assert_eq!(turns[0].text, "A question");
                 assert_eq!(turns[1].role, "model");
@@ -735,24 +877,24 @@ mod tests {
         ));
         poll_pending(pending.as_mut());
         for id in ["second", "third"] {
-            let blocked = send_with(&data, 7, request(id, Some(chat_id)), |_| {
+            let blocked = send_with(&data, 7, request(id, Some(chat_id)), |_, _| {
                 future::ready(answer())
             })
             .await;
             assert!(matches!(blocked, Err(Error::InProgress)));
         }
-        let same_request_without_chat = send_with(&data, 7, request("second", None), |_| {
+        let same_request_without_chat = send_with(&data, 7, request("second", None), |_, _| {
             future::ready(answer())
         })
         .await;
         assert!(matches!(same_request_without_chat, Err(Error::InProgress)));
         drop(pending);
-        let completed = send_with(&data, 7, request("second", Some(chat_id)), |_| {
+        let completed = send_with(&data, 7, request("second", Some(chat_id)), |_, _| {
             future::ready(answer())
         })
         .await
         .unwrap();
-        let replay = send_with(&data, 7, request("second", None), |_| {
+        let replay = send_with(&data, 7, request("second", None), |_, _| {
             future::ready(Err(ai::AiError::Other("provider should not run".into())))
         })
         .await
@@ -765,7 +907,7 @@ mod tests {
     #[tokio::test]
     async fn provider_and_storage_failures_leave_the_request_available_to_retry() {
         let data = test_data();
-        let failed = send_with(&data, 7, request("retry", None), |_| {
+        let failed = send_with(&data, 7, request("retry", None), |_, _| {
             future::ready(Err(ai::AiError::Overloaded))
         })
         .await;
@@ -773,7 +915,7 @@ mod tests {
             failed,
             Err(Error::Provider(ai::AiError::Overloaded))
         ));
-        let empty = send_with(&data, 7, request("retry", None), |_| {
+        let empty = send_with(&data, 7, request("retry", None), |_, _| {
             future::ready(Ok(ai::Answer {
                 text: " ".into(),
                 cut: false,
@@ -792,7 +934,7 @@ mod tests {
             &data,
             7,
             request("retry", None),
-            |_| future::ready(answer()),
+            |_, _| future::ready(answer()),
         )
         .await;
         assert!(matches!(failed, Err(Error::Storage(_))));
@@ -815,7 +957,7 @@ mod tests {
             &data,
             7,
             request("retry", None),
-            |_| future::ready(answer()),
+            |_, _| future::ready(answer()),
         )
         .await
         .unwrap();
@@ -832,7 +974,7 @@ mod tests {
             "image": { "mime": "image/png", "data": STANDARD.encode(&bytes) },
         }))
         .unwrap();
-        let result = send_with(&data, 7, original, |turns| {
+        let result = send_with(&data, 7, original, |_, turns| {
             assert_eq!(turns[0].images, [(bytes.clone(), "image/png".into())]);
             future::ready(answer())
         })
@@ -849,12 +991,12 @@ mod tests {
         assert_eq!(overview(&data, 8).unwrap()["chats"], json!([]));
         assert!(matches!(chat(&data, 8, chat_id), Err(Error::NotFound)));
         assert!(matches!(image(&data, 8, turn_id), Err(Error::NotFound)));
-        let denied = send_with(&data, 8, request("shared-key", Some(chat_id)), |_| {
+        let denied = send_with(&data, 8, request("shared-key", Some(chat_id)), |_, _| {
             future::ready(answer())
         })
         .await;
         assert!(matches!(denied, Err(Error::NotFound)));
-        let other = send_with(&data, 8, request("shared-key", None), |_| {
+        let other = send_with(&data, 8, request("shared-key", None), |_, _| {
             future::ready(answer())
         })
         .await
@@ -878,7 +1020,7 @@ mod tests {
                 "image": { "mime": mime, "data": encoded },
             }))
             .unwrap();
-            let result = send_with(&data, 7, request, |_| future::ready(answer())).await;
+            let result = send_with(&data, 7, request, |_, _| future::ready(answer())).await;
             assert!(matches!(result, Err(Error::Invalid(_))));
         }
         assert_eq!(overview(&data, 7).unwrap()["quota"]["remaining"], 3);

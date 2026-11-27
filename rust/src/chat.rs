@@ -13,7 +13,6 @@ use std::sync::Mutex;
 
 const CONTEXT_MESSAGES: u8 = 10; // сколько последних сообщений чата показывать ИИ, чтобы он понимал разговор
 const CHATTER_HISTORY: u8 = 15; // сколько сообщений показывать ИИ для случайной реплики
-const RUDE_MEMORY_HOURS: f64 = 24.0; // сколько часов автоответы помнят, что человек грубил боту
 
 const CHATTER_TASK: &str = "Ниже последние сообщения из чата Discord. Ты — участник этого чата, тебя никто не звал.
 Вставь от себя ОДНУ короткую реплику в тему разговора: шутку, мнение, вопрос или интересный факт по теме.
@@ -202,11 +201,10 @@ fn no_pings(text: &str) -> serenity::CreateMessage {
 pub struct Rule {
     words: Vec<(Vec<char>, bool)>, // слово и есть ли * на конце («любые буквы»)
     pub options: Vec<String>,
-    pub rude_options: Option<Vec<String>>, // ответы тем, кто недавно грубил боту (после ||)
     pub greeting: bool,                    // строка с ~: не отвечаем, если приветствие адресовано другому
 }
 
-/// Строки «слова = ответы || ответы грубиянам» → правила.
+/// Строки «слова = ответы» → правила.
 pub fn parse_auto_replies(text: &str) -> Vec<Rule> {
     let split = |text: &str| -> Vec<String> { text.split('|').map(str::trim).filter(|answer| !answer.is_empty()).map(String::from).collect() };
     let mut rules = Vec::new();
@@ -216,9 +214,9 @@ pub fn parse_auto_replies(text: &str) -> Vec<Rule> {
         }
         let greeting = line.starts_with('~');
         let (words, answers) = line.trim_start_matches('~').split_once('=').unwrap_or_default();
-        let (nice, rude) = answers.split_once("||").unwrap_or((answers, ""));
-        let options = split(nice);
-        let rude_options = split(rude);
+        // Старые файлы могли хранить отдельные ответы после `||`.
+        let answers = answers.split_once("||").map_or(answers, |(normal, _)| normal);
+        let options = split(answers);
         let words: Vec<(Vec<char>, bool)> = words
             .split(',')
             .map(normalize)
@@ -227,7 +225,7 @@ pub fn parse_auto_replies(text: &str) -> Vec<Rule> {
             .map(|word| (word.trim_end_matches('*').chars().collect(), word.ends_with('*')))
             .collect();
         if !words.is_empty() && !options.is_empty() {
-            rules.push(Rule { words, options, rude_options: (!rude_options.is_empty()).then_some(rude_options), greeting });
+            rules.push(Rule { words, options, greeting });
         }
     }
     rules
@@ -380,13 +378,7 @@ async fn auto_reply(ctx: &serenity::Context, data: &Data, guild: serenity::Guild
                 continue; // «привет саня» — здороваются не с ботом, приветствие пропускаем
             }
         }
-        let mut options = &rule.options;
-        if let Some(rude) = &rule.rude_options {
-            let last = data.db.last_rude_time(guild.get(), message.author.id.get()).ok().flatten();
-            if last.is_some_and(|last| db::now() - last < RUDE_MEMORY_HOURS * 3600.0) {
-                options = rude; // человек недавно грубил боту — отвечаем ему по-другому
-            }
-        }
+        let options = &rule.options;
         let answer = options[rand::rng().random_range(0..options.len())].clone();
         // отвечаем цитатой, без пинга автора и без пингов вообще (даже если в ответе написать @everyone)
         let reply = no_pings(&answer).reference_message(message);
@@ -454,10 +446,6 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
         }
         return;
     };
-    if !message.author.bot && ai::directed_insult(data, &question).await {
-        moderation::warn_for_insult(&ctx.http, data, Some(guild), &message.author, message.channel_id, bot).await;
-        return;
-    }
     let moderation = match moderation::requested_action(&question, replied.map(|post| post.author.id.get()), bot.get()) {
         Some(Ok(action)) => Some((Requester { ctx, guild, user: message.author.id }, action)),
         Some(Err(error)) => {
@@ -480,12 +468,7 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
     } else {
         String::new()
     };
-    let delivery = ai::DeliveryReceipt::default();
-    let extras = ai::Extras {
-        chat,
-        moderation,
-        options: ai::RequestOptions { user: Some(message.author.id.get()), delivery: Some(&delivery), ..Default::default() },
-    };
+    let extras = ai::Extras { chat, moderation };
     let name = message_author_name(message);
     let mut answer = match ai::ask(data, &question, &name, message.channel_id.get(), images, extras).await {
         Ok(answer) => answer,
@@ -495,11 +478,10 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
         }
     };
     typing.stop();
-    let _ = data.db.reset_rude_strikes(guild.get(), message.author.id.get()); // нормальное обращение — счётчик с нуля
     if let Some(math) = crate::ai_math::render_for_discord(&answer).await {
         let reply = no_pings(crate::ai_math::FILE_MESSAGE).reference_message(message).add_file(math.attachment());
         match message.channel_id.send_message(ctx, reply).await {
-            Ok(_) => { delivery.delivered(); return; }
+            Ok(_) => return,
             Err(error) if crate::ai_math::attachment_denied(&error) => answer = math.discord,
             Err(error) => {
                 report_error(&ctx.http, data, Some(guild), "Ответ ИИ с формулами", &error.to_string()).await;
@@ -513,7 +495,6 @@ async fn ai_reply(ctx: &serenity::Context, data: &Data, guild: serenity::GuildId
             report_error(&ctx.http, data, Some(guild), "Доставка ответа ИИ", &error.to_string()).await;
             return;
         }
-        delivery.delivered();
     }
 }
 
@@ -585,7 +566,7 @@ async fn chatter_text(ctx: &serenity::Context, data: &Data, guild: serenity::Gui
     }
     lines.reverse();
     let task = format!("{CHATTER_TASK}{}", lines.join("\n"));
-    let answer = ai::generate(data, &ai::system_prompt(data), &[ai::Turn::user(task)]).await?;
+    let answer = ai::generate_discord_chat(data, &ai::system_prompt(data), &[ai::Turn::user(task)]).await?;
     if answer.text.is_empty() || ai::has_ignore_tag(&answer.text) {
         return Ok(None);
     }
@@ -694,8 +675,6 @@ mod tests {
         assert_eq!(rules.len(), 3);
         assert!(rules[0].greeting && !rules[1].greeting);
         assert_eq!(rules[0].options, ["привет милый", "хай"]);
-        assert_eq!(rules[0].rude_options.as_deref(), Some(&["иди отсюда".to_string()][..]));
-        assert_eq!(rules[2].rude_options, None);
         let check = |rule: &Rule, text: &str| rule.matches(&normalize(text).chars().collect::<Vec<_>>());
         assert!(check(&rules[0], "Привет всем!"));
         assert!(!check(&rules[0], "приветствую")); // граница слова

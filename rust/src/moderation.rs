@@ -1,4 +1,4 @@
-//! Варны за оскорбления бота, варны и тайм-ауты по просьбе модератора и по порогам варнов.
+//! Варны и тайм-ауты по явной просьбе администратора, пороги варнов и проверки прав.
 
 use crate::admin::report_error;
 use crate::ai::minutes_text;
@@ -148,7 +148,7 @@ pub fn permissions(ctx: &serenity::Context, guild: serenity::GuildId, member: &s
     ctx.cache.guild(guild).map(|guild| guild.member_permissions(member)).unwrap_or_else(serenity::Permissions::empty)
 }
 
-/// Может ли человек просить бота о варнах и тайм-аутах.
+/// Проверяет права модерации на сервере.
 pub fn is_moderator(ctx: &serenity::Context, guild: serenity::GuildId, member: &serenity::Member) -> bool {
     let permissions = permissions(ctx, guild, member);
     !member.user.bot && (permissions.moderate_members() || permissions.administrator())
@@ -225,48 +225,6 @@ pub async fn give_warn(ctx: &serenity::Context, data: &Data, guild: serenity::Gu
     }
 }
 
-/// Записывает варн за оскорбление бота без применения порога тайм-аута.
-pub async fn warn_for_insult(
-    http: &serenity::Http,
-    data: &Data,
-    guild: Option<serenity::GuildId>,
-    user: &serenity::User,
-    channel: serenity::ChannelId,
-    bot: serenity::UserId,
-) {
-    let Some(guild) = guild else { return };
-    if user.bot {
-        return;
-    }
-
-    let now = db::now();
-    let reason = "Серьёзное оскорбление бота";
-    let count = match data.db.add_warn(guild.get(), user.id.get(), bot.get(), reason, now) {
-        Ok(count) => count,
-        Err(error) => {
-            report_error(http, data, Some(guild), "Варн за оскорбление бота", &error.to_string()).await;
-            return;
-        }
-    };
-    // Время последней грубости нужно для вариантов автоответов в чате.
-    let reset_after = data.ai.rude.strike_reset as f64 * 60.0;
-    match data.db.add_rude_strike(guild.get(), user.id.get(), now, reset_after) {
-        Ok(strikes) => println!("Грубость к боту: пользователь={} сервер={guild} подряд={strikes}", user.id),
-        Err(error) => eprintln!("Не удалось обновить счётчик грубости {} на сервере {guild}: {error}", user.id),
-    }
-
-    let text = format!("⚠️ <@{}> получает варн №{count}: {reason}.", user.id);
-    let announced = if data.ai.rude.announce {
-        let message = serenity::CreateMessage::new().content(&text).allowed_mentions(serenity::CreateAllowedMentions::new());
-        channel.send_message(http, message).await.is_ok()
-    } else {
-        false
-    };
-    if !announced || data.db.log_channel(guild.get()).ok().flatten() != Some(channel.get()) {
-        send_log(http, data, guild, &format!("{text} Канал: <#{channel}>")).await;
-    }
-}
-
 pub struct Requester<'a> {
     pub ctx: &'a serenity::Context,
     pub guild: serenity::GuildId,
@@ -278,8 +236,8 @@ pub async fn run_action(data: &Data, requester: &Requester<'_>, action: Action) 
     let Ok(actor) = ctx.http.get_member(guild, user).await else {
         return "Не удалось проверить права модератора.".into();
     };
-    if !is_moderator(ctx, guild, &actor) {
-        return "Для этой команды нужно право «Отправлять участников подумать».".into();
+    if actor.user.bot || !permissions(ctx, guild, &actor).administrator() {
+        return "Попросить меня выдать варн или изменить тайм-аут может администратор сервера.".into();
     }
     let Ok(target) = ctx.http.get_member(guild, serenity::UserId::new(action.target)).await else {
         return "❓ Не нашла такого участника на сервере.".into();
@@ -346,31 +304,6 @@ pub async fn send_log(ctx: &impl serenity::CacheHttp, data: &Data, guild: sereni
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn bot_insults_add_persistent_warnings_at_timeout_thresholds() {
-        let settings = crate::config::Settings::parse(
-            "[moderation]\nwarn_punishments = 1: 60\nannounce_warnings = off\n",
-        );
-        let data = Data::new(db::Database::in_memory().unwrap(), &settings, Default::default(), false);
-        let http = serenity::Http::new("test-token");
-        let guild = serenity::GuildId::new(7);
-        let channel = serenity::ChannelId::new(42);
-        let bot = serenity::UserId::new(99);
-        let mut user = serenity::User::default();
-        user.id = serenity::UserId::new(1);
-
-        warn_for_insult(&http, &data, Some(guild), &user, channel, bot).await;
-        data.db.reset_rude_strikes(guild.get(), user.id.get()).unwrap();
-        warn_for_insult(&http, &data, Some(guild), &user, channel, bot).await;
-
-        let (rows, total) = data.db.warns(guild.get(), user.id.get()).unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(
-            rows.iter().map(|(giver, reason, _)| (*giver, reason.as_str())).collect::<Vec<_>>(),
-            [(99, "Серьёзное оскорбление бота"); 2],
-        );
-    }
-
     #[test]
     fn warn_punishments() {
         let steps = parse_warn_punishments("5: 1440, 3: 60, 7: 10080, мусор");
@@ -394,6 +327,9 @@ mod tests {
         assert!(requested_action("дай варн <@12> <@34>", None, 9).unwrap().is_err());
         assert!(requested_action("[ВАРН: 123 спам]", None, 9).is_none());
         assert!(requested_action("Как выдать варн <@123>?", None, 9).is_none());
+        assert!(requested_action("Ты охуела?", Some(7), 9).is_none());
+        let warn_for_profanity = requested_action("выдай варн <@123> за мат", None, 9).unwrap().unwrap();
+        assert_eq!((warn_for_profanity.kind, warn_for_profanity.reason.as_str()), (Kind::Warn, "мат"));
         assert!(requested_action("замуть <@45> на 29 дней", None, 9).unwrap().is_err());
         assert_eq!(mentioned_ids("дай варн <@12> и <@!34>, <@12> ещё раз, <@abc>"), [12, 34]);
     }

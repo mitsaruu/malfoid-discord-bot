@@ -277,10 +277,6 @@ impl Database {
                  UNIQUE (user_id, chat_id),
                  FOREIGN KEY (chat_id, user_id) REFERENCES ai_activity_chats (id, user_id)
              );
-             CREATE TABLE IF NOT EXISTS rude_strikes (
-                 guild_id INTEGER, user_id INTEGER, count INTEGER, last_time REAL,
-                 PRIMARY KEY (guild_id, user_id)
-             );
              CREATE TABLE IF NOT EXISTS plays (
                  guild_id INTEGER, month TEXT, title TEXT, count INTEGER DEFAULT 0,
                  PRIMARY KEY (guild_id, month, title)
@@ -1280,47 +1276,6 @@ impl Database {
         Ok(requests.flatten().unwrap_or(0))
     }
 
-    /// +1 к счётчику грубостей подряд (если человек давно не грубил — счёт с нуля). Возвращает новое значение.
-    pub fn add_rude_strike(&self, guild: u64, user: u64, now: f64, reset_after: f64) -> rusqlite::Result<i64> {
-        let connection = self.lock();
-        let row = connection
-            .query_row(
-                "SELECT count, last_time FROM rude_strikes WHERE guild_id = ?1 AND user_id = ?2",
-                params![guild as i64, user as i64],
-                |row| Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), row.get::<_, Option<f64>>(1)?.unwrap_or(0.0))),
-            )
-            .optional()?;
-        let count = row.filter(|(_, last)| now - last < reset_after).map_or(0, |(count, _)| count) + 1;
-        connection.execute(
-            "INSERT INTO rude_strikes (guild_id, user_id, count, last_time) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (guild_id, user_id) DO UPDATE SET count = excluded.count, last_time = excluded.last_time",
-            params![guild as i64, user as i64, count, now],
-        )?;
-        Ok(count)
-    }
-
-    /// Человек нормально обратился к боту — грубости больше не «подряд» (время последней грубости остаётся).
-    pub fn reset_rude_strikes(&self, guild: u64, user: u64) -> rusqlite::Result<()> {
-        self.lock().execute(
-            "UPDATE rude_strikes SET count = 0 WHERE guild_id = ?1 AND user_id = ?2",
-            params![guild as i64, user as i64],
-        )?;
-        Ok(())
-    }
-
-    /// Когда человек последний раз грубил боту (None — не грубил).
-    pub fn last_rude_time(&self, guild: u64, user: u64) -> rusqlite::Result<Option<f64>> {
-        let time = self
-            .lock()
-            .query_row(
-                "SELECT last_time FROM rude_strikes WHERE guild_id = ?1 AND user_id = ?2",
-                params![guild as i64, user as i64],
-                |row| row.get::<_, Option<f64>>(0),
-            )
-            .optional()?;
-        Ok(time.flatten())
-    }
-
     // ---------- Утренние и вечерние сообщения ----------
 
     /// Все серверы с включёнными сообщениями.
@@ -1818,13 +1773,6 @@ mod tests {
         db.count_ai_request("2026-11-10").unwrap();
         db.count_ai_request("2026-11-11").unwrap(); // новый день — прошлый убирается
         assert_eq!((db.ai_requests("2026-11-10").unwrap(), db.ai_requests("2026-11-11").unwrap()), (0, 1));
-
-        assert_eq!(db.add_rude_strike(7, 1, 100.0, 3600.0).unwrap(), 1);
-        assert_eq!(db.add_rude_strike(7, 1, 200.0, 3600.0).unwrap(), 2);
-        db.reset_rude_strikes(7, 1).unwrap();
-        assert_eq!(db.add_rude_strike(7, 1, 300.0, 3600.0).unwrap(), 1);
-        assert_eq!(db.add_rude_strike(7, 1, 400.0, 3600.0).unwrap(), 2);
-        assert_eq!(db.add_rude_strike(7, 1, 9000.0, 3600.0).unwrap(), 1); // давно не грубил — с нуля
     }
 
     #[test]

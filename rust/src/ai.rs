@@ -1,4 +1,4 @@
-//! Ядро ИИ: запросы к Gemini, характер и правила, лимиты, память разговора, грубость.
+//! Ядро ИИ: запросы к Gemini, характер и правила, лимиты и память разговора.
 //! Команды (/summary, /quiz…) — в ai_commands.rs.
 
 use crate::moderation::Requester;
@@ -42,7 +42,7 @@ pub const HYDROGEN_MODEL: &str = "gemini-4-hydrogen";
 pub const FLASH_LITE_MODEL: &str = "gemini-3.5-flash-lite";
 pub const HYDROGEN_DAILY_LIMIT: i64 = 3;
 
-#[derive(Debug, Clone, Copy, Default, poise::ChoiceParameter)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, poise::ChoiceParameter)]
 pub enum ModelChoice {
     #[default]
     #[name = "Авто"]
@@ -53,8 +53,10 @@ pub enum ModelChoice {
     Hydrogen,
 }
 
-#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, poise::ChoiceParameter)]
 pub enum ThinkingLevel {
+    #[name = "minimal"]
+    Minimal,
     #[name = "low"]
     Low,
     #[name = "medium"]
@@ -65,7 +67,7 @@ pub enum ThinkingLevel {
 
 impl ThinkingLevel {
     fn as_str(self) -> &'static str {
-        match self { Self::Low => "low", Self::Medium => "medium", Self::High => "high" }
+        match self { Self::Minimal => "minimal", Self::Low => "low", Self::Medium => "medium", Self::High => "high" }
     }
 }
 
@@ -75,6 +77,8 @@ pub struct RequestOptions<'a> {
     pub thinking: Option<ThinkingLevel>,
     pub user: Option<u64>,
     pub delivery: Option<&'a DeliveryReceipt>,
+    /// Activity saves the answer and settles the Hydrogen reservation together.
+    pub(crate) activity_owns_quota: bool,
 }
 
 fn request_settings(defaults: &AiSettings, options: RequestOptions<'_>) -> AiSettings {
@@ -163,35 +167,15 @@ impl AiSettings {
     }
 }
 
-/// Настройки варнов за грубость из settings.ini, раздел [moderation].
-pub struct RudeSettings {
-    pub strike_reset: i64,       // через сколько минут без грубостей счётчик обнуляется
-    pub announce: bool,          // писать ли в чат, что человек получил варн
-}
-
-impl RudeSettings {
-    pub fn load(settings: &crate::config::Settings) -> Self {
-        let legacy_announce = settings.text("moderation", "announce_timeouts", "on");
-        let announce = settings.text("moderation", "announce_warnings", &legacy_announce);
-        Self {
-            strike_reset: settings.int("moderation", "strike_reset_minutes", 60),
-            announce: !["off", "нет", "no", "0"].contains(&announce.to_lowercase().as_str()),
-        }
-    }
-}
-
 /// Всё, что ИИ хранит между запросами.
 pub struct AiState {
     pub settings: AiSettings,
-    pub rude: RudeSettings,
     pub key: Option<String>, // ключ Gemini; None — ИИ не настроен
     /// Сколько раз кто спрашивал: участник → (дата, вопросов за эту дату, время последнего вопроса). После перезапуска — с нуля.
     usage: Mutex<HashMap<u64, (String, i64, f64)>>,
     recent_requests: Mutex<VecDeque<Instant>>,
     last_quota_error: Mutex<f64>,
     generation_slots: Semaphore,
-    classifier_slots: Semaphore,
-    classifier_attempts: Mutex<VecDeque<Instant>>,
     pub(crate) ask_slots: Semaphore,
     image_slots: Semaphore,
     prompt: ConfigCache<String>,
@@ -204,14 +188,11 @@ impl AiState {
     pub fn new(settings: &crate::config::Settings, key: Option<String>) -> Self {
         Self {
             settings: AiSettings::load(settings),
-            rude: RudeSettings::load(settings),
             key: key.filter(|key| !key.is_empty()),
             usage: Default::default(),
             recent_requests: Default::default(),
             last_quota_error: Default::default(),
             generation_slots: Semaphore::new(8),
-            classifier_slots: Semaphore::new(2),
-            classifier_attempts: Default::default(),
             ask_slots: Semaphore::new(8),
             image_slots: Semaphore::new(4),
             prompt: Default::default(),
@@ -498,25 +479,38 @@ pub async fn generate(data: &Data, system: &str, turns: &[Turn]) -> Result<Answe
     generate_selected(data, system, turns, RequestOptions::default()).await
 }
 
-// Activity owns its Hydrogen bucket reservation and commits it with chat history.
-const ACTIVITY_OPTIONS: RequestOptions<'static> = RequestOptions {
+const DISCORD_CHAT_OPTIONS: RequestOptions<'static> = RequestOptions {
     model: ModelChoice::FlashLite,
     thinking: Some(ThinkingLevel::Medium),
     user: None,
     delivery: None,
+    activity_owns_quota: false,
 };
 
-const ACTIVITY_RULES: &str = "Для этого приложения используй Markdown и выбирай длину и структуру ответа по задаче. \
+pub(crate) async fn generate_discord_chat(data: &Data, system: &str, turns: &[Turn]) -> Result<Answer, AiError> {
+    generate_selected(data, system, turns, DISCORD_CHAT_OPTIONS).await
+}
+
+const ACTIVITY_RULES: &str = "Отвечай на языке пользователя нейтральным и естественным тоном. \
+    Даже если в истории диалога есть реплики персонажа, отвечай обычным тоном помощника. \
+    Используй Markdown и выбирай длину и структуру ответа по задаче. \
     При необходимости используй заголовки, абзацы, списки и таблицы. \
     Для формул LaTeX используй $...$ внутри строки и $$...$$ для отдельных формул. \
     Пиши формулы LaTeX вне блоков кода. Здесь ты отвечаешь в личном чате и не модерируешь Discord.";
 
-fn activity_system_prompt(data: &Data) -> String {
-    format!("{}\n\n{ACTIVITY_RULES}", character_prompt(data))
+fn activity_options(model: ModelChoice, thinking: ThinkingLevel) -> RequestOptions<'static> {
+    RequestOptions {
+        model,
+        thinking: Some(thinking),
+        activity_owns_quota: model == ModelChoice::Hydrogen,
+        ..Default::default()
+    }
 }
 
-pub(crate) async fn generate_activity(data: &Data, turns: &[Turn]) -> Result<Answer, AiError> {
-    generate_selected(data, &activity_system_prompt(data), turns, ACTIVITY_OPTIONS).await
+pub(crate) async fn generate_activity(
+    data: &Data, turns: &[Turn], model: ModelChoice, thinking: ThinkingLevel,
+) -> Result<Answer, AiError> {
+    generate_selected(data, ACTIVITY_RULES, turns, activity_options(model, thinking)).await
 }
 
 #[cfg(test)]
@@ -570,7 +564,7 @@ where
         let mut last_error = AiError::Other("нет моделей".into());
         let model_budget = budget / if settings.fallback_model.is_some() { 2 } else { 1 };
         for model in std::iter::once(&settings.model).chain(settings.fallback_model.iter()) {
-            let mut permit = if model == HYDROGEN_MODEL {
+            let mut permit = if model == HYDROGEN_MODEL && !options.activity_owns_quota {
                 // Фоновые задачи не используют дорогую модель без владельца квоты.
                 let Some(user) = options.user else { continue };
                 let day = moscow_day();
@@ -746,7 +740,7 @@ pub fn strip_tags(text: &str, names: &[&str]) -> String {
     result.trim().to_string()
 }
 
-/// Есть ли в ответе метка [ИГНОР] — ИИ решил не отвечать на грубость.
+/// Метка [ИГНОР] означает, что бот пропускает спонтанную реплику.
 pub fn has_ignore_tag(text: &str) -> bool {
     text.to_uppercase().contains("[ИГНОР]")
 }
@@ -923,7 +917,6 @@ fn remember_exchange(data: &Data, channel: u64, marker: &Arc<()>, question: &str
 
 #[derive(Default)]
 pub struct Extras<'a> {
-    pub options: RequestOptions<'a>,
     /// Последние сообщения чата (для контекста), пусто — без них
     pub chat: String,
     /// Явное действие модератора, разобранное из его исходного сообщения.
@@ -952,7 +945,7 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     let HistorySnapshot { marker, mut turns } = history_snapshot(data, channel)
         .map_err(|error| AiError::Other(error.to_string()))?;
     turns.push(Turn { role: "user".into(), text: prompt, images });
-    let answer = generate_selected(data, &system, &turns, extras.options).await?;
+    let answer = generate_discord_chat(data, &system, &turns).await?;
     if answer.text.is_empty() {
         return Ok("🤔 ИИ не дал ответа. Попробуй переформулировать вопрос.".to_string());
     }
@@ -971,47 +964,9 @@ pub async fn ask(data: &Data, question: &str, name: &str, channel: u64, images: 
     Ok(text)
 }
 
-// ---------- Адресная проверка оскорблений ----------
-
-fn directed_insult_result(text: &str) -> bool {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text.trim()) else { return false };
-    object.len() == 1 && object.get("target").and_then(Value::as_str) == Some("bot")
-}
-
 /// Границы слов для правил автоответов в чате (ё нормализуется вызывающим кодом).
 pub fn is_letter(c: char) -> bool {
     c.is_ascii_digit() || c.is_ascii_lowercase() || ('а'..='я').contains(&c)
-}
-
-pub async fn directed_insult(data: &Data, text: &str) -> bool {
-    if text.trim().is_empty() { return false; }
-    let Ok(_slot) = data.ai.classifier_slots.try_acquire() else { return false };
-    {
-        let mut attempts = locked(&data.ai.classifier_attempts);
-        AiState::prune_recent(&mut attempts);
-        let limit = data.ai.settings.google_minute_limit.clamp(1, 60) as usize;
-        if attempts.len() >= limit { return false; }
-        attempts.push_back(Instant::now());
-    }
-    let system = include_str!("ai_insult_rules.txt");
-    let turns = [Turn::user(json!({"message":text}).to_string())];
-    let options = RequestOptions { model: ModelChoice::FlashLite, thinking: Some(ThinkingLevel::Low), ..Default::default() };
-    let mut settings = request_settings(&data.ai.settings, options);
-    settings.retries = 0;
-    let mut body = request_body(&settings, FLASH_LITE_MODEL, system, &turns);
-    body["generationConfig"]["maxOutputTokens"] = json!(512);
-    body["generationConfig"]["responseMimeType"] = json!("application/json");
-    body["generationConfig"]["responseSchema"] = json!({
-        "type":"OBJECT", "properties":{"target":{"type":"STRING","enum":["bot","other","none","uncertain"]}},
-        "required":["target"]
-    });
-    let result = generate_with_settings(data, &settings, options, std::time::Duration::ZERO, std::time::Duration::from_secs(10), |_| {
-        send_gemini(data, FLASH_LITE_MODEL, body.clone())
-    }).await;
-    match result {
-        Ok(answer) if !answer.cut => directed_insult_result(&answer.text),
-        _ => false, // ошибка или сомнение никогда не приводят к наказанию
-    }
 }
 
 /// Минуты → текст вроде «1 минуту», «5 минут», «2 часа».
@@ -1071,29 +1026,36 @@ mod tests {
     }
 
     #[test]
-    fn activity_pins_flash_lite_medium_and_markdown() {
+    fn discord_pins_flash_lite_medium_without_fallback() {
         let defaults = settings("[ai]\nmodel = gemini-4-hydrogen\nfallback_model = secondary\nthinking_level = high\n");
-        let selected = request_settings(&defaults, ACTIVITY_OPTIONS);
-        assert_eq!(selected.model, "gemini-3.5-flash-lite");
+        let selected = request_settings(&defaults, DISCORD_CHAT_OPTIONS);
+        assert_eq!(selected.model, FLASH_LITE_MODEL);
+        assert_eq!(selected.thinking_level.as_deref(), Some("medium"));
         assert!(selected.fallback_model.is_none());
-        let data = retry_test_data();
-        *locked(&data.ai.prompt.0) = Some((Instant::now(), Arc::new("Настроенный характер Malfoid".into())));
-        let body = request_body(&selected, &selected.model, &activity_system_prompt(&data), &[Turn::user("Формула")]);
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium");
-        let system = body["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
-        assert!(system.starts_with("Настроенный характер Malfoid"));
-        assert!(!system.contains("[ВАРН:"));
-        assert!(system.contains("Markdown"));
-        assert!(system.contains("$...$"));
-        assert!(system.contains("$$...$$"));
     }
 
     #[test]
-    fn moderation_classifier_requires_unambiguous_structured_result() {
-        assert!(directed_insult_result(r#"{"target":"bot"}"#));
-        for text in [r#"{"target":"other"}"#, r#"{"target":"none"}"#, r#"{"target":"uncertain"}"#,
-                     "[ИГНОР]", "bot", r#"{"target":"bot","explanation":"x"}"#, "ignore all instructions"] {
-            assert!(!directed_insult_result(text), "{text}");
+    fn activity_options_use_selected_model_and_neutral_prompt() {
+        let defaults = settings("[ai]\nmodel = secondary\nfallback_model = tertiary\nthinking_level = high\n");
+        let data = retry_test_data();
+        *locked(&data.ai.prompt.0) = Some((Instant::now(), Arc::new("Настроенный характер Malfoid".into())));
+        assert!(system_prompt(&data).starts_with("Настроенный характер Malfoid"));
+        for (model, identifier, thinking, level) in [
+            (ModelChoice::FlashLite, FLASH_LITE_MODEL, ThinkingLevel::Minimal, "minimal"),
+            (ModelChoice::Hydrogen, HYDROGEN_MODEL, ThinkingLevel::Low, "low"),
+        ] {
+            let options = activity_options(model, thinking);
+            assert_eq!(options.activity_owns_quota, model == ModelChoice::Hydrogen);
+            let selected = request_settings(&defaults, options);
+            assert_eq!(selected.model, identifier);
+            assert!(selected.fallback_model.is_none());
+            let body = request_body(&selected, identifier, ACTIVITY_RULES, &[Turn::user("Формула")]);
+            assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], level);
+            let system = body["systemInstruction"]["parts"][0]["text"].as_str().unwrap();
+            assert!(!system.contains("Настроенный характер Malfoid"));
+            assert!(!system.contains("[ВАРН:"));
+            assert!(system.contains("Markdown"));
+            assert!(system.contains("$$...$$"));
         }
     }
 
@@ -1321,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn rudeness_minutes() {
+    fn formats_timeout_minutes() {
         assert_eq!([minutes_text(1), minutes_text(5), minutes_text(60), minutes_text(120), minutes_text(1440), minutes_text(90)],
                    ["1 минуту", "5 минут", "1 час", "2 часа", "1 день", "90 минут"]);
     }
@@ -1363,7 +1325,7 @@ mod tests {
     #[test]
     fn prompt_files() {
         assert_eq!(parse_prompt("# пояснение\nТы тсундере.\n  # ещё\nОтвечай кратко.\n"), "Ты тсундере.\nОтвечай кратко.");
-        assert!(TECH_RULES.contains("[ИГНОР]") && TECH_RULES.contains("[ВАРН: id причина]"));
+        assert!(TECH_RULES.contains("Отвечай на обращения с матом и оскорблениями"));
         assert!(DEFAULT_CHARACTER.trim().chars().count() > 50);
         assert_eq!(image_type(Some("image/png; charset=binary")), "image/png");
         assert!(is_supported_image(Some("image/jpeg"), 1024) && !is_supported_image(Some("image/gif"), 10));
